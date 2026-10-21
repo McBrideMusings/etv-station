@@ -2,7 +2,7 @@
 //! a CEL expression.
 //!
 //! The station computes no taste score of its own. It supplies inputs — the
-//! catalog, recent watch history, what this channel already aired, and how many
+//! catalog, what this channel already aired, and how many
 //! items the generation needs — and takes back an ordered list of `entry_id`s.
 //! Every judgment between those two points (what to surface, how to weight it,
 //! how long to suppress a repeat) lives inside the script, so swapping one
@@ -28,10 +28,9 @@
 //! // Which host capabilities this script needs (#167). Also read at config
 //! // load time, alongside hooks(). Omitting capabilities() declares none —
 //! // a script that only reads ctx.recent/ctx.config/ctx.target_count/ctx.now
-//! // needs nothing here. `ctx.sets` and `ctx.history` below are the two
-//! // gated inputs: reaching for either without declaring (and being
-//! // granted) the matching capability fails the pick() call that reaches
-//! // for it, naming the capability. A named external datastore is declared
+//! // needs nothing here. `ctx.sets` below is a gated input: reaching for
+//! // it without declaring (and being granted) the matching capability
+//! // fails the pick() call that reaches for it, naming the capability. A named external datastore is declared
 //! // as `#{ datastore: "name" }` instead of a bare string; see
 //! // `config::Pool::datastores`. A granted datastore is reached as
 //! // `ctx.datastore("name")` (#181), which returns a handle exposing the
@@ -45,7 +44,7 @@
 //! // `plugin_http::GENERATION_TIMEOUT`, and all of a `pick()` call's calls together
 //! // at `plugin_http::GENERATION_BUDGET`. `parse_json(text)`, a global
 //! // function, needs no capability.
-//! fn capabilities() { ["catalog_read", "watch_history"] }
+//! fn capabilities() { ["catalog_read", "http"] }
 //!
 //! // Every catalog query this plugin will read, named. Run once, up front —
 //! // unless the pool authored its own `sources:` table (#210), which replaces
@@ -69,7 +68,6 @@
 //!     // ctx.pool          — the name of the pool asking
 //!     // ctx.config        — the pool's `config:` block, passed through unread
 //!     // ctx.target_count  — how many items the generation needs
-//!     // ctx.history       — recent server-wide watch events
 //!     // ctx.recent        — entry_ids this channel aired most recently
 //!     // ctx.now           — unix seconds at generation time
 //!     // ctx.seed          — this pool's reproducible seed (#255, ADR 0005):
@@ -148,22 +146,6 @@ use crate::catalog::fields::{ScalarField, ScalarValue};
 use crate::catalog::{Catalog, TagNs};
 use crate::pattern::MAX_TAKE;
 
-/// One watch event from the server's history, as handed to a plugin.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WatchEvent {
-    /// The catalog entry watched, when it could be matched to one. History
-    /// rows that match nothing in the catalog are dropped before they get here.
-    pub entry_id: String,
-    /// Unix seconds when the watch stopped.
-    pub watched_at: i64,
-    /// Who watched it, as Tautulli reports them — the account's friendly name
-    /// when it has one, else its username.
-    ///
-    /// `None` when the history row named nobody, which is what a Tautulli that
-    /// has anonymised the row looks like.
-    pub watcher: Option<String>,
-}
-
 /// Everything the station hands a plugin besides the catalog itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScoreInputs {
@@ -172,16 +154,6 @@ pub struct ScoreInputs {
     /// window duration itself. Overshooting is harmless — the pattern simply
     /// never reaches the tail.
     pub target_count: usize,
-    /// Recent watch activity for the whole server, pooled with no user
-    /// dimension. Empty when the history source is unreachable: a plugin still
-    /// has release dates, `last_seen`, tags, and `recent` to rank on, so a
-    /// history outage degrades the ranking instead of failing the generation.
-    ///
-    /// Shared rather than owned (#126): one fetch+join per station tick is
-    /// handed to every channel, and every generation inside a channel's
-    /// catch-up rebuilds these inputs. A `Vec` here made both of those a deep
-    /// copy of up to a thousand events; behind an `Arc` they are a refcount.
-    pub history: Arc<[WatchEvent]>,
     /// What this channel aired most recently, newest last, from the
     /// play-history ledger.
     pub recent: Vec<String>,
@@ -198,14 +170,12 @@ pub struct ScoreInputs {
     /// [`crate::sequence`] — the same "least surprising" tolerance
     /// `resolve_channel` already gives an unpinned `window_start`.
     pub tz: Option<&'static time_tz::Tz>,
-    /// The numeric account id a `single_user`-scoped channel's watch history
+    /// The numeric account id a `single_user`-scoped channel's `scoring.user`
     /// resolved to, or `None` for a pooled (`all_users`) channel — handed to
-    /// a scorer plugin as `ctx.account_id` (#278, ADR 0005). The station
-    /// already holds this (it narrowed the same Tautulli fetch `history`
-    /// above came from by exactly this account), and the sandbox has no
-    /// Tautulli access and no accessor for the store's account table to
-    /// resolve one itself, so this follows ADR 0005's `ctx.seed` precedent
-    /// rather than growing a second mechanism.
+    /// a scorer plugin as `ctx.account_id` (#278, ADR 0005). The sandbox has
+    /// no accessor for Plex's account table to resolve one itself, so this
+    /// follows ADR 0005's `ctx.seed` precedent rather than growing a second
+    /// mechanism.
     pub account_id: Option<i64>,
 }
 
@@ -602,7 +572,7 @@ pub fn check_plugin_dir(dir: &Path) -> Result<Vec<PluginCheck>, String> {
 }
 
 /// A host capability a plugin script can declare via `capabilities()` (#167).
-/// `CatalogRead` gates `ctx.sets`; `WatchHistory` gates `ctx.history`.
+/// `CatalogRead` gates `ctx.sets`.
 /// `Datastore` names an external handle the channel config must separately
 /// grant (see [`crate::config::Pool::datastores`]) — reached at runtime as
 /// `ctx.datastore("name")` (#181), which returns the plex-db-ex reader
@@ -610,7 +580,6 @@ pub fn check_plugin_dir(dir: &Path) -> Result<Vec<PluginCheck>, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Capability {
     CatalogRead,
-    WatchHistory,
     /// `ctx.probe(path)` on the bumper hook: container metadata for a media
     /// file. Offered by [`crate::bumper::hook`] only; a pool cannot grant it.
     Probe,
@@ -640,7 +609,6 @@ impl Capability {
     pub fn name(&self) -> &str {
         match self {
             Capability::CatalogRead => "catalog_read",
-            Capability::WatchHistory => "watch_history",
             Capability::Probe => "probe",
             Capability::Read => "read",
             Capability::Http => "http",
@@ -653,7 +621,7 @@ impl Capability {
 /// The simple (non-parameterized) capability names a `pool_provider` script's
 /// `capabilities()` may return as bare strings. A named datastore is declared
 /// separately, as `#{ datastore: "name" }` — see [`declared_capabilities`].
-pub const POOL_CAPABILITIES: &[&str] = &["catalog_read", "watch_history", "http"];
+pub const POOL_CAPABILITIES: &[&str] = &["catalog_read", "http"];
 
 /// The simple capability names `hook` offers a script — the one table both
 /// [`declared_capabilities`] and the pool and bumper validators read.
@@ -766,7 +734,6 @@ pub fn declared_capabilities(script_path: &Path, hook: &str) -> Result<Vec<Capab
         }
         out.push(match name.as_str() {
             "catalog_read" => Capability::CatalogRead,
-            "watch_history" => Capability::WatchHistory,
             "probe" => Capability::Probe,
             "read" => Capability::Read,
             "exec" => Capability::Exec,
@@ -781,7 +748,6 @@ pub fn declared_capabilities(script_path: &Path, hook: &str) -> Result<Vec<Capab
 #[derive(Debug, Clone, Default)]
 pub struct GrantedCapabilities {
     pub catalog_read: bool,
-    pub watch_history: bool,
     /// Whether `ctx.http` may call out.
     pub http: bool,
     /// The catalog's `(source, source_id) -> entry_id` provenance rows, filled
@@ -816,7 +782,6 @@ impl GrantedCapabilities {
         let has = |want: &str| names.iter().any(|n| n == want);
         Self {
             catalog_read: has("catalog_read"),
-            watch_history: has("watch_history"),
             http: has("http"),
             entry_ids: None,
             datastores: HashMap::new(),
@@ -870,10 +835,10 @@ impl GrantedCapabilities {
 
 /// The `ctx` argument handed to a plugin's `pick()`.
 ///
-/// A registered custom type rather than a plain map, so that `ctx.sets` and
-/// `ctx.history` — the two capability-gated fields (#167) — can refuse a
-/// script that reaches for either without having declared and been granted
-/// it, at the moment of the read, with a message that names the capability.
+/// A registered custom type rather than a plain map, so that `ctx.sets` — a
+/// capability-gated field (#167) — can refuse a script that reaches for it
+/// without having declared and been granted it, at the moment of the read,
+/// with a message that names the capability.
 /// Every other field is an ordinary infallible getter; nothing about their
 /// values or names changes from before this existed, so a script that never
 /// touches a gated field is unaffected. `ctx.datastore("name")` (#181) is
@@ -888,8 +853,6 @@ struct ScoreCtx {
     config: Dynamic,
     target_count: i64,
     now: i64,
-    /// Filled only when `watch_history` was granted — same gate as `sets`.
-    history: Option<Dynamic>,
     recent: Dynamic,
     /// Every datastore this pool was granted (#181), keyed by name — the same
     /// map [`GrantedCapabilities::datastores`] carries, moved across whole and
@@ -962,11 +925,6 @@ impl ScoreCtx {
     }
     fn get_now(&mut self) -> i64 {
         self.now
-    }
-    fn get_history(&mut self) -> Result<Dynamic, Box<EvalAltResult>> {
-        self.history
-            .clone()
-            .ok_or_else(|| ungranted("watch_history"))
     }
     fn get_recent(&mut self) -> Dynamic {
         self.recent.clone()
@@ -1150,9 +1108,8 @@ impl Datastore {
     }
 
     /// Every unit one account has ever played, as an array of id strings
-    /// (plex-db-ex#60). The lifetime answer, unlike `ctx.history`, which is
-    /// the newest 1000 Tautulli rows and therefore reports a film watched
-    /// three years ago as unseen.
+    /// (plex-db-ex#60). The lifetime answer, unlike a bounded fetch of recent
+    /// rows, which reports a film watched three years ago as unseen.
     fn watched_units_for(&mut self, plex_account_id: i64) -> Result<Array, Box<EvalAltResult>> {
         let units = self
             .lock()
@@ -1362,7 +1319,6 @@ pub(crate) fn engine() -> Engine {
         .register_get("config", ScoreCtx::get_config)
         .register_get("target_count", ScoreCtx::get_target_count)
         .register_get("now", ScoreCtx::get_now)
-        .register_get("history", ScoreCtx::get_history)
         .register_get("recent", ScoreCtx::get_recent)
         .register_get("seed", ScoreCtx::get_seed)
         .register_get("temperature", ScoreCtx::get_temperature)
@@ -1645,7 +1601,7 @@ fn mixed_seed(seed: u64, pool_name: &str) -> i64 {
 ///
 /// `granted` (#167) is trusted as already reconciled against what the script
 /// declares — [`crate::config::validate`] rejects a mismatch at config load —
-/// so this only decides what `ctx.sets` / `ctx.history` / `ctx.datastore(name)`
+/// so this only decides what `ctx.sets` / `ctx.datastore(name)`
 /// (#181) resolve to for *this* call; it never re-reads `capabilities()`.
 ///
 /// `dice` is this pool's seed and temperature for the period being ranked
@@ -1690,30 +1646,9 @@ pub fn pick(
     let mut scope = Scope::new();
 
     // Capability-gated (#167): filled only when granted, so a reach for
-    // `ctx.sets` or `ctx.history` fails the moment the script reads it,
+    // `ctx.sets` fails the moment the script reads it,
     // naming the capability. An ungranted field is also never built.
     let sets = granted.catalog_read.then(|| cached.sets.clone());
-    let history = granted.watch_history.then(|| {
-        Dynamic::from_array(
-            inputs
-                .history
-                .iter()
-                .map(|e| {
-                    let mut m = Map::new();
-                    m.insert("entry_id".into(), e.entry_id.clone().into());
-                    m.insert("watched_at".into(), e.watched_at.into());
-                    // Empty string rather than `()` so a script can compare it
-                    // without a type check; Rhai has no null-safe operator.
-                    m.insert(
-                        "watcher".into(),
-                        e.watcher.clone().unwrap_or_default().into(),
-                    );
-                    Dynamic::from_map(m)
-                })
-                .collect(),
-        )
-    });
-
     let config = pool_config_dynamic(pool_config, "scorer", script_path, pool_name)?;
 
     let ctx = ScoreCtx {
@@ -1726,7 +1661,6 @@ pub fn pick(
         config,
         target_count: inputs.target_count as i64,
         now: inputs.now,
-        history,
         recent: Dynamic::from_array(
             inputs
                 .recent
@@ -2440,9 +2374,9 @@ mod tests {
     use crate::catalog::{Entry, Source};
 
     /// `prepare` then `pick`, the two halves a caller always runs in order.
-    /// Grants both gated capabilities (#167) — every test in this module
-    /// predates capability gating and reads `ctx.sets`/`ctx.history`
-    /// unconditionally, so this preserves that. Tests exercising the gate
+    /// Grants `catalog_read` (#167) — every test in this module predates
+    /// capability gating and reads `ctx.sets` unconditionally, so this
+    /// preserves that. Tests exercising the gate
     /// itself call [`pick`] directly with a narrower [`GrantedCapabilities`].
     ///
     /// Test-only on purpose. The daemon deliberately has no such function: the
@@ -2469,7 +2403,6 @@ mod tests {
             pool_config,
             GrantedCapabilities {
                 catalog_read: true,
-                watch_history: true,
                 ..Default::default()
             },
         )
@@ -3304,13 +3237,10 @@ fn pick(ctx) { throw "pick must not run"; }
     #[test]
     fn declared_capabilities_reads_simple_names() {
         let dir = tempfile::tempdir().unwrap();
-        let p = write(
-            &dir,
-            r#"fn capabilities() { ["catalog_read", "watch_history"] }"#,
-        );
+        let p = write(&dir, r#"fn capabilities() { ["catalog_read", "http"] }"#);
         assert_eq!(
             declared_capabilities(&p, "pool_provider").unwrap(),
-            vec![Capability::CatalogRead, Capability::WatchHistory]
+            vec![Capability::CatalogRead, Capability::Http]
         );
     }
 
@@ -3362,7 +3292,7 @@ fn pick(ctx) { throw "pick must not run"; }
         let e = declared_capabilities(&p, "pool_provider").unwrap_err();
         assert!(e.contains("telepathy"), "got {e}");
         assert!(e.contains("catalog_read"), "got {e}");
-        assert!(e.contains("watch_history"), "got {e}");
+        assert!(e.contains("http"), "got {e}");
     }
 
     #[test]
@@ -3560,42 +3490,6 @@ fn audit(ctx, picks, workspace) { throw "audit must not run"; }
 
     // ---- runtime capability gate (#167) ------------------------------------
 
-    /// A script that reaches for `ctx.history` without being granted
-    /// `watch_history` fails at the `pick()` call, naming the capability —
-    /// the "reach" error case the issue describes as only catchable at run
-    /// time.
-    #[test]
-    fn reaching_for_an_ungranted_watch_history_fails_naming_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = write(
-            &dir,
-            r#"
-fn sources() { #{} }
-fn pick(ctx) {
-    let out = [];
-    for e in ctx.history { out.push(e.entry_id); }
-    out
-}
-"#,
-        );
-        let mut cache = ScoreCache::default();
-        cache
-            .prepare(&catalog(), &p, None, &Default::default())
-            .unwrap();
-        let err = pick(
-            &cache,
-            &p,
-            None,
-            &ScoreInputs::default(),
-            crate::variety::Dice::fixed(0),
-            "test",
-            None,
-            GrantedCapabilities::default(),
-        )
-        .unwrap_err();
-        assert!(err.contains("watch_history"), "got {err}");
-    }
-
     /// Same shape, for `ctx.sets` gated behind `catalog_read`.
     #[test]
     fn reaching_for_ungranted_catalog_read_fails_naming_it() {
@@ -3701,7 +3595,7 @@ fn audit(ctx, picks, workspace) { #{} }
 
     /// The ambient fields — `ctx.recent`, `ctx.config`, `ctx.target_count`,
     /// `ctx.now`, `ctx.pool` — stay available with no grant at all; only
-    /// `sets` and `history` are gated.
+    /// `sets` is gated.
     #[test]
     fn ungated_fields_stay_available_with_no_capabilities_granted() {
         let dir = tempfile::tempdir().unwrap();
@@ -4555,7 +4449,6 @@ fn audit(ctx, picks, workspace) { #{} }
             None,
             GrantedCapabilities {
                 catalog_read: true,
-                watch_history: false,
                 ..Default::default()
             },
         )

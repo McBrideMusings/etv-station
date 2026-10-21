@@ -168,7 +168,7 @@ There is no exhausted state. A channel cannot play its way to an empty list, bec
 
 Both halves of the generation model are now in place: the resume map (#72) and the play-history ledger (#70, sqlite-backed since #111). What reads the ledger the *other* way — the taste scorers of #74 and #82 — has also shipped.
 
-**`taste_scope: single_user` requires Plex (#282).** A channel scoped to one person (`scoring.user`) needs `PLEX_URL` and `PLEX_TOKEN` on the daemon, regardless of how the catalog is ingested and of the scorer's `plexdb_reader` datastore. Tautulli's user id and Plex's account id differ only for the server owner, and only Plex can say which account that is, so the translation cannot be skipped for accounts that merely look like they don't need it. A missing variable fails the channel at config load, naming both; the daemon's generation-time error remains as the backstop for an environment that changes after load.
+**`taste_scope: single_user` requires Plex (#282).** A channel scoped to one person (`scoring.user`) needs `PLEX_URL` and `PLEX_TOKEN` on the daemon, regardless of how the catalog is ingested and of the scorer's `plexdb_reader` datastore. `scoring.user` is a Plex account id or name, looked up in Plex's own `/accounts` list. A missing variable fails the channel at config load, naming both; the daemon's generation-time error remains as the backstop for an environment that changes after load.
 
 ### Future rules (designed for, not implemented)
 

@@ -257,14 +257,9 @@ pub struct PlexIngestStats {
 /// One real account Plex's own `/accounts` reports — the server owner and
 /// every home/shared user alike (#281).
 ///
-/// This is Plex's **own** id space, not Tautulli's — the two agree for every
-/// account except the server's owner, whom Plex's history stores under a
-/// small server-local id while Tautulli reports the same person under their
-/// much larger plex.tv id (plex-db-ex's own ADR-0010, in *that* project's
-/// `docs/adr/`, not this one's).
-/// `crate::daemon::SharedHistory` uses this list to translate a `single_user`
-/// channel's account into the id `plexdb_reader::Reader::taste_vector_for`
-/// actually keys its store on.
+/// This is Plex's **own** id space — the one `plexdb_reader::Reader::taste_vector_for`
+/// keys its store on. `crate::account::resolve` looks a `single_user` channel's
+/// `user` up in this list to find that id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlexAccount {
     pub id: i64,
@@ -1736,8 +1731,8 @@ impl PlexClient {
 /// Every real account `plex`'s server knows (#281) — one `/accounts` call,
 /// filtered by `valid_accounts`. Not part of the catalog ingest pass
 /// ([`ingest`] never calls this): it exists solely for
-/// `crate::daemon::SharedHistory` to translate a `single_user` channel's
-/// account into Plex's own id space, which [`PlexAccount`]'s doc explains.
+/// `crate::daemon::SharedAccounts` to resolve a `single_user` channel's
+/// `user` to a Plex account id, which [`PlexAccount`]'s doc explains.
 pub fn fetch_accounts(plex: &PlexEnv) -> Result<Vec<PlexAccount>, PlexIngestError> {
     let resp: AccountsResp =
         PlexClient::new(plex, Arc::new(Cancel::default())).get("/accounts", &[])?;

@@ -25,7 +25,7 @@ use etv_station::config::{ChannelConfig, NoRepeatWithin, Pool, read_channel};
 use etv_station::history::{HistoryDb, PlayRecord};
 use etv_station::resolve::{ResolvedItem, resolve_channel_with_resume};
 use etv_station::resume::{GenerationState, ResumeMap};
-use etv_station::score::{ScoreInputs, WatchEvent};
+use etv_station::score::ScoreInputs;
 use time::OffsetDateTime;
 
 /// Ten movies and three shows of unequal length, all locally sourced so
@@ -119,8 +119,7 @@ fn library() -> Catalog {
 /// all, so they are ineligible for the exploration slot and rank at the
 /// tied bottom by entry_id. Three real levels — a played title leading its
 /// own two closest, unwatched relatives — is enough to prove the ranking
-/// comes from this store and not from `ScoreInputs.history`, which is what
-/// the test below actually checks.
+/// comes from this store, which is what the test below actually checks.
 fn write_taste_fixture(path: &Path) {
     let conn = rusqlite::Connection::open(path).unwrap();
     conn.execute_batch(&format!(
@@ -390,28 +389,18 @@ fn a_block_level_constraint_is_inherited_without_reordering_the_pattern() {
 }
 
 /// Acceptance criterion 2: the plugin's ranking comes from the plex-db-ex
-/// datastore, not from this repo's own pooled watch history. `mov-contact`
-/// leads (see `write_taste_fixture`'s hand-computed scores), and moving
-/// `ScoreInputs.history` between two different runs changes nothing about
-/// which movies air or in what order, because `taste-cosine.rhai` never
-/// reads `ctx.history` at all — a stronger claim than "the order happens to
-/// match", which the equality assertion below checks directly.
+/// datastore. `mov-contact` leads (see `write_taste_fixture`'s hand-computed
+/// scores).
 ///
 /// Exploration is turned off here (`exploration_fraction: 0.0`, overriding
 /// the sample's own `0.2`): this test is checking the *rank*, and the
 /// seeded surprise slot has its own tests below and in
 /// `taste_cosine_scorer.rs`.
 #[test]
-fn the_datastore_taste_vector_decides_ranking_not_etv_stations_own_history() {
+fn the_datastore_taste_vector_decides_the_ranking() {
     let cat = library();
-    let with_history = |watched: &str| ScoreInputs {
+    let inputs = ScoreInputs {
         target_count: 20,
-        history: [WatchEvent {
-            entry_id: watched.into(),
-            watched_at: 900_000,
-            watcher: None,
-        }]
-        .into(),
         recent: Vec::new(),
         now: 900_000 + 3600,
         tz: None,
@@ -433,13 +422,8 @@ fn the_datastore_taste_vector_decides_ranking_not_etv_stations_own_history() {
         .collect::<Vec<_>>()
     };
 
-    let movies_a = resolve_with(&with_history("mov-arrival"));
-    let movies_b = resolve_with(&with_history("mov-blade"));
+    let movies_a = resolve_with(&inputs);
 
-    assert_eq!(
-        movies_a, movies_b,
-        "etv-station's own watch history must not move the movie ranking at all"
-    );
     assert_eq!(
         movies_a.first().map(String::as_str),
         Some("mov-contact"),

@@ -308,7 +308,7 @@ fn foryou_pool(plugin: &Path) -> Pool {
         on_short: Default::default(),
         constraints: None,
         config: None,
-        // The fixture scripts below never read `ctx.sets`/`ctx.history`, so no
+        // The fixture scripts below never read `ctx.sets`, so no
         // capability grant is needed (#167).
         capabilities: Vec::new(),
         datastores: Vec::new(),

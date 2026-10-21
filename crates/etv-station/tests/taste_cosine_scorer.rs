@@ -15,13 +15,16 @@
 //! uses for the generic datastore-grant mechanism this file exercises for
 //! one specific script.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source, TagNs};
 use etv_station::config::DatastoreGrant;
 use etv_station::score::{
-    Capability, GrantedCapabilities, PickedItem, PoolSources, ScoreCache, ScoreInputs, WatchEvent,
+    Capability, GrantedCapabilities, PickedItem, PoolSources, ScoreCache, ScoreInputs,
     declared_capabilities, declared_hooks, pick,
 };
 
@@ -33,7 +36,7 @@ fn plugin_path() -> PathBuf {
 }
 
 fn grant(db: &Path) -> GrantedCapabilities {
-    GrantedCapabilities::from_names(&["catalog_read".into(), "watch_history".into()])
+    GrantedCapabilities::from_names(&["catalog_read".into(), "http".into()])
         .with_datastores(&[DatastoreGrant {
             name: "taste".into(),
             path: db.to_str().unwrap().into(),
@@ -314,6 +317,16 @@ impl Scorer {
             recent: recent.iter().map(|s| (*s).to_string()).collect(),
             ..Default::default()
         };
+        // A pool that words a `why` makes the script fetch Tautulli's history.
+        // The dev shell exports the real `TAUTULLI_URL`, so point every test
+        // that does not serve its own Tautulli at a port nothing listens on.
+        let config = config.map(|mut c| {
+            if c.get("tautulli_url").is_none() {
+                c["tautulli_url"] = "http://127.0.0.1:1".into();
+                c["tautulli_api_key"] = "unused".into();
+            }
+            c
+        });
         pick(
             &self.cache,
             &self.script,
@@ -599,7 +612,7 @@ fn the_script_declares_pool_provider_and_all_three_capabilities() {
         caps,
         vec![
             Capability::CatalogRead,
-            Capability::WatchHistory,
+            Capability::Http,
             Capability::Datastore("taste".into()),
         ]
     );
@@ -2473,19 +2486,94 @@ fn temperature_loosens_the_ranking_by_seed_and_zero_keeps_it() {
     assert_eq!(detail_f64(moved, "temperature"), 1.0);
 }
 
-/// One generation with a watch history, `now` fixed at 10_000_000 seconds so
-/// a watch's age is the number a test writes.
-fn pick_with_history(
+/// One Tautulli `get_history` row a test serves: the Plex `ratingKey` of
+/// `entry` (see [`rating_key`]), how many days before `now` it stopped, and who
+/// watched.
+struct Watch {
+    entry_id: String,
+    days_ago: i64,
+    watcher: String,
+}
+
+fn watched(entry_id: &str, days_ago: i64, watcher: &str) -> Watch {
+    Watch {
+        entry_id: entry_id.into(),
+        days_ago,
+        watcher: watcher.into(),
+    }
+}
+
+/// The Plex `ratingKey` a fixture entry is filed under.
+fn rating_key(entry_id: &str) -> String {
+    format!("rk-{entry_id}")
+}
+
+/// A Tautulli stand-in answering exactly one request with `body`; returns its
+/// base URL and a handle yielding the request line it was asked.
+fn serve_tautulli_once(body: String) -> (String, std::thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        let reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(reply.as_bytes()).unwrap();
+        request.lines().next().unwrap_or_default().to_string()
+    });
+    (url, handle)
+}
+
+/// The history body Tautulli answers `get_history` with for `history`, `now`
+/// being 10_000_000 seconds so a watch's age is the number a test writes.
+fn history_body(history: &[Watch]) -> String {
+    let rows: Vec<serde_json::Value> = history
+        .iter()
+        .map(|w| {
+            serde_json::json!({
+                "rating_key": rating_key(&w.entry_id),
+                "stopped": 10_000_000 - w.days_ago * 86_400,
+                "friendly_name": w.watcher,
+                "user": w.watcher,
+            })
+        })
+        .collect();
+    serde_json::json!({ "response": { "data": { "data": rows } } }).to_string()
+}
+
+/// The `(source, source_id) -> entry_id` rows `ctx.entry_id_for` reads, for
+/// every fixture entry, plus `mov-d` again under the numeric key `7`.
+fn plex_rows() -> Arc<HashMap<(String, String), String>> {
+    let mut rows: HashMap<(String, String), String> = ["mov-a", "mov-b", "mov-c", "mov-d"]
+        .iter()
+        .map(|id| (("plex".to_string(), rating_key(id)), id.to_string()))
+        .collect();
+    rows.insert(("plex".to_string(), "7".to_string()), "mov-d".to_string());
+    Arc::new(rows)
+}
+
+/// One generation against a Tautulli at `url` (and `account_id`), `now` fixed
+/// at 10_000_000 seconds.
+fn pick_against_tautulli(
     scorer: &Scorer,
-    config: serde_json::Value,
-    history: Vec<WatchEvent>,
+    mut config: serde_json::Value,
+    url: &str,
+    account_id: Option<i64>,
 ) -> Vec<PickedItem> {
+    config["tautulli_url"] = url.into();
+    config["tautulli_api_key"] = "test-key".into();
     let inputs = ScoreInputs {
         target_count: 3,
         now: 10_000_000,
-        history: history.into(),
+        account_id,
         ..Default::default()
     };
+    let mut granted = grant(&scorer.db);
+    granted.entry_ids = Some(plex_rows());
     pick(
         &scorer.cache,
         &scorer.script,
@@ -2494,17 +2582,29 @@ fn pick_with_history(
         etv_station::variety::Dice::fixed(0),
         "movies",
         Some(&config),
-        grant(&scorer.db),
+        granted,
     )
     .unwrap()
 }
 
-fn watched(entry_id: &str, days_ago: i64, watcher: &str) -> WatchEvent {
-    WatchEvent {
-        entry_id: entry_id.into(),
-        watched_at: 10_000_000 - days_ago * 86_400,
-        watcher: Some(watcher.into()),
-    }
+fn pick_with_history(
+    scorer: &Scorer,
+    config: serde_json::Value,
+    history: Vec<Watch>,
+) -> Vec<PickedItem> {
+    pick_with_body(scorer, config, history_body(&history), None).0
+}
+
+/// The picks, and the request line the Tautulli stand-in was asked.
+fn pick_with_body(
+    scorer: &Scorer,
+    config: serde_json::Value,
+    body: String,
+    account_id: Option<i64>,
+) -> (Vec<PickedItem>, String) {
+    let (url, server) = serve_tautulli_once(body);
+    let picks = pick_against_tautulli(scorer, config, &url, account_id);
+    (picks, server.join().unwrap())
 }
 
 /// #319: a why line names an already-watched title for a keyword the pick
@@ -2560,6 +2660,79 @@ fn a_why_line_can_name_a_title_watched_inside_the_window() {
         field(&find(&none, "mov-c"), "why_reasons"),
         Some(serde_json::json!(["contact"]))
     );
+}
+
+/// A `rating_key` Tautulli sends as a JSON number joins like a string one.
+#[test]
+fn a_numeric_rating_key_joins_to_the_catalog() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+    let config = serde_json::json!({ "exploration_fraction": 0.0, "why": "Because" });
+    let body = serde_json::json!({ "response": { "data": { "data": [
+        { "rating_key": 7, "stopped": 10_000_000 - 86_400, "friendly_name": "pat", "user": "pat" },
+    ] } } })
+    .to_string();
+    let (picks, _) = pick_with_body(&scorer, config, body, None);
+    let bridged = picks
+        .iter()
+        .filter_map(|p| p.metadata.as_ref()?.get("why_bridge").cloned())
+        .any(|b| b["title"] == "mov-d");
+    assert!(
+        bridged,
+        "mov-d, watched under rating_key 7, must be citable"
+    );
+}
+
+/// A `single_user` channel asks Tautulli for its own account's rows.
+#[test]
+fn the_history_request_names_the_channels_account() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+    let config = serde_json::json!({ "exploration_fraction": 0.0, "why": "Because" });
+    let (_, pooled) = pick_with_body(&scorer, config.clone(), history_body(&[]), None);
+    assert!(!pooled.contains("user_id"), "{pooled}");
+    assert!(pooled.contains("cmd=get_history"), "{pooled}");
+    assert!(pooled.contains("apikey=test-key"), "{pooled}");
+    let (_, personal) = pick_with_body(&scorer, config, history_body(&[]), Some(42));
+    assert!(personal.contains("user_id=42"), "{personal}");
+}
+
+/// A wrong API key is an HTTP 200 whose `result` is "error": the picks come
+/// back with keyword reasons, as for an unreachable Tautulli.
+#[test]
+fn a_tautulli_error_reply_keeps_the_keyword_reasons() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+    let config = serde_json::json!({ "exploration_fraction": 0.0, "why": "Because" });
+    let body = serde_json::json!({ "response": {
+        "result": "error", "message": "Invalid apikey", "data": {},
+    } })
+    .to_string();
+    let (picks, _) = pick_with_body(&scorer, config, body, None);
+    let mov_c = picks.iter().find(|p| p.id == "mov-c").unwrap();
+    let meta = mov_c.metadata.as_ref().unwrap();
+    assert_eq!(
+        meta.get("why_reasons"),
+        Some(&serde_json::json!(["contact"]))
+    );
+    assert!(meta.get("why_bridge").is_none());
+}
+
+/// A Tautulli that does not answer degrades the reasons, not the ranking: the
+/// picks come back, each with its keyword reason and no bridge title.
+#[test]
+fn an_unreachable_tautulli_keeps_the_keyword_reasons() {
+    let scorer = Scorer::new(&small_catalog(), write_taste_fixture);
+    let config = serde_json::json!({ "exploration_fraction": 0.0, "why": "Because" });
+    let closed = {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    let picks = pick_against_tautulli(&scorer, config, &closed, None);
+    let mov_c = picks.iter().find(|p| p.id == "mov-c").unwrap();
+    let meta = mov_c.metadata.as_ref().unwrap();
+    assert_eq!(
+        meta.get("why_reasons"),
+        Some(&serde_json::json!(["contact"]))
+    );
+    assert!(meta.get("why_bridge").is_none());
 }
 
 /// A store where `seen` carries k1..k5 (so each is an equal-weight taste

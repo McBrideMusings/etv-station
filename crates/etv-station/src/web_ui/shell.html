@@ -1422,7 +1422,7 @@ const enc = encodeURIComponent;
 let poolsCtx = null;     // { channel, draft, data } for the Pools page on screen
 let poolsSeq = 0;        // a newer load supersedes an older one still waiting
 let poolsNotice = '';    // one line shown above the pools after a draft expired
-let accountsLoaded = null;  // GET /api/tautulli/users: the list, or null when Tautulli is not configured
+let accountsLoaded = null;  // GET /api/plex/accounts: the list, or null when Plex is not configured
 
 // A failed request is { error: 'HTTP <status>: <the server's error>', status }; anything else is the body.
 async function apiJson(method, path, body) {
@@ -1478,7 +1478,7 @@ async function loadPools(channel, draft) {
 
 async function loadAccounts() {
   if (accountsLoaded !== null) return accountsLoaded;
-  const data = await apiJson('GET', '/api/tautulli/users');
+  const data = await apiJson('GET', '/api/plex/accounts');
   accountsLoaded = data.error ? [] : data.results;
   return accountsLoaded;
 }
@@ -1573,7 +1573,7 @@ async function populateAccounts() {
   const users = await loadAccounts();
   const sel = $('acctSel');
   if (!sel) return;
-  for (const u of users) sel.insertAdjacentHTML('beforeend', `<option value="${esc(u.user_id)}">${esc(u.display_name)} (${esc(u.user_id)})</option>`);
+  for (const u of users) sel.insertAdjacentHTML('beforeend', `<option value="${esc(u.id)}">${esc(u.name)} (${esc(u.id)})</option>`);
 }
 
 function wirePools() {

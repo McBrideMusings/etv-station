@@ -67,11 +67,19 @@ impl Budget {
     }
 }
 
+/// The services the station reaches on a plugin's behalf: each is a base-URL
+/// variable and the secret variable that authenticates against it.
+const SERVICES: &[(&str, &str)] = &[
+    ("PLEX_URL", "PLEX_TOKEN"),
+    ("TAUTULLI_URL", "TAUTULLI_API_KEY"),
+];
+
 /// The environment variables a plugin may name as `{{NAME}}` in a
-/// [`call`]'s URL: where the station reaches Plex. The value is substituted
-/// here, in the station, so a script can reach Plex without ever holding the
-/// token; the response is the script's to read.
-pub const URL_ENV: &[&str] = &["PLEX_URL", "PLEX_TOKEN"];
+/// [`call`]'s URL: where the station reaches Plex and Tautulli, and the
+/// credential for each. The value is substituted here, in the station, so a
+/// script can reach a service without ever holding its credential; the
+/// response is the script's to read.
+pub const URL_ENV: &[&str] = &["PLEX_URL", "PLEX_TOKEN", "TAUTULLI_URL", "TAUTULLI_API_KEY"];
 
 /// `url` with each `{{NAME}}` for a [`URL_ENV`] name replaced by that
 /// variable's value. Any other `{{...}}` is left as written. A named variable
@@ -93,36 +101,41 @@ fn expand_url_with(url: &str, lookup: impl Fn(&str) -> Option<String>) -> Result
             .ok_or_else(|| format!("{name} is not set, but the url names {token}"))?;
         out = out.replace(&token, &value);
     }
-    // The token goes only to the host the station itself reaches Plex at, so a
-    // script cannot send it elsewhere by writing a different host in the url.
-    let token = "{{PLEX_TOKEN}}";
-    if url.contains(token) {
-        let plex = lookup("PLEX_URL").unwrap_or_default();
-        if host_of(&out) != host_of(&plex) {
-            return Err(format!(
-                "the url names {token} but its host is not the PLEX_URL host"
-            ));
+    // A credential goes only to the host the station itself reaches that
+    // service at, so a script cannot send it elsewhere by writing a different
+    // host in the url.
+    for (url_var, secret_var) in SERVICES {
+        let token = format!("{{{{{secret_var}}}}}");
+        if url.contains(&token) {
+            let service = lookup(url_var).unwrap_or_default();
+            if host_of(&out) != host_of(&service) {
+                return Err(format!(
+                    "the url names {token} but its host is not the {url_var} host"
+                ));
+            }
         }
     }
     Ok(out)
 }
 
-/// The host `url` reaches, for a log line: `{{PLEX_URL}}` is filled in (left
-/// as written when unset), and the credentials, path and query are dropped.
+/// The host `url` reaches, for a log line: each service's `{{..._URL}}` is
+/// filled in (left as written when unset), and the credentials, path and
+/// query are dropped.
 pub fn display_host(url: &str) -> String {
-    let plex = std::env::var("PLEX_URL").unwrap_or_default();
-    let shown = if plex.is_empty() {
-        url.to_string()
-    } else {
-        url.replace("{{PLEX_URL}}", &plex)
-    };
+    let mut shown = url.to_string();
+    for (url_var, _) in SERVICES {
+        let value = std::env::var(url_var).unwrap_or_default();
+        if !value.is_empty() {
+            shown = shown.replace(&format!("{{{{{url_var}}}}}"), &value);
+        }
+    }
     host_of(&shown).to_string()
 }
 
 /// `method` `url` with `body` (sent only when non-empty), returning the
 /// response body as text. A 4xx/5xx status, a transport failure and a timeout
-/// are all errors. `{{PLEX_URL}}` and `{{PLEX_TOKEN}}` in `url` are filled from
-/// the environment ([`URL_ENV`]).
+/// are all errors. `{{PLEX_URL}}`, `{{PLEX_TOKEN}}`, `{{TAUTULLI_URL}}` and
+/// `{{TAUTULLI_API_KEY}}` in `url` are filled from the environment ([`URL_ENV`]).
 pub fn call(url: &str, method: &str, body: &str, timeout: Duration) -> Result<String, String> {
     call_with(url, method, body, &[], timeout)
 }
@@ -373,6 +386,38 @@ pub(crate) mod tests {
         assert!(e.contains("PLEX_URL is not set"), "{e}");
         let empty = expand_url_with("{{PLEX_TOKEN}}", |_| Some(String::new())).unwrap_err();
         assert!(empty.contains("PLEX_TOKEN is not set"), "{empty}");
+    }
+
+    #[test]
+    fn every_service_variable_is_a_named_url_variable() {
+        for (url_var, secret_var) in SERVICES {
+            assert!(URL_ENV.contains(url_var) && URL_ENV.contains(secret_var));
+        }
+    }
+
+    #[test]
+    fn a_url_names_tautulli_by_placeholder_and_its_key_goes_nowhere_else() {
+        let env = |name: &str| match name {
+            "TAUTULLI_URL" => Some("http://tautulli.lan:8181".to_string()),
+            "TAUTULLI_API_KEY" => Some("k3y".to_string()),
+            _ => None,
+        };
+        let got = expand_url_with(
+            "{{TAUTULLI_URL}}/api/v2?apikey={{TAUTULLI_API_KEY}}&cmd=get_history",
+            env,
+        );
+        assert_eq!(
+            got.unwrap(),
+            "http://tautulli.lan:8181/api/v2?apikey=k3y&cmd=get_history"
+        );
+        let elsewhere =
+            expand_url_with("https://evil.example/c?k={{TAUTULLI_API_KEY}}", env).unwrap_err();
+        assert!(
+            elsewhere.contains("not the TAUTULLI_URL host"),
+            "{elsewhere}"
+        );
+        let unset = expand_url_with("{{TAUTULLI_URL}}/x", |_| None).unwrap_err();
+        assert!(unset.contains("TAUTULLI_URL is not set"), "{unset}");
     }
 
     #[test]

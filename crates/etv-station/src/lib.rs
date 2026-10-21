@@ -1,3 +1,4 @@
+pub mod account;
 pub mod annotate;
 pub mod atomic;
 pub mod audit;
@@ -39,7 +40,6 @@ pub mod scan;
 pub mod score;
 pub mod sequence;
 pub mod simulate;
-pub mod tautulli;
 #[cfg(test)]
 pub(crate) mod test_tracing;
 pub mod tracks;

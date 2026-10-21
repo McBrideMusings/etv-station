@@ -58,7 +58,8 @@
 // competes on taste alone. See the score assembly in pick().
 //
 // capabilities() declares catalog_read (for ctx.sets, built from sources()
-// below), watch_history, and a named datastore grant (#181). The channel
+// below, and ctx.entry_id_for), http (to read Tautulli's watch history itself,
+// see recent_watches() below), and a named datastore grant (#181). The channel
 // pool that names this script must grant all three under that pool's
 // `capabilities:` / `datastores:`, or the load fails naming whichever is
 // missing.
@@ -83,15 +84,16 @@
 //                        under `taste_scope: single_user` (#278, ADR 0005),
 //                        or unit `()` on a pooled (`all_users`) channel —
 //                        this script never resolves a username itself; the
-//                        station already did, from watch history it holds
-//                        and this sandbox cannot reach
+//                        station already did, against Plex's account list
+//                        that this sandbox cannot reach
 //   ctx.recent           the entry_ids this channel aired most recently,
 //                        oldest first and newest LAST, capped at the
 //                        channel's `scoring.recent_depth` (default 200).
 //                        Airings of THIS channel, not Plex watch events —
-//                        `ctx.history` is the other thing; this script reads
-//                        it only to name a watched title as a pick's reason
-//                        (#319). Ambient: no capability gates ctx.recent.
+//                        recent_watches() is the other thing; this script
+//                        reads those only to name a watched title as a pick's
+//                        reason (#319). Ambient: no capability gates
+//                        ctx.recent.
 //   ctx.datastore(name)  a handle onto the plex-db-ex reader (#181),
 //                        exposing enrichment_for_many / pooled_taste_vector
 //                        among others
@@ -193,7 +195,7 @@ fn genre_bucket() { "genres" }
 // no-repeat rule will notice. "only" and "exclude" cannot overlap, so a
 // comfort pool and a discovery pool are disjoint by construction.
 //
-// The source is the datastore's lifetime play set, not `ctx.history` — that
+// The source is the datastore's lifetime play set, not recent_watches() — that
 // is the newest 1000 Tautulli rows, so a film watched three years ago would
 // read as unseen and land in the discovery half.
 fn seen_mode(ctx) { tunable(ctx, "seen", "any") }
@@ -243,10 +245,11 @@ fn rating_number(v) {
 }
 
 // How far back a watched title may be cited as the reason for a pick (#319),
-// in days. `ctx.history` is the newest 1000 rows with no age bound, so without
-// this a title the house watched eleven months ago could be named as the
-// reason for tonight's film. Read only when the pool sets `why` on a movies
-// pool; a pick with no title inside the window keeps its keyword reason.
+// in days. Tautulli's history is the newest 1000 rows with no age bound, so
+// without this a title the house watched eleven months ago could be named as
+// the reason for tonight's film. Read only when the pool sets `why` on a
+// movies pool; a pick with no title inside the window keeps its keyword
+// reason.
 fn bridge_window_days(ctx) { tunable(ctx, "bridge_window_days", 30).to_int() }
 
 // How much a candidate is discounted for sitting close to what the WHOLE
@@ -356,9 +359,69 @@ fn display_keys(ds, keys) {
     out
 }
 
+// Recent watch events from Tautulli, newest first, each
+// `#{ entry_id, watched_at, watcher }`; rows older than `cutoff` (unix seconds)
+// and rows whose title is not in the catalog are dropped. Empty when Tautulli
+// is not configured or does not answer — a ranking without bridge titles is a
+// degraded ranking, not a failed one.
+//
+// The script reaches Tautulli itself (ADR 0014): `ctx.http` fills
+// `{{TAUTULLI_URL}}` and `{{TAUTULLI_API_KEY}}` from the station's environment,
+// so the key never sits in this file or a channel config. `config.tautulli_url`
+// and `config.tautulli_api_key` replace them when a pool must name another
+// server.
+//
+// A `single_user` channel asks for that account's rows by `user_id =
+// ctx.account_id`. Tautulli numbers the server owner differently from Plex, so
+// the owner's channel gets no rows here and keeps its keyword reasons.
+//
+// Each row joins to the catalog by Plex `ratingKey`: `ctx.entry_id_for("plex",
+// rating_key)`. Tautulli types `rating_key` as a number in some versions and a
+// string in others, so it is read through to_string().
+fn recent_watches(ctx, cutoff) {
+    let base = tunable(ctx, "tautulli_url", "{{TAUTULLI_URL}}");
+    let key = tunable(ctx, "tautulli_api_key", "{{TAUTULLI_API_KEY}}");
+    let url = base + "/api/v2?apikey=" + key + "&cmd=get_history&length=1000";
+    if ctx.account_id != () { url += "&user_id=" + ctx.account_id; }
+    let rows = [];
+    try {
+        let reply = parse_json(ctx.http(url, "GET", "")).response;
+        // A wrong API key is an HTTP 200 whose `result` is "error".
+        if reply.result == "error" { throw "tautulli answered: " + reply.message; }
+        rows = reply.data.data;
+    } catch (e) {
+        log("pool " + ctx.pool + ": watch history unavailable, naming no bridge titles: " + e);
+        return [];
+    }
+    if rows.len == 0 && ctx.account_id != () {
+        log("pool " + ctx.pool + ": tautulli has no rows for user_id " + ctx.account_id + " — the server owner has a different id in Tautulli than in Plex");
+    }
+    let known = #{};
+    let out = [];
+    for row in rows {
+        if row.rating_key == () || row.stopped == () || row.stopped < cutoff { continue; }
+        let rk = row.rating_key.to_string();
+        if known[rk] == () {
+            let found = ctx.entry_id_for("plex", rk);
+            known[rk] = if found == () { "" } else { found };
+        }
+        if known[rk] == "" { continue; }
+        let who = "";
+        // trim() edits a string in place in Rhai, so it works on a copy.
+        for name in [row.friendly_name, row.user] {
+            if name == () { continue; }
+            let trimmed = name;
+            trimmed.trim();
+            if trimmed != "" { who = trimmed; break; }
+        }
+        out.push(#{ entry_id: known[rk], watched_at: row.stopped, watcher: who });
+    }
+    out
+}
+
 fn hooks() { ["pool_provider"] }
 
-fn capabilities() { ["catalog_read", "watch_history", #{ datastore: datastore_name() }] }
+fn capabilities() { ["catalog_read", "http", #{ datastore: datastore_name() }] }
 
 // Both sets this script can rank. A pool picks one with `unit:` in its
 // `config:` and SHOULD narrow `sources:` to match — a pool that overrides
@@ -1181,12 +1244,12 @@ fn pick(ctx) {
     // arrives newest-first only by convention, so it is sorted here, with
     // entry_id breaking a tie, to keep two runs over the same data agreeing.
     let bridge_idx = #{};
-    if ctx.config["why"] != () && unit_kind == "movie" && ctx.history.len > 0 {
-        let cutoff = ctx.now - bridge_window_days(ctx) * 86400;
-        let evs = [];
-        for e in ctx.history {
-            if e.watched_at >= cutoff { evs.push(e); }
-        }
+    let evs = if ctx.config["why"] != () && unit_kind == "movie" {
+        recent_watches(ctx, ctx.now - bridge_window_days(ctx) * 86400)
+    } else {
+        []
+    };
+    if evs.len > 0 {
         evs.sort(|a, b| {
             if a.watched_at > b.watched_at { -1 } else if a.watched_at < b.watched_at { 1 }
             else if a.entry_id < b.entry_id { -1 } else if a.entry_id > b.entry_id { 1 }

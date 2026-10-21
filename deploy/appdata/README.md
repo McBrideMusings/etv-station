@@ -67,9 +67,11 @@ the catalog) and `ETV_STATION_IDENTITY_ROOTS` (the root stripped when deriving
 a local item's identity, a separate decision — #243) — Plex credentials
 (`PLEX_URL`, `PLEX_TOKEN`), and Tautulli credentials (`TAUTULLI_URL`,
 `TAUTULLI_API_KEY`) are per-host, so they come from the container's
-environment rather than from any file here. Tautulli is what a scorer plugin
-ranks by: without it the watch history the daemon hands the script is empty,
-and the ranking is arbitrary.
+environment rather than from any file here. The station never contacts
+Tautulli: a plugin granted `http` writes `{{TAUTULLI_URL}}` and
+`{{TAUTULLI_API_KEY}}` in a `ctx.http` url and the station fills them in.
+`taste-cosine.rhai` reads its watch history that way, to name a watched title
+in a pick's `why` line; without them the ranking is unchanged.
 
 Only `README.md` is committed — the channels, blocks, overlays, and the
 station config itself (including its `ffmpeg:`/`normalization:` block) are
