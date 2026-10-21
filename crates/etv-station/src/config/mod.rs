@@ -1,6 +1,6 @@
 mod arcs;
 mod block;
-mod categories;
+pub(crate) mod categories;
 mod channel;
 mod chronology;
 mod constraints;
