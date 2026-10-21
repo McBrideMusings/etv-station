@@ -3071,23 +3071,6 @@ async fn pattern_catch_up(
             );
         }
 
-        // Render each item's `guide:` overrides (#158) — they need the
-        // schedule (this item's own start/finish, a one-item lookahead),
-        // which `resolve_channel_with_resume` did not have: that call happens
-        // before duration-probing has assigned any item a real length. Done
-        // here rather than inside `resolve` so it lands on whatever the
-        // channel actually scheduled, however that list was chosen: a plugin
-        // pool, a CEL query, or a hand-written entry list all get the same
-        // treatment.
-        render_guide(
-            &mut items,
-            &durations,
-            from,
-            &channel.name,
-            channel.config.display_name.as_deref(),
-            explain_wanted,
-        );
-
         // A channel with an `anchor` in the past joins its list where elapsed
         // time says it should be, rather than at item 0 — "this station has been
         // broadcasting since 2020". Only on the very first generation: after
@@ -3116,13 +3099,12 @@ async fn pattern_catch_up(
 
         // The align/fill pass (ADR 0004's accepted drift, closed): bumpers for
         // the gap between a programme's end and its block's next grid line.
-        // After probing and guide rendering, so it sees real lengths and the
-        // guide text never sees a bumper as a neighbour; before chunk slicing,
-        // so the chunk files hold the bumpers. A joined-mid-list generation
+        // After probing, so it sees real lengths; before chunk slicing, so the
+        // chunk files hold the bumpers. A joined-mid-list generation
         // has no real gap at its head (`seq_start` is in the past).
         let programmes = items.len();
         let crate::bumper::fill::Laid {
-            items,
+            mut items,
             durations,
             progress,
             bumper_records,
@@ -3140,6 +3122,24 @@ async fn pattern_catch_up(
             seq_start,
             seq_start == from,
             &resume_out,
+        );
+        // Render each item's `guide:` overrides (#158) — they need the
+        // schedule (this item's own start/finish, a one-item lookahead),
+        // which `resolve_channel_with_resume` did not have: that call happens
+        // before duration-probing has assigned any item a real length. Done
+        // here rather than inside `resolve` so it lands on whatever the
+        // channel actually scheduled, however that list was chosen: a plugin
+        // pool, a CEL query, or a hand-written entry list all get the same
+        // treatment. After the align/fill pass, so the start/stop/next_start
+        // times include the bumpers; `render_guide` still reads only
+        // programmes as neighbours.
+        render_guide(
+            &mut items,
+            &durations,
+            from,
+            &channel.name,
+            channel.config.display_name.as_deref(),
+            explain_wanted,
         );
         let (items_slice, durations_slice, progress_slice) =
             (&items[skip..], &durations[skip..], &progress[skip..]);
@@ -4061,12 +4061,30 @@ pub(crate) fn render_guide(
         .map(|item| item.program.as_ref().and_then(|p| p.title.clone()))
         .collect();
 
-    let generated_at = OffsetDateTime::now_utc();
+    // Every item's start and stop on the (possibly bumper-filled) schedule.
+    let mut spans = Vec::with_capacity(durations.len());
     let mut airing = from;
-    for (idx, dur) in durations.iter().enumerate() {
+    for dur in durations {
         let start = airing;
-        let stop = start + time::Duration::seconds_f64(dur.as_secs_f64());
-        airing = stop;
+        airing = start + time::Duration::seconds_f64(dur.as_secs_f64());
+        spans.push((start, airing));
+    }
+    // The neighbours a template reads are programmes: a bumper the align/fill
+    // pass inserted is never an item's `next_title` or `prev_title`.
+    let is_programme = |i: usize| items[i].bumper.is_none();
+    let next_programme: Vec<Option<usize>> = (0..durations.len())
+        .map(|i| (i + 1..durations.len()).find(|&j| is_programme(j)))
+        .collect();
+    let prev_programme: Vec<Option<usize>> = (0..durations.len())
+        .map(|i| (0..i).rev().find(|&j| is_programme(j)))
+        .collect();
+
+    let generated_at = OffsetDateTime::now_utc();
+    for idx in 0..durations.len() {
+        if items[idx].bumper.is_some() {
+            continue;
+        }
+        let (start, stop) = spans[idx];
 
         let explain = explain_wanted
             .then(|| explain_line_for(items[idx].metadata.as_ref()))
@@ -4102,15 +4120,9 @@ pub(crate) fn render_guide(
             channel_identity,
             channel_name,
             program_title: program_title.as_deref(),
-            next_title: base_titles
-                .get(idx + 1)
-                .and_then(|t: &Option<String>| t.as_deref()),
-            next_start: (idx + 1 < durations.len()).then_some(stop),
-            prev_title: if idx > 0 {
-                base_titles[idx - 1].as_deref()
-            } else {
-                None
-            },
+            next_title: next_programme[idx].and_then(|j| base_titles[j].as_deref()),
+            next_start: next_programme[idx].map(|j| spans[j].0),
+            prev_title: prev_programme[idx].and_then(|j| base_titles[j].as_deref()),
             start,
             stop,
             now: generated_at,
@@ -4301,6 +4313,47 @@ mod render_guide_tests {
             Some("Second"),
             "the last item has no next, so prev is used"
         );
+    }
+
+    /// A bumper between two programmes shifts the next programme's start and
+    /// is never a neighbour: `{next_start}` is the next programme's real
+    /// start, `{next_title}` skips the bumper, `{start}` is unaffected.
+    #[test]
+    fn bumpers_shift_times_but_are_not_neighbours() {
+        let guide = Some(GuideConfig {
+            description: Some("{next_title} at {next_start}".into()),
+            title: None,
+            sub_title: None,
+            categories: None,
+        });
+        let mut bumper = item_with_guide("bump", "Bumper", None);
+        bumper.bumper = Some(serde_json::json!({}));
+        let mut items = vec![
+            item_with_guide("a", "First", guide),
+            bumper,
+            item_with_guide("b", "Second", None),
+        ];
+        let durations = vec![
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+            Duration::from_secs(60),
+        ];
+        render_guide(
+            &mut items,
+            &durations,
+            datetime!(2026-08-13 00:00 UTC),
+            "diehard",
+            None,
+            false,
+        );
+        let description = items[0]
+            .program
+            .as_ref()
+            .unwrap()
+            .description
+            .clone()
+            .unwrap();
+        assert_eq!(description, "Second at 2026-08-13T00:03:00Z");
     }
 
     /// Explain audit records with a `pool`-stage `verdict`, for the tests
