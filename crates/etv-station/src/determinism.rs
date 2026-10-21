@@ -317,6 +317,7 @@ mod tests {
                 channels: Vec::new(),
                 categories: Vec::new(),
                 chronologies: Vec::new(),
+                arcs: Vec::new(),
                 source_roots: Vec::new(),
                 identity_roots: Vec::new(),
                 catalog_path,
@@ -649,6 +650,7 @@ fn audit(ctx, picks, workspace) {
 
     fn plugin_pool(script: &Path) -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,

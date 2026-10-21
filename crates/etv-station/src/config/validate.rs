@@ -1646,6 +1646,7 @@ mod tests {
 
     fn pool(name: &str) -> Pool {
         Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
@@ -1935,6 +1936,7 @@ mod tests {
             channels: vec![],
             categories: Vec::new(),
             chronologies: Vec::new(),
+            arcs: Vec::new(),
             source_roots: vec![],
             identity_roots: vec![],
             catalog_path: None,
@@ -1968,6 +1970,7 @@ mod tests {
             channels: vec!["channels/a.yaml".into()],
             categories: Vec::new(),
             chronologies: Vec::new(),
+            arcs: Vec::new(),
             source_roots: vec![],
             identity_roots: vec![],
             catalog_path: None,
@@ -2002,6 +2005,7 @@ mod tests {
             channels: vec!["channels/a.yaml".into()],
             categories: Vec::new(),
             chronologies: Vec::new(),
+            arcs: Vec::new(),
             source_roots: vec![],
             identity_roots: vec![],
             catalog_path: None,
@@ -2034,6 +2038,7 @@ mod tests {
             channels: vec!["  ".into()],
             categories: Vec::new(),
             chronologies: Vec::new(),
+            arcs: Vec::new(),
             source_roots: vec![],
             identity_roots: vec![],
             catalog_path: None,
@@ -2559,8 +2564,9 @@ mod tests {
     fn rejects_filter_on_a_pattern_block() {
         let mut b = pattern_block(vec![pool("movies")], vec![step("movies", 1)]);
         b.filter = Some(crate::config::Filter {
-            seasons: Some(vec![1]),
+            seasons: Some(vec![1.into()]),
             episode_ids: None,
+            ..Default::default()
         });
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(
@@ -2574,8 +2580,9 @@ mod tests {
     fn rejects_filter_on_a_sequencer_block() {
         let mut b = sequencer_block(vec![pool("movies")]);
         b.filter = Some(crate::config::Filter {
-            seasons: Some(vec![1]),
+            seasons: Some(vec![1.into()]),
             episode_ids: None,
+            ..Default::default()
         });
         let err = validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err();
         assert!(
@@ -2592,6 +2599,7 @@ mod tests {
         b.filter = Some(crate::config::Filter {
             seasons: None,
             episode_ids: None,
+            ..Default::default()
         });
         validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap();
     }

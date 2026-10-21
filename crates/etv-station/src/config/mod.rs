@@ -1,3 +1,4 @@
+mod arcs;
 mod block;
 mod categories;
 mod channel;
@@ -21,6 +22,7 @@ mod validate;
 pub mod variety;
 
 pub use crate::guide::GuideConfig;
+pub use arcs::{ArcBucket, ArcFile, Arcs};
 pub use block::{BlockFile, Duplicates};
 pub use channel::{AnnotateConfig, ChannelConfig, ChannelGuide, ChannelSubtitle, ScoringConfig};
 pub use chronology::{Chronologies, Chronology, ChronologyFile, ChronologyRef};
@@ -29,7 +31,7 @@ pub use entry::{
     ChronologyEntry, CollectionEntry, Entry, Fallback, IncludeEntry, ItemEntry, QueryEntry,
 };
 pub use fill::{Align, DEFAULT_MIN_FILL, FillEntry};
-pub use filter::Filter;
+pub use filter::{Filter, SeasonSel};
 pub use hooks::{HookDecl, HookGrant, HookTrigger};
 pub use load::{
     DroppedChannel, LoadedChannel, Station, expand_process_env, load, load_for_inspection,

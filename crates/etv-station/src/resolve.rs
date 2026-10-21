@@ -57,9 +57,9 @@ use time::OffsetDateTime;
 
 use crate::catalog::{Catalog, EntrySource, TagNs, canonical_path, derive_entry_id};
 use crate::config::{
-    BlockInclude, ChannelConfig, ChronologyEntry, ChronologyRef, CollectionEntry, Constraints,
-    Duplicates, Entry, Fallback, Filter, ItemEntry, Mode, NoRepeatWithin, Order, QueryEntry,
-    ShowGroup, SourceConfig,
+    ArcBucket, BlockInclude, ChannelConfig, ChronologyEntry, ChronologyRef, CollectionEntry,
+    Constraints, Duplicates, Entry, Fallback, Filter, ItemEntry, Mode, NoRepeatWithin, Order,
+    QueryEntry, SeasonSel, ShowGroup, SourceConfig,
 };
 use crate::constrain::{ItemKeys, Limits, RepeatGap};
 use crate::errors::ConfigError;
@@ -2072,8 +2072,17 @@ fn resolve_chronology(
     pending_items(catalog, ids)
 }
 
+/// What `filter.seasons` resolved to: the wanted season numbers, each item's
+/// catalog season, and the items inside a wanted arc (#163).
+struct SeasonFilter {
+    numbers: HashSet<i64>,
+    by_id: HashMap<String, i64>,
+    in_arc: HashSet<String>,
+}
+
 /// Narrow a block's resolved list to `filter`'s restrictions (#197): `seasons`
-/// keeps only items whose catalog season is in the list, `episode_ids` keeps
+/// keeps only items whose catalog season is in the list (or that fall in a
+/// named show arc, #163), `episode_ids` keeps
 /// only items whose id is in the list, and with both set an item must satisfy
 /// both — two "restrict to" fields combine as a narrower set, not a union.
 ///
@@ -2089,14 +2098,46 @@ fn apply_filter(
     // The wanted seasons and the id -> season map they are checked against
     // both exist only when `filter.seasons` is set, so they travel as one
     // value instead of a set plus a map that means nothing without it.
-    let season_filter: Option<(HashSet<i64>, HashMap<String, i64>)> = match &filter.seasons {
+    let season_filter: Option<SeasonFilter> = match &filter.seasons {
         Some(wanted) => {
             let cat = catalog.ok_or_else(|| {
                 "filter.seasons needs the catalog, which is not available".to_string()
             })?;
             let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
             let by_id = cat.seasons_for(&ids).map_err(|e| e.to_string())?;
-            Some((wanted.iter().map(|&n| i64::from(n)).collect(), by_id))
+            let numbers = wanted
+                .iter()
+                .filter_map(|s| match s {
+                    SeasonSel::Number(n) => Some(i64::from(*n)),
+                    SeasonSel::Arc(_) => None,
+                })
+                .collect();
+            // An arc name is a pseudo-season of the show that declares it, so
+            // the episodes it keeps come from the arcs' own ranges.
+            let arc_names: HashSet<&str> = filter.arc_names().collect();
+            let in_arc = if arc_names.is_empty() {
+                HashSet::new()
+            } else {
+                let arcs = filter.arcs.as_deref().ok_or_else(|| {
+                    "filter.seasons names an arc, which only a station load can resolve; \
+                     list the arcs file under `arcs:` in the station config"
+                        .to_string()
+                })?;
+                let positions = cat.arc_positions_for(&ids).map_err(|e| e.to_string())?;
+                positions
+                    .into_iter()
+                    .filter(|(_, (show, absolute))| {
+                        matches!(arcs.bucket(show, *absolute),
+                            Some(ArcBucket::Named(arc)) if arc_names.contains(arc))
+                    })
+                    .map(|(id, _)| id)
+                    .collect()
+            };
+            Some(SeasonFilter {
+                numbers,
+                by_id,
+                in_arc,
+            })
         }
         None => None,
     };
@@ -2108,10 +2149,11 @@ fn apply_filter(
     Ok(items
         .into_iter()
         .filter(|item| {
-            let season_ok = season_filter.as_ref().is_none_or(|(wanted, by_id)| {
-                by_id
-                    .get(&item.id)
-                    .is_some_and(|season| wanted.contains(season))
+            let season_ok = season_filter.as_ref().is_none_or(|f| {
+                f.in_arc.contains(&item.id)
+                    || f.by_id
+                        .get(&item.id)
+                        .is_some_and(|season| f.numbers.contains(season))
             });
             let episode_ok = episode_ids
                 .as_ref()
@@ -3524,8 +3566,9 @@ mod tests {
         })]);
         inc.order = None; // let the season/episode default (#95) order the survivors
         inc.filter = Some(Filter {
-            seasons: Some(vec![1]),
+            seasons: Some(vec![1.into()]),
             episode_ids: None,
+            ..Default::default()
         });
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
@@ -3549,6 +3592,7 @@ mod tests {
         inc.filter = Some(Filter {
             seasons: None,
             episode_ids: Some(vec!["lavfi:b".into()]),
+            ..Default::default()
         });
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap();
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
@@ -3559,8 +3603,9 @@ mod tests {
     fn filter_seasons_without_a_catalog_errors() {
         let mut inc = include_with(vec![Entry::Item(Box::new(item_entry("a")))]);
         inc.filter = Some(Filter {
-            seasons: Some(vec![1]),
+            seasons: Some(vec![1.into()]),
             episode_ids: None,
+            ..Default::default()
         });
         let err = resolve_channel(&channel(vec![inc]), path(), &[], None, None).unwrap_err();
         assert!(
@@ -3579,8 +3624,9 @@ mod tests {
             order: None,
         })]);
         inc.filter = Some(Filter {
-            seasons: Some(vec![1]),                 // id-a, id-c
+            seasons: Some(vec![1.into()]),          // id-a, id-c
             episode_ids: Some(vec!["id-b".into()]), // season 2 — disjoint from the above
+            ..Default::default()
         });
         let err = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap_err();
         assert!(format!("{err}").contains("zero items"), "err = {err}");
@@ -3597,6 +3643,7 @@ mod tests {
         inc.filter = Some(Filter {
             seasons: None,
             episode_ids: None,
+            ..Default::default()
         });
         let items = resolve_channel(&channel(vec![inc]), path(), &[], None, Some(&cat)).unwrap();
         assert_eq!(items.len(), 3, "an empty [filter] table restricts nothing");
@@ -3886,6 +3933,7 @@ mod tests {
         let mut inc = include_with(vec![]);
         inc.pools = vec![
             Pool {
+                arcs: None,
                 seed: None,
                 temperature: None,
                 tracks: None,
@@ -3914,6 +3962,7 @@ mod tests {
                 guide: None,
             },
             Pool {
+                arcs: None,
                 seed: None,
                 temperature: None,
                 tracks: None,
@@ -4837,6 +4886,7 @@ fn annotate(ctx, item) { #{ seen: item.entry_id, title: item.title } }"#,
         let cat = interleave_catalog();
         let mut inc = include_with(vec![]);
         inc.pools = vec![Pool {
+            arcs: None,
             seed: None,
             temperature: None,
             tracks: None,
