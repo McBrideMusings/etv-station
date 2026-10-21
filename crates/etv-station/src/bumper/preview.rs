@@ -267,6 +267,19 @@ fn build(ctx) {
     }
 
     #[test]
+    fn a_gap_just_over_max_secs_is_covered_by_the_card_alone() {
+        let preview = text_card("up-next", 20_000);
+        let segs = &preview.resolved.segments;
+        let card_ms: u64 = segs
+            .iter()
+            .filter(|s| !s.filler)
+            .map(|s| s.duration_ms)
+            .sum();
+        assert_eq!(card_ms, 20_000);
+        assert!(segs.iter().all(|s| !s.filler), "a filler segment aired");
+    }
+
+    #[test]
     fn a_text_card_never_airs_an_unfilled_slot() {
         for card in ["up-next", "just-ended", "sleep"] {
             let json = text_card(card, 12_000).items_json();
