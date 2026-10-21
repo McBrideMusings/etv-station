@@ -665,13 +665,23 @@ pub fn join_offered(offered: &[&str]) -> String {
 /// throwing `capabilities()`, an entry that is neither a string nor a
 /// `#{ datastore: "name" }` map, an unknown string capability, a capability
 /// another hook offers, or a datastore entry with an empty or non-string name.
+///
+/// A convenience wrapper over [`compile_plugin`] +
+/// [`declared_capabilities_from_ast`]; a caller that already compiled the
+/// script for another inspection should call the latter with that `AST`.
 pub fn declared_capabilities(script_path: &Path, hook: &str) -> Result<Vec<Capability>, String> {
-    let source = std::fs::read_to_string(script_path)
-        .map_err(|e| format!("read plugin {}: {e}", script_path.display()))?;
+    let ast = compile_plugin(script_path)?;
+    declared_capabilities_from_ast(&ast, script_path, hook)
+}
+
+/// [`declared_capabilities`], given a script already compiled by
+/// [`compile_plugin`] — `script_path` only names the script in errors.
+pub fn declared_capabilities_from_ast(
+    ast: &rhai::AST,
+    script_path: &Path,
+    hook: &str,
+) -> Result<Vec<Capability>, String> {
     let engine = engine();
-    let ast = engine
-        .compile(&source)
-        .map_err(|e| format!("compile plugin {}: {e}", script_path.display()))?;
 
     if !ast.iter_functions().any(|f| f.name == "capabilities") {
         return Ok(Vec::new());
@@ -679,7 +689,7 @@ pub fn declared_capabilities(script_path: &Path, hook: &str) -> Result<Vec<Capab
 
     let mut scope = Scope::new();
     let declared: Array = engine
-        .call_fn(&mut scope, &ast, "capabilities", ())
+        .call_fn(&mut scope, ast, "capabilities", ())
         .map_err(|e| format!("plugin {}: capabilities(): {e}", script_path.display()))?;
 
     let mut out = Vec::with_capacity(declared.len());
