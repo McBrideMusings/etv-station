@@ -39,9 +39,9 @@ normalization:
   video:
     format: h264
     bit_depth: 8
-    width: 1280
-    height: 720
-    bitrate_kbps: 2000
-    buffer_kbps: 4000
+    width: 1920
+    height: 1080
+    bitrate_kbps: 6000
+    buffer_kbps: 12000
   subtitle:
     mode: convert
