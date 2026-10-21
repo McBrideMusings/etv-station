@@ -194,6 +194,26 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
         None => (url.clone(), String::new()),
     };
 
+    let content_type = request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Content-Type"))
+        .map(|h| h.value.to_string());
+    if let Some(Reply::Json(status, refusal)) =
+        reject_non_json_post(&method, content_type.as_deref())
+    {
+        tracing::info!(
+            event = "ui.request",
+            method = %method,
+            path = %path,
+            status,
+            content_type = content_type.as_deref(),
+            "POST refused: not application/json"
+        );
+        respond_json(request, status, &refusal);
+        return;
+    }
+
     let mut body = String::new();
     if matches!(method, Method::Post) {
         let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
@@ -228,6 +248,26 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
             );
             respond_json(request, status, &body);
         }
+    }
+}
+
+/// A POST that is not `application/json` is a "simple" cross-site request: a
+/// page the user visits can send one to this port with no CORS preflight. JSON
+/// forces the preflight, which a cross-site page cannot pass, so every POST
+/// route answers 415 to anything else, before its body is read.
+fn reject_non_json_post(method: &Method, content_type: Option<&str>) -> Option<Reply> {
+    if *method != Method::Post {
+        return None;
+    }
+    let media_type = content_type
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    match media_type {
+        Some(t) if t.eq_ignore_ascii_case("application/json") => None,
+        _ => Some(Reply::Json(
+            415,
+            json!({"error": "POST bodies must be sent as Content-Type: application/json"}),
+        )),
     }
 }
 
@@ -784,6 +824,29 @@ mod tests {
             );
         std::fs::write(dir.join("channel.yaml"), channel).unwrap();
         f
+    }
+
+    #[test]
+    fn only_a_json_content_type_passes_the_post_check() {
+        let refused = |method: &Method, content_type: Option<&str>| match reject_non_json_post(
+            method,
+            content_type,
+        ) {
+            Some(Reply::Json(status, body)) => Some((status, body)),
+            Some(_) => panic!("refusal was not JSON"),
+            None => None,
+        };
+        for ct in [
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+            None,
+        ] {
+            let (status, body) = refused(&Method::Post, ct).expect("refused");
+            assert_eq!(status, 415, "{ct:?}: {body}");
+        }
+        assert!(refused(&Method::Post, Some("application/json")).is_none());
+        assert!(refused(&Method::Post, Some("Application/JSON; charset=utf-8")).is_none());
+        assert!(refused(&Method::Get, None).is_none());
     }
 
     fn post_render(state: &mut AppState, body: Value) -> (u16, Value) {

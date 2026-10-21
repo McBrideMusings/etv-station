@@ -747,7 +747,7 @@ async function requestRender(channel, body, name) {
   panel.innerHTML = `${title}<div class="muted"><span class="spinner"></span>Queuing…</div>`;
   let id;
   try {
-    const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/graphics/render`, { method: 'POST', body: JSON.stringify(body) });
+    const res = await fetch(`/api/channels/${encodeURIComponent(channel)}/graphics/render`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     const data = await res.json();
     if (!res.ok && res.status !== 202) { fail(`HTTP ${res.status}: ${data.error || 'no error message'}`); return; }
     id = data.render;

@@ -71,7 +71,8 @@ trap 'rm -f "$body"' EXIT
 deadline=$(( $(date +%s) + ${ETV_UI_WAIT:-900} ))
 while :; do
   curl_args=(-sS --max-time 600 -X "$method" -o "$body" -w '%{http_code}')
-  [ -z "$data" ] || curl_args+=(-H 'Content-Type: application/json' -d "$data")
+  curl_args+=(-H 'Content-Type: application/json')
+  [ -z "$data" ] || curl_args+=(-d "$data")
   if ! status="$(curl "${curl_args[@]}" "$base$path")"; then
     echo "ui-get: cannot reach $base$path" >&2
     exit 2
