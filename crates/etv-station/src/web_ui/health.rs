@@ -27,6 +27,7 @@
 //! was decided on.
 
 use super::*;
+use std::sync::Mutex;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -47,6 +48,77 @@ pub struct HealthSources {
     pub accel: Option<String>,
     /// `ETV_VAAPI_DEVICE`: the render node expected on a VAAPI command line.
     pub vaapi_device: Option<String>,
+    /// The last read of ETV-next's failure state, refreshed off the request thread.
+    pub upstream: Arc<UpstreamReading>,
+}
+
+/// How long a reading of ETV-next is served before a refresh starts.
+const UPSTREAM_FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+
+type Failures = HashMap<i64, Value>;
+
+/// What a request is handed for ETV-next's failure state.
+enum Upstream {
+    /// No read has finished yet; one is in flight.
+    Pending,
+    /// The newest finished read, and how old it is when a newer one is in flight.
+    Read {
+        result: Result<Failures, String>,
+        stale_secs: Option<u64>,
+    },
+}
+
+#[derive(Default)]
+struct UpstreamSlot {
+    finished: Option<(std::time::Instant, Result<Failures, String>)>,
+    in_flight: bool,
+}
+
+/// ETV-next's failure state, read by a worker thread so a hung ETV-next costs
+/// a request nothing: the web UI serves one request at a time, and
+/// [`read_failures`] can wait its whole timeout.
+#[derive(Default)]
+pub struct UpstreamReading {
+    slot: Mutex<UpstreamSlot>,
+}
+
+impl UpstreamReading {
+    fn get(self: &Arc<Self>, base: &str) -> Upstream {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        let age = slot.finished.as_ref().map(|(at, _)| at.elapsed());
+        if !slot.in_flight && age.is_none_or(|a| a >= UPSTREAM_FRESH_FOR) {
+            slot.in_flight = true;
+            let me = Arc::clone(self);
+            let url = base.to_string();
+            let spawned = std::thread::Builder::new()
+                .name("ui-health-upstream".into())
+                .spawn(move || {
+                    let result = read_failures(&url);
+                    if let Err(e) = &result {
+                        tracing::warn!(event = "ui.health_upstream", url = %url, error = %e, "ETV-next health unreadable");
+                    }
+                    let mut slot = me.slot.lock().unwrap_or_else(|e| e.into_inner());
+                    slot.finished = Some((std::time::Instant::now(), result));
+                    slot.in_flight = false;
+                });
+            if let Err(e) = spawned {
+                tracing::error!(event = "ui.health_upstream.spawn_failed", error = %e, "health worker did not start");
+                slot.in_flight = false;
+                slot.finished = Some((
+                    std::time::Instant::now(),
+                    Err(format!("worker thread did not start: {e}")),
+                ));
+            }
+        }
+        match &slot.finished {
+            None => Upstream::Pending,
+            Some((at, result)) => Upstream::Read {
+                result: result.clone(),
+                stale_secs: (slot.in_flight && at.elapsed() >= UPSTREAM_FRESH_FOR)
+                    .then(|| at.elapsed().as_secs()),
+            },
+        }
+    }
 }
 
 impl HealthSources {
@@ -65,6 +137,7 @@ impl HealthSources {
             etv_next_url: format!("http://127.0.0.1:{port}"),
             accel: var("ETV_ACCEL"),
             vaapi_device: var("ETV_VAAPI_DEVICE"),
+            upstream: Arc::default(),
         }
     }
 
@@ -262,15 +335,22 @@ pub(super) fn api_health_channels(state: &AppState) -> Result<(u16, Value), Stri
     let keys = lineup::lineup_keys(&station.lineup, &base);
     let now = OffsetDateTime::now_utc().unix_timestamp();
 
-    let (failures, upstream) = match read_failures(&sources.etv_next_url) {
-        Ok(f) => (f, None),
-        Err(e) => {
-            tracing::warn!(event = "ui.health_upstream", url = %sources.etv_next_url, error = %e, "ETV-next health unreadable");
-            (
-                HashMap::new(),
-                Some(json!({ "url": sources.etv_next_url, "error": e })),
-            )
-        }
+    let (failures, upstream) = match sources.upstream.get(&sources.etv_next_url) {
+        Upstream::Pending => (
+            HashMap::new(),
+            Some(json!({ "url": sources.etv_next_url, "pending": true })),
+        ),
+        Upstream::Read {
+            result: Ok(f),
+            stale_secs,
+        } => (
+            f,
+            stale_secs.map(|s| json!({ "url": sources.etv_next_url, "stale_secs": s })),
+        ),
+        Upstream::Read { result: Err(e), .. } => (
+            HashMap::new(),
+            Some(json!({ "url": sources.etv_next_url, "error": e })),
+        ),
     };
     let diag_readable = sources
         .diag_dir
@@ -405,6 +485,57 @@ mod tests {
                 .unwrap()
                 .starts_with("GET /health/channels.json")
         );
+    }
+
+    #[test]
+    fn a_hung_etv_next_leaves_the_request_pending_not_waiting() {
+        // Accepts the connection and never answers, so the read waits its full timeout.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let reading = Arc::new(UpstreamReading::default());
+        let began = std::time::Instant::now();
+        let first = reading.get(&url);
+        let second = reading.get(&url);
+        assert!(began.elapsed() < std::time::Duration::from_millis(200));
+        assert!(matches!(first, Upstream::Pending));
+        assert!(matches!(second, Upstream::Pending));
+        drop(listener);
+    }
+
+    #[test]
+    fn a_finished_read_is_served_from_the_cache() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let _ = conn.read(&mut req).unwrap();
+            let body = r#"{"channels":[{"number":"7","state":"failed"}]}"#;
+            write!(
+                conn,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let reading = Arc::new(UpstreamReading::default());
+        assert!(matches!(reading.get(&url), Upstream::Pending));
+        server.join().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match reading.get(&url) {
+                Upstream::Read {
+                    result: Ok(f),
+                    stale_secs: None,
+                } => {
+                    assert_eq!(f[&7]["state"], "failed");
+                    break;
+                }
+                _ if std::time::Instant::now() > deadline => panic!("worker never finished"),
+                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
     }
 
     fn vaapi() -> HealthSources {

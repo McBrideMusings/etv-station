@@ -623,8 +623,11 @@ async function loadHealth() {
 }
 
 function drawHealth(d) {
-  const upstream = d.upstream
-    ? `<div class="error">ETV-next is unreachable or answered badly, so failure state is missing below.\nTried ${esc(d.upstream.url)}\n${esc(d.upstream.error)}</div>` : '';
+  const u = d.upstream;
+  const upstream = !u ? ''
+    : u.pending ? `<div class="muted">Reading ETV-next's failure state; the Failures column is blank until it answers. Reload in a moment.</div>`
+    : u.stale_secs != null ? `<div class="muted">ETV-next is slow to answer; the Failures column shows a reading ${esc(u.stale_secs)}s old.</div>`
+    : `<div class="error">ETV-next is unreachable or answered badly, so failure state is missing below.\nTried ${esc(u.url)}\n${esc(u.error)}</div>`;
   const expected = d.expected && d.expected.encoder
     ? `<p class="muted">Expected encoder: ${esc(d.expected.encoder)}${d.expected.vaapi_device ? ` on ${esc(d.expected.vaapi_device)}` : ''}.</p>`
     : `<p class="muted">No hardware encoder is configured (ETV_ACCEL), so every transcode counts as software.</p>`;

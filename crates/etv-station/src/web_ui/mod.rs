@@ -460,6 +460,7 @@ mod tests {
             etv_next_url: "http://127.0.0.1:1".into(),
             accel: Some("vaapi".into()),
             vaapi_device: Some("/dev/dri/renderD128".into()),
+            ..HealthSources::default()
         };
         let (status, body) = get_json(&mut state, "/api/health/channels");
         assert_eq!(status, 200, "{body}");
@@ -475,7 +476,18 @@ mod tests {
         assert_eq!(verdict(numbers[0]), "FAIL");
         assert_eq!(verdict(numbers[1]), "STALE");
         assert_eq!(verdict(numbers[2]), "PASS");
+        // The first answer does not wait for ETV-next; once the read finishes the
+        // error is served from the cache.
         assert_eq!(body["upstream"]["url"], "http://127.0.0.1:1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (_, body) = get_json(&mut state, "/api/health/channels");
+            if body["upstream"]["error"].is_string() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{body}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     #[test]
