@@ -576,7 +576,7 @@ mod tests {
     fn black_fixture(dir: &Path) -> PathBuf {
         let path = dir.join("black.mkv");
         let status = Command::new("ffmpeg")
-            .args(["-nostdin", "-hide_banner", "-loglevel", "error"])
+            .args(["-nostdin", "-y", "-hide_banner", "-loglevel", "error"])
             .args(["-f", "lavfi", "-i"])
             .arg("color=c=black:s=320x180:d=2:r=10")
             .args(["-c:v", "mpeg4"])
