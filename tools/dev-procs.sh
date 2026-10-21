@@ -21,11 +21,22 @@ DEV_PROCS=(
 # Echo the PIDs matching one DEV_PROCS entry, one per line; empty output when
 # nothing matches (pgrep exits non-zero in that case, which `|| true` absorbs so
 # callers running under `set -e` aren't killed by a normal "none found").
+#
+# A `--serve-ui` daemon is the web dashboard (tools/station-ui.sh): it binds its
+# own port and shares no folder or process with the dev stack, so it is not
+# listed. Dropping it here keeps it from blocking dev-run's pre-flight, from
+# failing verify-integration's orphan check, and from being killed by kill-dev.
 dev_proc_pids() {
-  local kind="$1" pattern="$2"
+  local kind="$1" pattern="$2" pid pids
   if [ "$kind" = "exact" ]; then
-    pgrep -x "$pattern" 2>/dev/null || true
+    pids=$(pgrep -x "$pattern" 2>/dev/null || true)
   else
-    pgrep -f "$pattern" 2>/dev/null || true
+    pids=$(pgrep -f "$pattern" 2>/dev/null || true)
   fi
+  for pid in $pids; do
+    case "$(ps -o command= -p "$pid" 2>/dev/null)" in
+      *" --serve-ui"*) continue ;;
+    esac
+    echo "$pid"
+  done
 }
