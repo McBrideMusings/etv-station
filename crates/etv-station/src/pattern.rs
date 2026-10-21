@@ -4506,6 +4506,7 @@ mod tests {
     #[test]
     fn a_take_range_from_random_airs_a_consecutive_window_of_the_rolled_size() {
         let mut lens = std::collections::BTreeSet::new();
+        let mut starts = std::collections::BTreeSet::new();
         for seed in 0..32 {
             let (ids, _) = build_with(
                 vec![shows_pool()],
@@ -4519,8 +4520,13 @@ mod tests {
                 eps.windows(2).all(|w| w[1] == w[0] + 1),
                 "seed {seed}: not consecutive in order: {ids:?}"
             );
+            starts.insert(eps[0]);
             lens.insert(ids.len());
         }
+        assert!(
+            starts.iter().any(|&e| e > 1),
+            "every window began at the series top: {starts:?}"
+        );
         assert_eq!(lens.into_iter().collect::<Vec<_>>(), vec![2, 3]);
     }
 
