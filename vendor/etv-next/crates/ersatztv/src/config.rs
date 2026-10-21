@@ -46,6 +46,11 @@ pub struct ServerConfig {
     /// error instead, which is loud and happens at startup. `scaffold` writes
     /// one, so a generated lineup always has it.
     pub device_id: String,
+    /// Hold every channel's worker open from startup, so a first tune never
+    /// pays the cold start. Off by default: a held worker encodes for nobody,
+    /// one transcode per channel.
+    #[serde(default)]
+    pub prewarm: bool,
 }
 
 #[derive(Deserialize, Serialize, Clone, JsonSchema)]
@@ -102,6 +107,7 @@ fn server_config_default() -> ServerConfig {
         // rather than constant, so two servers in that state are still distinct
         // tuners to Plex.
         device_id: uuid::Uuid::new_v4().to_string(),
+        prewarm: false,
     }
 }
 

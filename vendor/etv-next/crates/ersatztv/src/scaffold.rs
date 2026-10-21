@@ -74,6 +74,7 @@ pub async fn add_lineup(lineup_path: &Path, channels: u32, force: bool) -> Resul
             // the lineup — which is what Plex needs to keep recognising the
             // tuner across restarts.
             device_id: uuid::Uuid::new_v4().to_string(),
+            prewarm: false,
         },
         output: OutputConfig {
             folder: String::from("./hls"),
