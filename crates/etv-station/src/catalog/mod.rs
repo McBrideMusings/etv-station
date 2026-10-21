@@ -26,7 +26,7 @@ pub mod reconcile_plexdb;
 pub mod schema;
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -110,6 +110,32 @@ impl Catalog {
         })?;
         query::register_functions(&conn)?;
         Ok(Catalog { conn })
+    }
+
+    /// Copy the catalog at `path` to `<path>.ui-copy`, migrate the copy to the
+    /// current schema, and return the copy's path. The source is only read.
+    ///
+    /// For a read-only consumer holding a catalog fetched from a host that
+    /// runs an older release: [`Self::open_readonly`] applies no migrations, so
+    /// the file as fetched lacks columns this binary selects. The fetched copy
+    /// stays at the host's schema, so a version check against the host keeps
+    /// matching; the migrated copy is replaced on every call.
+    pub fn migrated_copy(path: impl AsRef<Path>) -> Result<PathBuf, CatalogError> {
+        let path = path.as_ref();
+        let mut name = path.as_os_str().to_owned();
+        name.push(".ui-copy");
+        let copy = PathBuf::from(name);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut stale = copy.as_os_str().to_owned();
+            stale.push(suffix);
+            let _ = std::fs::remove_file(stale);
+        }
+        std::fs::copy(path, &copy).map_err(|source| CatalogError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        drop(Self::open(&copy)?);
+        Ok(copy)
     }
 
     /// An in-memory catalog — used by tests and ephemeral tooling.
@@ -1593,6 +1619,40 @@ mod tests {
             .unwrap();
         assert_eq!(out.len(), ids.len() - 1);
         assert!(!out.iter().any(|id| id == "never-ingested"));
+    }
+
+    #[test]
+    fn migrated_copy_brings_an_older_catalog_to_the_current_schema_and_leaves_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("catalog.db");
+        {
+            // The schema one migration behind this binary's.
+            let conn = Connection::open(&src).unwrap();
+            conn.execute_batch("CREATE TABLE schema_version (version INTEGER NOT NULL);")
+                .unwrap();
+            let behind = schema::MIGRATIONS.len() - 1;
+            for (i, ddl) in schema::MIGRATIONS.iter().enumerate().take(behind) {
+                conn.execute_batch(ddl).unwrap();
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    [(i + 1) as i64],
+                )
+                .unwrap();
+            }
+        }
+        let copy = Catalog::migrated_copy(&src).unwrap();
+        assert_eq!(copy, dir.path().join("catalog.db.ui-copy"));
+        let version = |p: &Path| -> i64 {
+            Connection::open(p)
+                .unwrap()
+                .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(version(&copy), schema::SCHEMA_VERSION);
+        assert_eq!(version(&src), schema::SCHEMA_VERSION - 1);
+        // A second call replaces the copy rather than failing on it.
+        Catalog::migrated_copy(&src).unwrap();
+        Catalog::open_readonly(&copy).unwrap();
     }
 
     #[test]
