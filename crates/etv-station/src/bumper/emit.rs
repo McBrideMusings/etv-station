@@ -15,8 +15,8 @@
 //! (etv-station-7aa7.9), so `SegmentAudio::Own` omits `tracks.audio`. A bed or
 //! mute segment sets its level on purpose, so its items carry
 //! `normalize_loudness: false` and the channel's loudnorm leaves them alone.
-//! Ducking a bed under clip audio is etv-station-7aa7.27, and a
-//! pending segment airs its stand-in and carries [`PENDING_KEY`] so the swap
+//! A `Ducked` segment mixes its own file's audio with the bed in one lavfi
+//! graph (`amix`, `normalize=0`), and a pending segment airs its stand-in and carries [`PENDING_KEY`] so the swap
 //! (etv-station-7aa7.35) can find it.
 
 use std::path::Path;
@@ -396,7 +396,47 @@ fn audio_override(
             Some(bed) => bed_graph(bed, len_ms, first, last),
             None => SILENCE.to_string(),
         })),
+        SegmentAudio::Ducked { gain_db } => Some(PlayoutItemSource::lavfi(
+            match (bed, own_audio_file(&seg.segment.source)) {
+                (Some(bed), Some((path, in_ms))) => {
+                    ducked_graph(path, in_ms, gain_db, bed, len_ms, first, last)
+                }
+                _ => SILENCE.to_string(),
+            },
+        )),
     }
+}
+
+/// The file whose own audio a `Ducked` item mixes, and the point it starts at
+/// (every repeat of a looped clip starts at the clip's in point).
+fn own_audio_file(source: &SegmentSource) -> Option<(&Path, u64)> {
+    match source {
+        SegmentSource::Clip { path, in_ms, .. } => Some((path, *in_ms)),
+        SegmentSource::Render { path, .. } => Some((path, 0)),
+        _ => None,
+    }
+}
+
+/// The segment's own audio at `gain_db`, mixed with the bed chain.
+/// `apad` keeps the own audio running past the file's end, so
+/// `duration=first` never ends the mix before the item's span does.
+/// `normalize=0` keeps `amix` from scaling both inputs down by the input count.
+fn ducked_graph(
+    path: &Path,
+    in_ms: u64,
+    gain_db: f64,
+    bed: &AudioSource,
+    duration_ms: u64,
+    first: bool,
+    last: bool,
+) -> String {
+    format!(
+        "amovie={}:seek_point={},volume={}dB,apad[own];{}[bed];[own][bed]amix=inputs=2:duration=first:normalize=0",
+        quote_filter_arg(&path.to_string_lossy()),
+        seconds(in_ms),
+        gain_db,
+        bed_graph(bed, duration_ms, first, last),
+    )
 }
 
 const SILENCE: &str = "anullsrc=channel_layout=stereo:sample_rate=48000";
@@ -968,6 +1008,36 @@ mod tests {
         assert!(!graph(&items[1]).contains("afade"));
         assert!(
             graph(&items[2]).contains("afade=t=out:st=1:d=1") && !graph(&items[2]).contains("t=in")
+        );
+    }
+
+    #[test]
+    fn a_ducked_clip_mixes_its_own_audio_with_the_bed_in_one_graph() {
+        let mut clip = seg(
+            "clip",
+            SegmentSource::Clip {
+                path: "/m/a.mkv".into(),
+                in_ms: 2_000,
+                out_ms: 6_000,
+            },
+            Dur::Fixed(4_000),
+        );
+        clip.audio = SegmentAudio::Ducked { gain_db: -12.0 };
+        let items = emit(
+            &Timeline {
+                segments: vec![clip],
+                bed: Some(bed()),
+            },
+            4_000,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].normalize_loudness, Some(false));
+        let tracks = serde_json::to_value(items[0].tracks.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            tracks["audio"]["source"]["params"],
+            "amovie='/m/a.mkv':seek_point=2,volume=-12dB,apad[own];\
+             amovie='/beds/rain.wav':loop=0,volume=-12dB,afade=t=in:st=0:d=0.5,afade=t=out:st=3:d=1[bed];\
+             [own][bed]amix=inputs=2:duration=first:normalize=0"
         );
     }
 

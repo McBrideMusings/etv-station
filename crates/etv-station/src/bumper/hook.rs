@@ -233,6 +233,26 @@ pub fn build(script: &Path, input: &BumperInput) -> Result<BuiltTimeline, Bumper
     if builder.segments.is_empty() {
         return Err(BumperError::Empty { path });
     }
+    for seg in &builder.segments {
+        if !matches!(seg.audio, SegmentAudio::Ducked { .. }) {
+            continue;
+        }
+        if builder.bed.is_none() {
+            return Err(fail(format!(
+                "segment \"{}\": ducked_bed() needs the timeline to have an audio_bed()",
+                seg.name
+            )));
+        }
+        if !matches!(
+            seg.source,
+            SegmentSource::Clip { .. } | SegmentSource::Render { .. }
+        ) {
+            return Err(fail(format!(
+                "segment \"{}\": ducked_bed() needs a clip or render source",
+                seg.name
+            )));
+        }
+    }
     let usage = builder.usage.snapshot();
     Ok(BuiltTimeline {
         timeline: Timeline {
@@ -1255,16 +1275,14 @@ fn bumper_engine(host: Host) -> rhai::Engine {
         })
         .register_fn(
             "ducked_bed",
-            |s: &mut SegmentBuilder, _gain_db: f64| -> RhaiResult<SegmentBuilder> {
+            |s: &mut SegmentBuilder, gain_db: Dynamic| -> RhaiResult<SegmentBuilder> {
                 s.usage.bump("ducked_bed");
-                err("ducked_bed() is not implemented: clip audio under a bed needs an amix graph")
-            },
-        )
-        .register_fn(
-            "ducked_bed",
-            |s: &mut SegmentBuilder| -> RhaiResult<SegmentBuilder> {
-                s.usage.bump("ducked_bed");
-                err("ducked_bed() is not implemented: clip audio under a bed needs an amix graph")
+                let gain_db = number(&gain_db, "ducked_bed() gain_db")?;
+                if !gain_db.is_finite() {
+                    return err(format!("ducked_bed(): {gain_db} is not a finite number"));
+                }
+                s.audio = SegmentAudio::Ducked { gain_db };
+                Ok(s.clone())
             },
         );
 
@@ -1448,15 +1466,29 @@ fn build(ctx) {
     }
 
     #[test]
-    fn ducked_bed_errors_until_implemented() {
+    fn ducked_bed_sets_the_gain_and_needs_a_bed_naming_the_segment() {
         let dir = tempfile::tempdir().unwrap();
-        let path = script(
+        let ok = script(
             &dir,
             "fn hooks() { [\"bumper\"] }\nfn build(ctx) { let t = timeline(); \
-             t.push(segment().black().fixed(1).ducked_bed(-12.0)); t }",
+             t.audio_bed(\"/b/rain.wav\"); \
+             t.push(segment().name(\"talk\").clip(clip(\"/m/a.mkv\", 0, 1000)).fixed(1).ducked_bed(-12)); t }",
         );
-        let msg = build(&path, &input(None)).unwrap_err().to_string();
-        assert!(msg.contains("ducked_bed() is not implemented"), "{msg}");
+        let built = build(&ok, &input(None)).unwrap();
+        assert_eq!(
+            built.timeline.segments[0].audio,
+            SegmentAudio::Ducked { gain_db: -12.0 }
+        );
+        let no_bed = script(
+            &dir,
+            "fn hooks() { [\"bumper\"] }\nfn build(ctx) { let t = timeline(); \
+             t.push(segment().name(\"talk\").clip(clip(\"/m/a.mkv\", 0, 1000)).fixed(1).ducked_bed(-12)); t }",
+        );
+        let msg = build(&no_bed, &input(None)).unwrap_err().to_string();
+        assert!(
+            msg.contains("\"talk\"") && msg.contains("audio_bed"),
+            "{msg}"
+        );
     }
 
     #[test]
