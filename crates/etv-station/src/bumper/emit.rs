@@ -29,7 +29,8 @@ use serde_json::json;
 use time::{Duration, OffsetDateTime};
 
 use super::timeline::{
-    AudioSource, OverlayVars, ResolvedSegment, ResolvedTimeline, SegmentAudio, SegmentSource,
+    AudioSource, BedSource, OverlayVars, ResolvedSegment, ResolvedTimeline, SegmentAudio,
+    SegmentSource,
 };
 
 /// The `metadata` key marking an item whose real file has not landed yet; its
@@ -335,7 +336,10 @@ pub fn otio_json(resolved: &ResolvedTimeline, fps: f64) -> serde_json::Value {
                     resolved
                         .bed
                         .as_ref()
-                        .map(|b| b.path.to_string_lossy().into_owned())
+                        .map(|b| match &b.source {
+                            BedSource::File(path) => path.to_string_lossy().into_owned(),
+                            BedSource::Lavfi(filters) => format!("lavfi:{filters}"),
+                        })
                         .unwrap_or(target)
                 } else {
                     target
@@ -463,14 +467,18 @@ fn still_graph(image: &Path, fps: f64, seg: &ResolvedSegment, bed: Option<&Audio
     )
 }
 
-/// `amovie` with the bed's gain and fades. The bed loops so a segment longer
-/// than the file keeps sound; the item's own span ends it.
+/// The bed's sound, a file via `amovie` or a synthesized filter graph, with the
+/// bed's gain and fades. A file loops so a segment longer than it keeps sound;
+/// the item's own span ends it.
 fn bed_graph(bed: &AudioSource, duration_ms: u64, first: bool, last: bool) -> String {
-    let mut graph = format!(
-        "amovie={}:loop=0,volume={}dB",
-        quote_filter_arg(&bed.path.to_string_lossy()),
-        bed.gain_db,
-    );
+    let mut graph = match &bed.source {
+        BedSource::File(path) => format!(
+            "amovie={}:loop=0,volume={}dB",
+            quote_filter_arg(&path.to_string_lossy()),
+            bed.gain_db,
+        ),
+        BedSource::Lavfi(filters) => format!("{filters},volume={}dB", bed.gain_db),
+    };
     if first && bed.fade_in_ms > 0 {
         graph.push_str(&format!(",afade=t=in:st=0:d={}", seconds(bed.fade_in_ms)));
     }
@@ -837,7 +845,7 @@ mod tests {
 
     fn bed() -> AudioSource {
         AudioSource {
-            path: PathBuf::from("/beds/rain.wav"),
+            source: BedSource::File(PathBuf::from("/beds/rain.wav")),
             gain_db: -12.0,
             fade_in_ms: 500,
             fade_out_ms: 1_000,
@@ -923,6 +931,30 @@ mod tests {
                 .contains("fps=30[out0];amovie='/beds/rain.wav':loop=0,volume=-12dB")
         );
         assert!(lavfi_params(&items[0]).ends_with("[out1]"));
+    }
+
+    #[test]
+    fn a_lavfi_bed_is_its_graph_then_the_gain_and_fades() {
+        let mut still = seg(
+            "still",
+            SegmentSource::Still {
+                image_path: "/m/art.png".into(),
+            },
+            Dur::Fixed(4_000),
+        );
+        still.audio = SegmentAudio::Bed;
+        let mut synth = bed();
+        synth.source = BedSource::Lavfi("anoisesrc=color=brown,lowpass=f=180".into());
+        let items = emit(
+            &Timeline {
+                segments: vec![still],
+                bed: Some(synth),
+            },
+            4_000,
+        );
+        assert!(lavfi_params(&items[0]).contains(
+            "[out0];anoisesrc=color=brown,lowpass=f=180,volume=-12dB,afade=t=in:st=0:d=0.5,afade=t=out:st=3:d=1[out1]"
+        ));
     }
 
     #[test]

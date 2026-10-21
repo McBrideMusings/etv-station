@@ -10,6 +10,7 @@ output_base: examples/output
 
 channels:
   - channels/align-test.yaml
+  - channels/text-card-test.yaml
 
 catalog_path: tmp/catalog.db
 

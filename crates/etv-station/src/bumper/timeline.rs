@@ -104,10 +104,21 @@ pub struct OverlayVars {
     pub vars: BTreeMap<String, serde_json::Value>,
 }
 
-/// A music or ambience file played under [`SegmentAudio::Bed`] segments.
+/// Where a bed's sound comes from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BedSource {
+    /// A music or ambience file, looped under the segment.
+    File(PathBuf),
+    /// An ffmpeg audio filter graph that makes its own sound (`anoisesrc=...`),
+    /// with no input file.
+    Lavfi(String),
+}
+
+/// The sound played under [`SegmentAudio::Bed`] segments.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioSource {
-    pub path: PathBuf,
+    pub source: BedSource,
     #[serde(default)]
     pub gain_db: f32,
     #[serde(default)]
@@ -656,7 +667,7 @@ mod tests {
     fn the_bed_carries_through() {
         let mut t = tl(vec![seg("a", Duration::Fixed(1000))]);
         t.bed = Some(AudioSource {
-            path: "bed.flac".into(),
+            source: BedSource::File("bed.flac".into()),
             gain_db: -6.0,
             fade_in_ms: 0,
             fade_out_ms: 500,

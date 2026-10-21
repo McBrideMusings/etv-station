@@ -91,7 +91,7 @@ use crate::ffprobe::PROBE_TIMEOUT;
 use crate::history::{AiringFilter, AiringKind, HistoryDb, LedgerRow};
 
 use super::timeline::{
-    AudioSource, Duration, OverlayVars, Segment, SegmentAudio, SegmentSource, Timeline,
+    AudioSource, BedSource, Duration, OverlayVars, Segment, SegmentAudio, SegmentSource, Timeline,
 };
 
 /// Capability names a bumper plugin may declare: each gates one `ctx` call.
@@ -627,14 +627,23 @@ fn overlay_vars(script: String, vars: Map) -> RhaiResult<OverlayVars> {
 }
 
 fn bed_source(source: Dynamic, opts: Map) -> RhaiResult<AudioSource> {
-    let path = if source.is_string() {
-        source.into_string().unwrap_or_default()
+    let source = if source.is_string() {
+        BedSource::File(PathBuf::from(source.into_string().unwrap_or_default()))
     } else if let Some(m) = source.try_cast::<Map>() {
-        m.get("path")
-            .and_then(|p| p.clone().into_string().ok())
-            .ok_or("audio_bed(): the source map has no string `path`")?
+        let text = |key: &str| m.get(key).and_then(|v| v.clone().into_string().ok());
+        match (text("path"), text("lavfi")) {
+            (Some(path), None) => BedSource::File(PathBuf::from(path)),
+            (None, Some(filters)) => BedSource::Lavfi(filters),
+            _ => {
+                return err(
+                    "audio_bed(): the source map needs exactly one of a string `path` or `lavfi`",
+                );
+            }
+        }
     } else {
-        return err("audio_bed(): the source must be a path string or a map with `path`");
+        return err(
+            "audio_bed(): the source must be a path string or a map with `path` or `lavfi`",
+        );
     };
     let num = |key: &str| -> RhaiResult<f64> {
         match opts.get(key) {
@@ -646,7 +655,7 @@ fn bed_source(source: Dynamic, opts: Map) -> RhaiResult<AudioSource> {
         }
     };
     Ok(AudioSource {
-        path: PathBuf::from(path),
+        source,
         gain_db: num("gain_db")? as f32,
         fade_in_ms: secs_to_ms(num("fade_in")?, "audio_bed() fade_in")?,
         fade_out_ms: secs_to_ms(num("fade_out")?, "audio_bed() fade_out")?,
@@ -1463,6 +1472,36 @@ fn build(ctx) {
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].source, SegmentSource::black());
         assert_eq!(segs[0].duration, Duration::Fixed(30_000));
+    }
+
+    #[test]
+    fn audio_bed_takes_a_lavfi_graph_or_a_path_and_refuses_both_or_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let bed_of = |source: &str| {
+            let path = script(
+                &dir,
+                &format!(
+                    "fn hooks() {{ [\"bumper\"] }}\nfn build(ctx) {{ let t = timeline(); \
+                     t.audio_bed({source}, #{{ gain_db: -20.0 }}); \
+                     t.push(segment().black().fixed(1).bed_audio()); t }}"
+                ),
+            );
+            build(&path, &input(None)).map(|b| b.timeline.bed)
+        };
+        let lavfi = bed_of(r##"#{ lavfi: "anoisesrc=color=brown" }"##)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            lavfi.source,
+            BedSource::Lavfi("anoisesrc=color=brown".into())
+        );
+        assert_eq!(lavfi.gain_db, -20.0);
+        let file = bed_of(r#"#{ path: "/b/rain.wav" }"#).unwrap().unwrap();
+        assert_eq!(file.source, BedSource::File("/b/rain.wav".into()));
+        for bad in [r#"#{ path: "/b.wav", lavfi: "anullsrc" }"#, "#{}"] {
+            let msg = bed_of(bad).unwrap_err().to_string();
+            assert!(msg.contains("exactly one of"), "{bad}: {msg}");
+        }
     }
 
     #[test]

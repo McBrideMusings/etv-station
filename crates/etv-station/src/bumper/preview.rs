@@ -248,4 +248,35 @@ fn build(ctx) {
             .unwrap();
         assert!(err.contains("boom"), "got {err}");
     }
+    fn text_card(card: &str, gap_ms: u64) -> Preview {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins/bumpers");
+        let script = dir.join("text_card.rhai");
+        let mut req = request(&script, &dir, gap_ms);
+        req.config = Some(serde_json::json!({ "card": card }));
+        preview(&req).unwrap()
+    }
+
+    #[test]
+    fn the_text_card_drops_optional_screens_first_when_the_gap_is_short() {
+        let short = text_card("up-next", 6_000);
+        let long = text_card("up-next", 12_000);
+        assert_eq!(short.resolved.total_ms(), 6_000);
+        assert_eq!(long.resolved.total_ms(), 12_000);
+        assert_eq!(short.items.len(), 2);
+        assert_eq!(long.items.len(), 3);
+    }
+
+    #[test]
+    fn a_text_card_never_airs_an_unfilled_slot() {
+        for card in ["up-next", "just-ended", "sleep"] {
+            let json = text_card(card, 12_000).items_json();
+            assert!(!json.contains("{prev_title"), "{card}: {json}");
+            assert!(!json.contains("{next_title"), "{card}: {json}");
+        }
+        assert!(
+            text_card("just-ended", 12_000)
+                .items_json()
+                .contains("that was a thing")
+        );
+    }
 }

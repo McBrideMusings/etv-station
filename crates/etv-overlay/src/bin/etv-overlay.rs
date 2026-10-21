@@ -812,7 +812,7 @@ fn watch(
             program.metadata = it.metadata.clone();
         }
     }
-    let mut item_engine = ItemOverlayEngine::default();
+    let mut item_engine = ItemOverlayEngine::sized(spec.width, spec.height);
     let mut last_mtime = fs_mtime(&config);
 
     let frame_period = Duration::from_secs_f64(1.0 / spec.framerate.max(1) as f64);
@@ -1008,7 +1008,7 @@ fn pipe_to_fifo(
         VelloRenderer::new_with_fonts(base.width, base.height, base.pixel_format, fonts)?;
     let mut active_spec = timeline_source.spec_at(OffsetDateTime::now_utc()).cloned();
     let mut engine = build_engine_for(active_spec.as_ref())?;
-    let mut item_engine = ItemOverlayEngine::default();
+    let mut item_engine = ItemOverlayEngine::sized(base.width, base.height);
     let start = std::time::Instant::now();
     // The overlay half of the two-clock instrumentation. The heartbeat lands
     // beside the fifo so anything that can see the channel's playout folder can

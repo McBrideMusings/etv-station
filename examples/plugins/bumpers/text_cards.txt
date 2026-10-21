@@ -1,0 +1,73 @@
+# Copy for examples/plugins/bumpers/text_card.rhai, read through ctx.read.
+#
+#   == id         starts a card
+#   a line        centred text; it appears 0.5s after the line above it
+#   *a line*      the same line in italics
+#   > a credit    a smaller line, right-aligned under the widest line
+#   ~ 0.6         wait 0.6s before the next line appears
+#   ---           ends a screen: cut to black, then the next screen starts
+#   @optional     (first line of a screen) kept only when the gap has room for it
+#   {slot}        next_title, prev_title or channel, filled from the schedule
+#   {slot|text}   the same, with `text` printed when the schedule has no value
+#
+# A {slot} with no value and no `|text` makes the card ineligible for that gap,
+# so a literal {slot} never airs.
+
+== up-next
+up next
+~ 0.4
+{next_title|more of the same}
+---
+@optional
+we asked it to be shorter
+it declined
+---
+please stay
+
+== just-ended
+that was {prev_title|a thing}
+---
+it is over now
+---
+@optional
+we are all fine
+---
+this channel is {channel}
+
+== tweet
+*@adultswim speaks to me*
+*on a personal level*
+> @CassiePlush
+---
+@optional
+thank you, current twitter resident
+---
+your opinion is very important to us
+
+== nothing-wrong
+nothing is wrong
+---
+@optional
+we checked
+---
+carry on
+
+== sleep
+have you eaten
+---
+have you slept
+---
+@optional
+{next_title|something} is on
+anyway
+
+== bored
+we have run out of things to say
+~ 0.8
+and yet
+---
+@optional
+the clock says it is time
+to fill the time
+---
+here we are

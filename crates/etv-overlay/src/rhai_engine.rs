@@ -148,6 +148,9 @@ impl Graphic {
 pub struct RhaiEngine {
     engine: Engine,
     graphics: Vec<Graphic>,
+    /// The canvas the frame is drawn on, `frame_width` / `frame_height` in a
+    /// script. `-1.0` for both when no renderer's size was handed over.
+    frame: (f64, f64),
 }
 
 impl RhaiEngine {
@@ -179,7 +182,15 @@ impl RhaiEngine {
         Self {
             engine,
             graphics: Vec::new(),
+            frame: (-1.0, -1.0),
         }
+    }
+
+    /// Tell scripts the canvas size, so a layout written in pixels can scale
+    /// with the output (`frame_width`, `frame_height`).
+    pub fn with_frame_size(mut self, width: u32, height: u32) -> Self {
+        self.frame = (f64::from(width), f64::from(height));
+        self
     }
 
     /// The engine for one loaded spec: each graphic's layers, `config` and
@@ -200,7 +211,7 @@ impl RhaiEngine {
                     })?;
             }
         }
-        Ok(engine)
+        Ok(engine.with_frame_size(spec.width, spec.height))
     }
 
     /// The engine for one playout item's own overlay selection, in place of the
@@ -309,6 +320,11 @@ impl RhaiEngine {
         // which is also why a mistyped key is silent.
         scope.push_constant("config", graphic.config.clone());
         scope.push_constant("vars", graphic.vars.clone());
+        // The canvas in pixels, `-1.0` when unknown: every layer measure is in
+        // canvas pixels, so a script that wants one layout at any output size
+        // scales by `frame_width / 640.0` or `frame_height / 360.0`.
+        scope.push_constant("frame_width", self.frame.0);
+        scope.push_constant("frame_height", self.frame.1);
         scope.push_constant("time", time_seconds);
         scope.push_constant("frame", frame_index as i64);
         scope.push_constant("title", program.title.clone());
@@ -392,20 +408,32 @@ fn string_array(items: &[String]) -> rhai::Array {
 #[derive(Default)]
 pub struct ItemOverlayEngine {
     current: Option<(ItemOverlay, RhaiEngine)>,
+    frame: Option<(u32, u32)>,
 }
 
 impl ItemOverlayEngine {
+    /// Engines built here tell their scripts the canvas is `width` x `height`.
+    pub fn sized(width: u32, height: u32) -> Self {
+        Self {
+            current: None,
+            frame: Some((width, height)),
+        }
+    }
+
     pub fn engine_for(&mut self, overlay: &ItemOverlay) -> &RhaiEngine {
         let stale = self
             .current
             .as_ref()
             .is_none_or(|(loaded, _)| loaded != overlay);
         if stale {
-            let engine = RhaiEngine::for_item_overlay(overlay).unwrap_or_else(|e| {
+            let mut engine = RhaiEngine::for_item_overlay(overlay).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "item overlay failed to load; drawing nothing for it");
                 RhaiEngine::for_item_overlay(&ItemOverlay::None)
                     .expect("the none overlay has no script to fail")
             });
+            if let Some((w, h)) = self.frame {
+                engine = engine.with_frame_size(w, h);
+            }
             tracing::info!(
                 ?overlay,
                 "item overlay selected; channel overlay suppressed"
@@ -695,6 +723,28 @@ fade:
             "the config value should reach the resolved state, got {}",
             state.layers[0].opacity
         );
+    }
+
+    /// A script reads the canvas size it draws on, `-1.0` when no size was
+    /// handed over.
+    #[test]
+    fn a_script_reads_the_canvas_size() {
+        let script = write_script(r#"#{ "visible": true, "opacity": frame_width / 1000.0 }"#);
+        let opacity = |engine: RhaiEngine| {
+            engine.evaluate(0.0, 0, &ProgramContext::unknown()).layers[0].opacity
+        };
+        let mut sized = RhaiEngine::new(vec![watermark()]).with_frame_size(640, 360);
+        sized.load_script(script.path()).unwrap();
+        assert!((opacity(sized) - 0.64).abs() < 1e-6);
+
+        let height = write_script(r#"#{ "visible": true, "opacity": frame_height / 1000.0 }"#);
+        let mut engine = RhaiEngine::new(vec![watermark()]).with_frame_size(1920, 500);
+        engine.load_script(height.path()).unwrap();
+        assert!((opacity(engine) - 0.5).abs() < 1e-6);
+
+        let mut unsized_ = RhaiEngine::new(vec![watermark()]);
+        unsized_.load_script(script.path()).unwrap();
+        assert_eq!(opacity(unsized_), 0.0);
     }
 
     /// Two specs, one script, different numbers — the point of the field.
