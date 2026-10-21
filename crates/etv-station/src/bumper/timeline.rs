@@ -81,7 +81,7 @@ pub enum Duration {
 }
 
 /// Which sound a segment plays.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SegmentAudio {
     /// The source's own audio.
@@ -91,6 +91,8 @@ pub enum SegmentAudio {
     Bed,
     /// Silence.
     Mute,
+    /// The segment's own audio at `gain_db`, mixed with [`Timeline::bed`].
+    Ducked { gain_db: f64 },
 }
 
 /// An overlay script and the variables it draws with; becomes the playout
