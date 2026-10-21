@@ -1534,11 +1534,12 @@ fn short_label(k) {
     if k.split(" ").len > 3 || k == "" { () } else { k }
 }
 
-// Every reason that clears `why_min_share` of the pick's matched weight,
-// largest share first, a title before a keyword and then by label on a tie: `#{ label, kind, share }`. Keywords and
-// a bridging watched title compete on the same footing; a title takes the
-// share of the keyword that linked it. Pure arithmetic on the stage — no
-// randomness — so the same stage always yields the same set.
+// Every reason that clears `why_min_share` of the pick's matched weight, as
+// `#{ label, kind, share }`. Largest share first; on a tie a title comes
+// before a keyword, then by label. Keywords and a bridging watched title
+// compete on the same footing; a title takes the share of the keyword that
+// linked it. Pure arithmetic on the stage, so the same stage always yields
+// the same set.
 fn why_candidates(ctx, stage) {
     let words = [];
     let weights = [];

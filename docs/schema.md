@@ -1987,10 +1987,10 @@ history, so a share is the only scale-free test. Three pool `config:` keys:
   the highest value at which the three For You pools still agree; from 0.15 up
   one pool goes silent on a quarter of its picks.
 - `why_max_reasons` (default `3`): the most reasons shown. When more qualify,
-  a weighted draw seeded by `ctx.seed`, the pick's id and the labels keeps
+  a weighted draw seeded by `ctx.seed`, the pick's unit id (the film, or the show on a shows pool) and the labels keeps
   that many, so regenerating a window with the same seed reads the same.
 - `why_min_score` (default `0`, off): a pick whose base score is below this has
-  no `why` or `why_reasons` at all (`why_candidates` stays as evidence). A pick
+  no `why` or `why_reasons` at all (an exploration draw is not scored by taste, so the floor does not apply to it) (`why_candidates` stays as evidence). A pick
   with no qualifying reason is silent the same way.
 
 **A reason can be a watched title.** On a movies pool that sets `why`, the
