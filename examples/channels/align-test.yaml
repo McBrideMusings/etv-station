@@ -47,7 +47,7 @@ rule:
           out_point: "17m"
           source:
             kind: lavfi
-            params: "mandelbrot=size=1280x720:rate=30 [out0]; sine=frequency=220 [out1]"
+            params: "mandelbrot=size=320x180:rate=30:maxiter=200 [out0]; sine=frequency=220 [out1]"
           program:
             title: "Seventeen Minutes"
             categories: ["Test"]

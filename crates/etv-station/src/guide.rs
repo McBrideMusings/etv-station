@@ -30,9 +30,10 @@
 //! - the channel: `channel_identity`, `channel_name` (its display name, #158
 //!   decision #5), `program_title` (this item's own title before any guide
 //!   override — the series-convention default)
-//! - the schedule: `next_title`, `next_start`, `prev_title` — a one-item
-//!   lookahead/lookbehind over this generation's ordered list; empty at
-//!   either end
+//! - the schedule: `next_title`, `next_start`, `prev_title` — the next and
+//!   previous programme in this generation's ordered list, skipping bumpers
+//!   the align/fill pass inserted (so `next_start` can sit after a bumper
+//!   gap); empty at either end
 //! - time: `start`, `stop` (this item's own airing window), `now` (wall
 //!   clock at generation time)
 
