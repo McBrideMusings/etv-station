@@ -1,0 +1,8 @@
+{
+  "clips": [
+    { "path": "crates/etv-query-test/fixtures/bumpers/ident-45s.mp4", "tags": ["ident"], "burned_in_text": true, "minutes": null },
+    { "path": "crates/etv-query-test/fixtures/bumpers/station-bumper-12s.mp4", "tags": ["bumper", "snipe"], "burned_in_text": false, "minutes": null },
+    { "path": "crates/etv-query-test/fixtures/bumpers/promo-22s.mp4", "tags": ["promo", "intermission"], "burned_in_text": false, "minutes": null },
+    { "path": "crates/etv-query-test/fixtures/bumpers/station-bumper-18s.mp4", "tags": ["countdown"], "burned_in_text": true, "minutes": 5 }
+  ]
+}
