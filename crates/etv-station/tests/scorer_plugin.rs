@@ -17,7 +17,7 @@ use etv_station::config::{
 use etv_station::errors::ConfigError;
 use etv_station::resolve::{ResolvedItem, resolve_channel_with_resume};
 use etv_station::resume::GenerationState;
-use etv_station::score::{ScoreInputs, WatchEvent};
+use etv_station::score::ScoreInputs;
 use time::macros::datetime;
 
 /// Four movies and one two-episode show, all locally sourced so resolution
@@ -180,10 +180,10 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     on_short: Default::default(),
                     constraints: None,
                     config: None,
-                    // Every fixture script in this file reads `ctx.sets` /
-                    // `ctx.history` unconditionally (#167 predates this file),
-                    // so this helper grants both for every test that uses it.
-                    capabilities: vec!["catalog_read".into(), "watch_history".into()],
+                    // Every fixture script in this file reads `ctx.sets`
+                    // unconditionally (#167 predates this file), so this
+                    // helper grants it for every test that uses it.
+                    capabilities: vec!["catalog_read".into()],
                     datastores: Vec::new(),
                     guide: None,
                 }],
@@ -338,11 +338,11 @@ fn audit(ctx, picks, workspace) { #{} }
     assert_ne!(a, b, "same station, same catalog, different plugin");
 }
 
-/// Watch history and the recently-aired tail are inputs, not catalog fields: a
-/// channel cannot express either in CEL, and the plugin is the only thing that
-/// decides what they mean.
+/// The recently-aired tail is an input, not a catalog field: a channel cannot
+/// express it in CEL, and the plugin is the only thing that decides what it
+/// means.
 #[test]
-fn history_and_recent_airings_reach_the_script() {
+fn recent_airings_reach_the_script() {
     let dir = tempfile::tempdir().unwrap();
     let p = write_plugin(
         &dir,
@@ -350,14 +350,10 @@ fn history_and_recent_airings_reach_the_script() {
         r#"
 fn sources() { #{ movies: `item.type == "movie"` } }
 fn pick(ctx) {
-    let watched = [];
-    for e in ctx.history { watched.push(e.entry_id); }
     let out = [];
-    // Anything watched lately, minus anything this channel just aired.
+    // Everything but what this channel just aired.
     for item in ctx.sets.movies {
-        if watched.contains(item.entry_id) && !ctx.recent.contains(item.entry_id) {
-            out.push(item.entry_id);
-        }
+        if !ctx.recent.contains(item.entry_id) { out.push(item.entry_id); }
     }
     #{ picks: out, workspace: () }
 }
@@ -366,20 +362,7 @@ fn audit(ctx, picks, workspace) { #{} }
     );
     let inputs = ScoreInputs {
         target_count: 10,
-        history: [
-            WatchEvent {
-                entry_id: "mov-a".into(),
-                watched_at: 1000,
-                watcher: None,
-            },
-            WatchEvent {
-                entry_id: "mov-c".into(),
-                watched_at: 2000,
-                watcher: None,
-            },
-        ]
-        .into(),
-        recent: vec!["mov-c".into()],
+        recent: vec!["mov-a".into()],
         now: 3000,
         tz: None,
         account_id: None,
@@ -387,8 +370,8 @@ fn audit(ctx, picks, workspace) { #{} }
     let got = resolve_with(&plugin_channel(&p, 1, 1), &catalog(), inputs);
     assert_eq!(
         got,
-        vec!["mov-a"],
-        "watched and not recently aired is the only survivor"
+        vec!["mov-b"],
+        "the recently aired mov-a is skipped, so the first survivor leads"
     );
 }
 

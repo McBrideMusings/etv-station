@@ -1949,7 +1949,7 @@ pub(crate) fn resolve_pool_sources(
             let path = score_env.resolve_path(plugin);
             // Load-time validation already proved this pool's `capabilities`
             // match exactly what the plugin declares (#167) — this just reads
-            // the same grant back to decide what `ctx.sets`/`ctx.history`/
+            // the same grant back to decide what `ctx.sets`/
             // `ctx.datastore(name)` (#181) resolve to for this call.
             let granted = crate::score::GrantedCapabilities::from_names(&cfg.capabilities)
                 .with_entry_ids(catalog)

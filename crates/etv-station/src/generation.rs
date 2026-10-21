@@ -13,7 +13,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Arc;
 
 use time::OffsetDateTime;
 
@@ -23,7 +22,7 @@ use crate::errors::StationError;
 use crate::history::HistoryDb;
 use crate::resolve::{ResolvedItem, resolve_channel_with_resume};
 use crate::resume::{GenerationState, Progress, ResumeMap};
-use crate::score::{ScoreInputs, WatchEvent};
+use crate::score::ScoreInputs;
 
 /// Bound on how many generations one catch-up will chain before giving up, so
 /// a pathological config (a sequence with no wall-clock length) can't spin.
@@ -71,8 +70,6 @@ pub struct GenerationEnv<'a> {
     pub config_path: &'a Path,
     pub identity_roots: &'a [String],
     pub path_index: Option<&'a HashMap<String, String>>,
-    /// Watch history for `ctx.history`, fetched once per tick.
-    pub history: Arc<[WatchEvent]>,
     pub account_id: Option<i64>,
     pub tz: Option<&'static time_tz::Tz>,
     /// The tick's clock, handed to the scorer as `ctx.now`.
@@ -119,7 +116,6 @@ pub fn generate(
     // worth would make a single generation try to cover the month.
     let scoring = ScoreInputs {
         target_count: target_count(config, from, target),
-        history: Arc::clone(&env.history),
         recent: ledger.tail(recent_depth(config))?,
         now: env.now.unix_timestamp(),
         // A sequencer block (#169) reads this to place its pools against the

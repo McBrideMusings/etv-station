@@ -53,7 +53,7 @@ partition is not a preference — pools are blind to each other, so two movie
 pools over one library have to be disjoint by construction or they will both air
 the same film in a day. Lifetime watch state came from a new reader accessor
 ([plex-db-ex#60](https://github.com/McBrideMusings/plex-db-ex/issues/60)); the
-Tautulli history tail this station already held is capped at 1000 rows and would
+bounded Tautulli history fetch (1000 rows) would
 have called a film watched two years ago unseen. The weights are swept against
 the live snapshot rather than chosen, and every pick's audit carries the terms
 behind it and the profile entries that fed them, so tuning has numbers.

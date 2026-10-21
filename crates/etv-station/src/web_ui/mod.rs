@@ -48,11 +48,11 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::account::AccountScope;
 use crate::catalog::{Catalog, Entry as CatalogEntry, TagNs, like_escape};
 use crate::config::{self, DatastoreGrant, Pool};
 use crate::profile::ProfileEntry;
 use crate::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
-use crate::tautulli::{self, HistoryScope};
 use crate::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unavailable};
 use airing::api_airing_audit;
 use channel::{ReviewState, api_channel_review, still_reply};
@@ -63,8 +63,8 @@ pub use health::HealthSources;
 use health::api_health_channels;
 use lineup::api_lineup;
 use pools::{
-    PoolState, api_draft_discard, api_draft_edit, api_draft_open, api_pools, api_search_item,
-    api_search_keyword, api_search_tag, api_tautulli_users, draft_yaml, scored_channel_count,
+    PoolState, api_draft_discard, api_draft_edit, api_draft_open, api_plex_accounts, api_pools,
+    api_search_item, api_search_keyword, api_search_tag, draft_yaml, scored_channel_count,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
@@ -298,7 +298,7 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
         (Method::Get, "/api/search/keyword") => api_search_keyword(state, query),
         (Method::Get, "/api/search/tag") => api_search_tag(state, query),
         (Method::Get, "/api/search/item") => api_search_item(state, query),
-        (Method::Get, "/api/tautulli/users") => api_tautulli_users(),
+        (Method::Get, "/api/plex/accounts") => api_plex_accounts(),
         _ => Ok((
             404,
             json!({"error": format!("no route: {} {}", method, path)}),

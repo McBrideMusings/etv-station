@@ -1108,8 +1108,8 @@ the discarded draft answers 404. Screenshot, light and dark: no draft, a draft w
 edits (draft bar, movement column), the pending state while a ranking runs (the
 "Ranking…" line; a pool ranks in 10-22s on the real catalog), and an error-server
 state (`#/channels/001-for-you/pools?draft=gone` first shows the 404 notice, then the
-deployed pools). The Tautulli account choice lists users only when `TAUTULLI_URL`
-and `TAUTULLI_API_KEY` are set.
+deployed pools). The account choice lists Plex accounts (`/api/plex/accounts`) only when
+`PLEX_URL` and `PLEX_TOKEN` are set.
 
 A review answers from the channel's real airings with no simulation: `GET /api/channels/{ch}/review`
 is 200 at once (observed 2026-10-19 on a fixture station: 12 ms), every airing `projected: false`,

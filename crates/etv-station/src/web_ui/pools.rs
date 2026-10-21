@@ -36,6 +36,7 @@
 
 use super::lineup::{has_scorer, lineup_keys};
 use super::*;
+use crate::catalog::ingest::plex::{PlexEnv, fetch_accounts};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Drafts the server keeps at once.
@@ -261,21 +262,19 @@ fn pools_of(channel: &config::ChannelConfig) -> Vec<&Pool> {
 }
 
 /// The Plex account a channel's scorer reads history for: none for
-/// `taste_scope: all_users`, else the one Tautulli resolves its single user to.
+/// `taste_scope: all_users`, else the one Plex account its single user names.
 pub(super) fn channel_account_id(channel: &config::ChannelConfig) -> Result<Option<i64>, String> {
-    match channel.history_scope() {
-        HistoryScope::AllUsers => Ok(None),
-        scope @ HistoryScope::User(_) => {
-            let (url, key) = tautulli::credentials_from_env().ok_or_else(|| {
-                "scoring.taste_scope is single_user, but TAUTULLI_URL/TAUTULLI_API_KEY \
+    match channel.account_scope() {
+        AccountScope::AllUsers => Ok(None),
+        scope @ AccountScope::User(_) => {
+            let env = PlexEnv::from_env().ok_or_else(|| {
+                "scoring.taste_scope is single_user, but PLEX_URL/PLEX_TOKEN \
                  aren't set (source .env)"
                     .to_string()
             })?;
-            let rows = tautulli::fetch_rows(&url, &key, &scope);
-            Ok(Some(
-                tautulli::resolve_account_id(&scope, &rows)?
-                    .ok_or_else(|| "single_user scope resolved to no account".to_string())?,
-            ))
+            let accounts = fetch_accounts(&env)
+                .map_err(|e| format!("fetching plex accounts to resolve scoring.user: {e}"))?;
+            crate::account::resolve(&scope, &accounts)
         }
     }
 }
@@ -1125,13 +1124,12 @@ pub(super) fn api_search_item(state: &AppState, query: &str) -> Result<(u16, Val
     Ok((200, json!({ "results": results })))
 }
 
-pub(super) fn api_tautulli_users() -> Result<(u16, Value), String> {
-    let (url, key) = tautulli::credentials_from_env()
-        .ok_or_else(|| "TAUTULLI_URL/TAUTULLI_API_KEY aren't set".to_string())?;
-    let users = tautulli::fetch_users(&url, &key)?;
-    let results: Vec<Value> = users
+pub(super) fn api_plex_accounts() -> Result<(u16, Value), String> {
+    let env = PlexEnv::from_env().ok_or_else(|| "PLEX_URL/PLEX_TOKEN aren't set".to_string())?;
+    let accounts = fetch_accounts(&env).map_err(|e| format!("fetching plex accounts: {e}"))?;
+    let results: Vec<Value> = accounts
         .iter()
-        .map(|u| json!({ "user_id": u.user_id, "display_name": u.display_name() }))
+        .map(|a| json!({ "id": a.id, "name": a.name }))
         .collect();
     Ok((200, json!({ "results": results })))
 }
@@ -1216,7 +1214,7 @@ mod tests {
                  scoring:\n  nominal_item_secs: 5400\n\
                  rule:\n  blocks:\n    - mode: all\n      program:\n        title: \"For You\"\n      pools:\n\
                  \x20       - name: movies\n          plugin: \"{plugin}\"\n\
-                 \x20         capabilities: [catalog_read, watch_history]\n\
+                 \x20         capabilities: [catalog_read, http]\n\
                  \x20         datastores:\n            - name: taste\n              path: \"{db}\"\n\
                  \x20         config:\n            exploration_fraction: 0.0\n\
                  \x20         select: round_robin\n          advance: restart\n\

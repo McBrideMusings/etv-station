@@ -17,8 +17,6 @@
 //! Not part of normal generation. A debug check, wired to its own CLI flag in
 //! `main.rs`, never called from [`crate::daemon`].
 
-use std::sync::Arc;
-
 use time::OffsetDateTime;
 
 use crate::catalog::Catalog;
@@ -139,7 +137,6 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
     let state = GenerationState::empty();
     let scoring = ScoreInputs {
         target_count: TARGET_COUNT_HINT,
-        history: Arc::from(Vec::new()),
         recent: Vec::new(),
         now: OffsetDateTime::now_utc().unix_timestamp(),
         // Same station tz a real generation hands a sequencer block — a
@@ -147,10 +144,9 @@ pub fn check(station: &mut Station, channel_name: &str) -> Result<DeterminismRep
         // wall-clock read this check exists to catch, so both passes need the
         // real zone rather than the UTC fallback.
         tz: Some(crate::tz::parse(&station.station.tz)?),
-        // No live Tautulli fetch happens in this stateless check, the same
-        // simplification `history` above already makes — a `single_user`
-        // channel's `ctx.account_id` is untested here, not incorrectly
-        // resolved (#278).
+        // No live Plex account lookup happens in this stateless check — a
+        // `single_user` channel's `ctx.account_id` is untested here, not
+        // incorrectly resolved (#278).
         account_id: None,
     };
     // Read once and handed to both passes, for the same reason `now` is: a
@@ -769,7 +765,6 @@ fn audit(ctx, picks, workspace) {
         let state = GenerationState::empty();
         let scoring = ScoreInputs {
             target_count: TARGET_COUNT_HINT,
-            history: Arc::from(Vec::new()),
             recent: Vec::new(),
             now: OffsetDateTime::now_utc().unix_timestamp(),
             tz: Some(crate::tz::parse(&station.station.tz).unwrap()),

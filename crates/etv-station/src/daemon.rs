@@ -12,6 +12,7 @@ use tokio::select;
 use tokio::sync::Notify;
 use tracing::Instrument;
 
+use crate::account::AccountScope;
 use crate::cancel::Cancel;
 use crate::catalog::Catalog;
 use crate::catalog::ingest::plex::{PlexAccount, PlexEnv};
@@ -26,7 +27,6 @@ use crate::generation::{
 use crate::history::HistoryDb;
 use crate::overlay_supervisor;
 use crate::scan;
-use crate::tautulli::{HistoryRow, HistoryScope};
 use crate::tz as tzmod;
 
 /// The station-wide history database's filename, under `output_base` — a
@@ -257,7 +257,7 @@ struct Signals {
 
 /// Everything a channel loop needs that belongs to the *station* rather than to
 /// the channel: the parsed time zone, the media roots, the shared catalog, and
-/// the shared watch history.
+/// the shared Plex account list.
 ///
 /// One value per generation, handed whole to every channel task. Threading these
 /// individually meant each new station-wide resource added a parameter to three
@@ -268,11 +268,9 @@ struct StationContext<'a> {
     tz: &'static Tz,
     identity_roots: &'a [String],
     catalog: Option<&'a CatalogInfo>,
-    history: &'a SharedHistory,
-    /// The station-wide play-history database (#111). Named distinctly from
-    /// `history` above — that field is the *watch* history a scorer plugin
-    /// reads (`ctx.history`); this one is the play-history ledger every
-    /// channel appends to and projects its resume cursor from.
+    accounts: &'a SharedAccounts,
+    /// The station-wide play-history database (#111): the play-history ledger
+    /// every channel appends to and projects its resume cursor from.
     history_db: &'a Arc<HistoryDb>,
     /// The station-level `tracks:` rules (#261), the base of the track
     /// selection cascade.
@@ -282,165 +280,54 @@ struct StationContext<'a> {
     hooks: &'a crate::hooks::HookBus,
 }
 
-/// The station's copy of "what has been watched lately" — one per distinct
-/// audience, not one per channel (#126, #112).
+/// The station's copy of Plex's `/accounts` list — one per generation, shared by
+/// every `single_user` channel.
 ///
-/// Before #126, an N-channel station issued N identical `get_history` calls of a
-/// thousand rows and ran N identical catalog joins on every tick to produce N
-/// identical `Vec<WatchEvent>`. #126 collapsed that to a single cached copy,
-/// which was correct while history had no user dimension. #112 gives it one: a
-/// channel can now rank against one named person, so two channels no longer
-/// always want the same rows.
-///
-/// So the cache is keyed by [`HistoryScope`] rather than reverted to a
-/// per-channel fetch. A station running the house For You channel plus one each
-/// for two people makes three requests per refresh window and no more — however
-/// many channels are pointed at those three audiences. Sharing survives; it is
-/// just sharing among the channels that actually want the same rows.
-///
-/// Channels tick on their own `roll_interval`s and there is no station-wide
-/// clock to hang a single fetch off, so this stays a cache the channels pull
-/// from rather than a task that pushes to them: the first channel into a refresh
-/// window for a given scope pays for that scope's fetch, and for the join when
-/// it returned rows, while every other channel on that scope inside that window
-/// gets the same `Arc` back.
-///
-/// Contention is the point, not a cost: the one mutex is held across the fetch,
-/// so channels that tick together queue behind one request instead of racing N.
-/// Keeping a single mutex over the whole map rather than one per scope also caps
-/// how hard a many-channel station can hit Tautulli at once — scopes serialize
-/// against each other, which is the behaviour worth having when the alternative
-/// is three simultaneous thousand-row requests.
-///
-/// A `single_user` scope's fetch also resolves that account's **Plex** id
-/// (#278, #281), cached alongside its events and read back through
-/// [`Self::account_id`] — a scorer plugin needs the id, not the events, to
-/// rank against one person's [`plexdb_reader::Reader::taste_vector_for`]
-/// rather than the pooled vector. It is Plex's own id, not Tautulli's: the two
-/// disagree for exactly one account, the server's owner (plex-db-ex
-/// ADR-0010), so [`Self::resolve_account_id`] translates through Plex's own
-/// `/accounts` rather than handing a scorer plugin the raw Tautulli id
-/// [`crate::tautulli::resolve_account_id`] finds.
-struct SharedHistory {
-    /// What to join fetched rows against, and — because it is `None` whenever
-    /// this generation has no reader for the result — the switch that decides
-    /// whether a fetch happens at all. `None` means no request is ever made and
-    /// no join event is ever logged.
-    ///
-    /// Two things put it there: a station with no `catalog_path`, which has
-    /// nothing to join rows against; and a station whose channels name no
-    /// scorer plugin, which has nobody to hand the joined events to. See
-    /// [`history_catalog`] (#131).
-    catalog: Option<Arc<CatalogInfo>>,
-    /// The Tautulli `(url, api key)` to fetch against, resolved from the
-    /// environment once by the caller. `None` — an unconfigured Tautulli —
-    /// makes no request and produces no rows, which then takes the same
-    /// skip-the-join path an unreachable or idle server takes (#141). Holding
-    /// the pair here rather than reading the environment down in the fetch is
-    /// what lets a test exercise that path without mutating the process
-    /// (#132).
-    tautulli: Option<(String, String)>,
-    /// The Plex connection to resolve a `single_user` scope's account id
-    /// against (#281), resolved from the environment once by the caller — the
-    /// same [`PlexEnv`] the catalog ingest uses. `None` — an unconfigured
-    /// Plex — makes a `single_user` channel's scorer plugin fail its
-    /// generation loudly naming the user, the same as an account Plex's own
-    /// `/accounts` does not recognise: there is no pooled-vector fallback to
-    /// degrade to.
+/// A `single_user` channel's `scoring.user` resolves to a Plex account id that a
+/// scorer plugin receives as `ctx.account_id` ([`crate::account::resolve`]).
+/// `/accounts` takes no parameter and returns the same server-wide list for every
+/// asker, so the list is fetched once per refresh window and every channel
+/// resolving inside that window shares the fetch. `Err` is cached too, as the
+/// already-formatted failure string, so an unreachable Plex costs one call per
+/// window rather than one per channel; `PlexIngestError` itself is not `Clone`,
+/// which is why the message is stored instead of the error.
+struct SharedAccounts {
+    /// The Plex connection to list accounts from, resolved from the environment
+    /// once by the caller — the same [`PlexEnv`] the catalog ingest uses. `None`
+    /// — an unconfigured Plex — makes a `single_user` channel's generation fail
+    /// loudly naming the user: there is no pooled-vector fallback to degrade to.
     plex: Option<PlexEnv>,
-    /// How long a scope listed in `scope_refresh` is reused before the next
-    /// channel to ask refetches; also the window for a scope that is not listed.
+    /// How long a fetched list is reused before the next channel to ask
+    /// refetches: the shortest `roll_interval` among the `single_user` channels,
+    /// so no channel resolves against a list older than one of its own ticks.
     refresh_after: Duration,
-    /// Per-scope refresh windows: the shortest `roll_interval` among the
-    /// channels that read that scope's history, so no channel ever sees a
-    /// history older than one of its own ticks, and a fast channel on one scope
-    /// does not shorten the window of any other scope (#371).
-    scope_refresh: HashMap<HistoryScope, Duration>,
-    /// One entry per audience any channel has asked for so far, created on first
-    /// ask. Scopes come from the channel list, which is fixed for the life of a
-    /// generation, so this cannot grow without bound under a running station.
-    state: tokio::sync::Mutex<HashMap<HistoryScope, HistoryCache>>,
-    /// The station-wide Plex `/accounts` cache (#283) — **not** keyed by
-    /// [`HistoryScope`], unlike `state` above. `/accounts` takes no scope
-    /// parameter and returns the same server-wide list for every asker, so
-    /// every `single_user` scope resolving inside one refresh window shares
-    /// this one fetch — one level up from #126/#112's per-audience Tautulli
-    /// cache, which still varies by scope because Tautulli's history genuinely
-    /// does. `None` before the first fetch.
-    ///
-    /// Locked independently of `state`. [`Self::resolve_account_id`] runs
-    /// under `state`'s lock (called from [`Self::refresh`] while it is held),
-    /// so this mutex must only ever be acquired *underneath* `state`, never
-    /// the reverse — [`Self::plex_accounts`] touches only this field and
-    /// nothing else, which is what keeps that ordering safe.
-    accounts: tokio::sync::Mutex<Option<PlexAccountsCache>>,
-    /// How `accounts` is actually fetched — a seam so tests can count calls
+    /// `None` before the first fetch. Tokio's clock, so tests can advance it.
+    cache: tokio::sync::Mutex<Option<PlexAccountsCache>>,
+    /// How the list is actually fetched — a seam so tests can count calls
     /// without a live Plex server. Production installs a closure wrapping
     /// [`crate::catalog::ingest::plex::fetch_accounts`]; only tests reach for
     /// [`Self::with_accounts_fetch`] to install a counting one.
-    accounts_fetch: PlexAccountsFetch,
+    fetch: PlexAccountsFetch,
 }
 
-/// The result of one station-wide `/accounts` fetch (#283), cached whole
-/// rather than keyed by scope — see the doc on [`SharedHistory::accounts`]
-/// for why. `Err` is cached too, as the already-formatted failure string,
-/// so an unreachable Plex costs one call per refresh window rather than one
-/// per scope still asking; `PlexIngestError` itself is not `Clone`, which is
-/// why the message is stored instead of the error.
+/// One station-wide `/accounts` fetch, cached whole.
 struct PlexAccountsCache {
     fetched_at: tokio::time::Instant,
     result: Result<Arc<[PlexAccount]>, String>,
 }
 
-/// A fetcher for the station-wide `/accounts` list (#283), owning its
-/// [`PlexEnv`] rather than borrowing one, because the call it wraps runs on a
-/// `spawn_blocking` thread and must be `'static`. Production wraps
-/// [`crate::catalog::ingest::plex::fetch_accounts`]; a test installs a
-/// counting stand-in through [`SharedHistory::with_accounts_fetch`].
+/// A fetcher for the station-wide `/accounts` list, owning its [`PlexEnv`]
+/// rather than borrowing one, because the call it wraps runs on a
+/// `spawn_blocking` thread and must be `'static`.
 type PlexAccountsFetch = Arc<dyn Fn(PlexEnv) -> Result<Vec<PlexAccount>, String> + Send + Sync>;
 
-struct HistoryCache {
-    /// `None` until the first fetch. Tokio's clock, so tests can advance it.
-    fetched_at: Option<tokio::time::Instant>,
-    events: Arc<[crate::score::WatchEvent]>,
-    /// The **Plex** account id this scope's fetch resolved (#278, #281),
-    /// cached alongside `events` since both come from the same fetch and age
-    /// together. `Err` names the user when nothing resolved — a Tautulli
-    /// account [`crate::tautulli::resolve_account_id`] could not find, no
-    /// Plex configured to translate it, or a Tautulli account Plex's own
-    /// `/accounts` does not recognise; see [`SharedHistory::resolve_account_id`].
-    /// `Ok(None)` before the first fetch, the same as an unset field would
-    /// default to, since a scope with no catalog to fetch against never
-    /// resolves to anything more interesting than "nothing to report" anyway.
-    account_id: Result<Option<i64>, String>,
-}
-
-impl Default for HistoryCache {
-    fn default() -> Self {
+impl SharedAccounts {
+    fn new(plex: Option<PlexEnv>, refresh_after: Duration) -> Self {
         Self {
-            fetched_at: None,
-            events: Arc::from(Vec::new()),
-            account_id: Ok(None),
-        }
-    }
-}
-
-impl SharedHistory {
-    fn new(
-        catalog: Option<Arc<CatalogInfo>>,
-        tautulli: Option<(String, String)>,
-        plex: Option<PlexEnv>,
-        refresh_after: Duration,
-    ) -> Self {
-        Self {
-            catalog,
-            tautulli,
             plex,
             refresh_after,
-            scope_refresh: HashMap::new(),
-            state: tokio::sync::Mutex::new(HashMap::new()),
-            accounts: tokio::sync::Mutex::new(None),
-            accounts_fetch: Arc::new(|env| {
+            cache: tokio::sync::Mutex::new(None),
+            fetch: Arc::new(|env| {
                 crate::catalog::ingest::plex::fetch_accounts(&env).map_err(|e| {
                     format!("fetching plex accounts to resolve a taste_scope account id: {e}")
                 })
@@ -448,242 +335,53 @@ impl SharedHistory {
         }
     }
 
-    /// Give each scope its own refresh window instead of the single
-    /// `refresh_after` (#371).
-    fn with_scope_refresh(mut self, windows: HashMap<HistoryScope, Duration>) -> Self {
-        self.scope_refresh = windows;
-        self
-    }
-
-    /// How long `scope`'s fetched history is reused.
-    fn window(&self, scope: &HistoryScope) -> Duration {
-        self.scope_refresh
-            .get(scope)
-            .copied()
-            .unwrap_or(self.refresh_after)
-    }
-
-    /// How long the station-wide `/accounts` list is reused: the shortest
-    /// window among the `single_user` scopes, the only ones that read it.
-    fn accounts_window(&self) -> Duration {
-        self.scope_refresh
-            .iter()
-            .filter(|(scope, _)| matches!(scope, HistoryScope::User(_)))
-            .map(|(_, window)| *window)
-            .min()
-            .unwrap_or(self.refresh_after)
-    }
-
-    /// Test-only seam (#283): install a counting or failing fetcher in place
-    /// of the default live `/accounts` call, so a test can assert how many
-    /// times it actually ran without contacting a real Plex server.
+    /// Test-only seam: install a counting or failing fetcher in place of the
+    /// default live `/accounts` call.
     #[cfg(test)]
     fn with_accounts_fetch(mut self, f: PlexAccountsFetch) -> Self {
-        self.accounts_fetch = f;
+        self.fetch = f;
         self
     }
 
-    /// The history to generate `scope`'s channels against right now, fetching it
-    /// first if that scope's cached copy has aged past its [`Self::window`].
+    /// The **Plex** account id `scope` resolves to right now (#278, #281) —
+    /// `Ok(None)` for [`AccountScope::AllUsers`], which never touches Plex.
     ///
-    /// Each scope ages independently: a channel ranking against one person does
-    /// not refresh the server-wide pool, and vice versa.
-    ///
-    /// Empty when Tautulli is unset or unreachable, which degrades a scorer's
-    /// ranking rather than failing the tick (#74).
-    async fn current(&self, scope: &HistoryScope) -> Arc<[crate::score::WatchEvent]> {
-        self.refresh(scope).await.0
-    }
-
-    /// The **Plex** account id `scope` resolves to right now (#278, #281),
-    /// from the same fetch [`Self::current`] uses — read back rather than
-    /// fetched a second time.
-    ///
-    /// `Ok(None)` for [`HistoryScope::AllUsers`]. `Err` names the user when a
-    /// `single_user` scope could not be resolved all the way to a Plex
-    /// account id — a Tautulli account Tautulli itself does not recognise, no
-    /// `PLEX_URL`/`PLEX_TOKEN` configured to translate it, or a Tautulli
-    /// account Plex's own `/accounts` does not recognise. Either way there is
-    /// no id to hand a scorer plugin, and the caller must fail the generation
-    /// loudly rather than let `ctx.account_id` arrive as unit and read like a
-    /// pooled channel. Only worth calling for a channel that names a scorer
-    /// plugin — nothing else reads the result.
-    async fn account_id(&self, scope: &HistoryScope) -> Result<Option<i64>, String> {
-        self.refresh(scope).await.1
-    }
-
-    /// The shared fetch-or-cache-hit both [`Self::current`] and
-    /// [`Self::account_id`] read from, so the two can never observe two
-    /// different fetches for what is supposed to be one scope's one refresh
-    /// window.
-    async fn refresh(
-        &self,
-        scope: &HistoryScope,
-    ) -> (Arc<[crate::score::WatchEvent]>, Result<Option<i64>, String>) {
-        let Some(sc) = self.catalog.as_ref() else {
-            // Nothing to join rows against, so no Tautulli fetch runs here —
-            // unchanged from before #281. A `single_user` scope's account id
-            // still has to be resolved (#278), and #281 needs a live Plex
-            // `/accounts` fetch to do it, run with no rows to fall back on: a
-            // scope whose config value doesn't directly match a Plex account
-            // id/name fails loudly here, exactly as a name-scope already did
-            // in this configuration before #281.
-            let account_id = self.resolve_account_id(scope, &[]).await;
-            return (Arc::from(Vec::new()), account_id);
-        };
-        let mut state = self.state.lock().await;
-        let cache = state.entry(scope.clone()).or_default();
-        if let Some(at) = cache.fetched_at
-            && at.elapsed() < self.window(scope)
-        {
-            return (Arc::clone(&cache.events), cache.account_id.clone());
-        }
-        // The HTTP half runs on a blocking thread — `ureq` is synchronous and
-        // would otherwise stall this runtime worker for the request timeout,
-        // exactly as the Plex ingest above avoids. The catalog join is local
-        // work and stays here.
-        //
-        // With no Tautulli configured there is nothing to request, so no
-        // request is made and the row set is empty before the join is even
-        // considered.
-        let rows = match self.tautulli.clone() {
-            Some((url, key)) => {
-                let scope = scope.clone();
-                tokio::task::spawn_blocking(move || crate::tautulli::fetch_rows(&url, &key, &scope))
-                    .await
-                    .unwrap_or_default()
-            }
-            None => Vec::new(),
-        };
-        // Resolved from `rows` before they are moved into the join below
-        // (#278, #281) — the only place on this side a username maps to an
-        // id, and a digit-authored scope that matches a Plex account id
-        // directly never even looks at `rows` to answer it.
-        let account_id = self.resolve_account_id(scope, &rows).await;
-        let events = if rows.is_empty() {
-            // No rows is the ordinary state, not a corner: a station with no
-            // `TAUTULLI_URL`/`TAUTULLI_API_KEY` never asks for any, and a
-            // configured server that is unreachable or that nobody has watched
-            // lately returns none. A join over an empty row set can only
-            // produce an empty result, so running it costs a SQLite open and a
-            // `tautulli.join` INFO reading `rows=0, keys=0, matched=0` to
-            // arrive back where it started. That line is worse than wasted:
-            // "joined watch history to the catalog" on an unconfigured station
-            // reads as a wired-up Tautulli whose server is idle, which is a
-            // different problem entirely (#141). Skip both, and let
-            // `tautulli.join` mean a join actually happened.
-            //
-            // The empty result is still cached and still stamped below, so the
-            // rest of this refresh window is served from the cache rather than
-            // repeating the fetch on every channel's tick.
-            Vec::new()
-        } else {
-            // A reader of its own, opened for this join and dropped with it.
-            // Once per refresh window for the whole station, so the open costs
-            // nothing next to the HTTP request that just happened; keeping a
-            // handle alive between fetches would buy nothing. A failure to open
-            // degrades the ranking rather than failing the tick, same as an
-            // unreachable Tautulli.
-            match Catalog::open_readonly(&sc.path) {
-                Ok(reader) => crate::tautulli::join(&reader, rows),
-                Err(e) => {
-                    tracing::warn!(
-                        event = "tautulli.catalog_unavailable",
-                        error = %e,
-                        "could not open a catalog reader to join watch history; generating without it",
-                    );
-                    Vec::new()
-                }
-            }
-        };
-        cache.events = Arc::from(events);
-        cache.account_id = account_id;
-        cache.fetched_at = Some(tokio::time::Instant::now());
-        (Arc::clone(&cache.events), cache.account_id.clone())
-    }
-
-    /// The **Plex** account id `scope` resolves to (#281) — `Ok(None)` for
-    /// [`HistoryScope::AllUsers`].
-    ///
-    /// Starts from [`crate::tautulli::resolve_account_id`]'s Tautulli-space id
-    /// (#278, unchanged — that function's job is narrowing the Tautulli
-    /// fetch and validating the account exists there, not taste) and
-    /// translates it into Plex's own id space, since the two only disagree
-    /// for one account: the server's owner, whom Plex's own history stores
-    /// under a small server-local id while Tautulli reports the same person
-    /// under their much larger plex.tv id (plex-db-ex ADR-0010). A `single_user`
-    /// channel's scorer plugin ranks against
-    /// `plexdb_reader::Reader::taste_vector_for`, which is keyed on *Plex's*
-    /// id, so handing it the raw Tautulli id is exactly #281's silent bug.
-    ///
-    /// Two steps, direct then fallback, so every account except the owner
-    /// resolves with no Tautulli row needed at all — unchanged from before
-    /// #281:
-    /// 1. **Direct.** The Tautulli-resolved id, checked against Plex's own
-    ///    `/accounts` by id. Every account agrees on id except the owner, so
-    ///    this is the only step most accounts ever need.
-    /// 2. **Fallback**, only when the direct check misses. `rows`' Tautulli
-    ///    username for this scope ([`crate::tautulli::HistoryRow::username_for`])
-    ///    matched against a Plex account's *name* — the one field
-    ///    plex-db-ex's own name join (ADR-0010) confirms agrees between the
-    ///    two systems. `rows` is what this refresh already fetched; no
-    ///    second Tautulli call.
-    ///
-    /// `Err`, naming the user, when: `resolve_account_id` itself failed; this
-    /// station has no `PLEX_URL`/`PLEX_TOKEN` to translate with; Plex was
-    /// unreachable; or neither step above found a match. Never a silent
-    /// `Ok(None)` for a `single_user` scope — that is what let a `single_user`
-    /// channel rank against an empty vector without anything in the logs
-    /// saying why (#281's whole point, same rule #278 set for the Tautulli
-    /// side).
-    ///
-    /// The `/accounts` listing both steps check against is fetched by
-    /// [`Self::plex_accounts`] once per station per refresh window (#283),
-    /// not once per call here — every `single_user` scope resolving inside
-    /// that window shares the one fetch, since `/accounts` has no scope
-    /// parameter to vary by.
-    async fn resolve_account_id(
-        &self,
-        scope: &HistoryScope,
-        rows: &[HistoryRow],
-    ) -> Result<Option<i64>, String> {
-        let Some(tautulli_id) = crate::tautulli::resolve_account_id(scope, rows)? else {
+    /// `Err` names the user when a `single_user` scope could not be resolved
+    /// all the way to a Plex account id — no `PLEX_URL`/`PLEX_TOKEN` configured,
+    /// Plex unreachable, or no account of that id or name. The caller must fail
+    /// the generation loudly rather than let `ctx.account_id` arrive as unit and
+    /// read like a pooled channel. Only worth calling for a channel that names a
+    /// scorer plugin — nothing else reads the result.
+    async fn account_id(&self, scope: &AccountScope) -> Result<Option<i64>, String> {
+        let AccountScope::User(user) = scope else {
             return Ok(None);
         };
         let Some(env) = self.plex.clone() else {
             return Err(format!(
-                "taste_scope: single_user resolved a Tautulli account ({tautulli_id}) but this \
-                 station has no PLEX_URL/PLEX_TOKEN configured to translate it into a Plex \
-                 account id (#281)",
+                "taste_scope: single_user (user {user:?}) needs PLEX_URL/PLEX_TOKEN configured \
+                 to look the account up",
             ));
         };
         let accounts = self.plex_accounts(env).await?;
-
-        translate_tautulli_id_to_plex(tautulli_id, scope, rows, &accounts).map(Some)
+        crate::account::resolve(scope, &accounts)
     }
 
-    /// The station-wide `/accounts` list (#283), fetched once per
-    /// [`Self::accounts_window`] and shared by every `single_user` scope that
-    /// resolves inside it — see the doc on [`Self::accounts`] for why one
-    /// fetch answers every scope.
-    ///
-    /// Locks only `self.accounts`, never `self.state` — [`Self::refresh`]
-    /// already holds `state` when it reaches [`Self::resolve_account_id`],
-    /// so acquiring `state` from here would deadlock against it.
+    /// The `/accounts` list, fetched once per [`Self::refresh_after`] and shared
+    /// by every `single_user` channel that resolves inside it.
     async fn plex_accounts(&self, env: PlexEnv) -> Result<Arc<[PlexAccount]>, String> {
-        let mut accounts = self.accounts.lock().await;
-        if let Some(cache) = accounts.as_ref()
-            && cache.fetched_at.elapsed() < self.accounts_window()
+        let mut cache = self.cache.lock().await;
+        if let Some(c) = cache.as_ref()
+            && c.fetched_at.elapsed() < self.refresh_after
         {
-            return cache.result.clone();
+            return c.result.clone();
         }
-        let fetch = Arc::clone(&self.accounts_fetch);
+        let fetch = Arc::clone(&self.fetch);
         let result = tokio::task::spawn_blocking(move || fetch(env))
             .await
             .map_err(|e| format!("plex accounts fetch panicked: {e}"))
             .and_then(|r| r)
             .map(|list| Arc::from(list) as Arc<[PlexAccount]>);
-        *accounts = Some(PlexAccountsCache {
+        *cache = Some(PlexAccountsCache {
             fetched_at: tokio::time::Instant::now(),
             result: result.clone(),
         });
@@ -691,89 +389,17 @@ impl SharedHistory {
     }
 }
 
-/// The pure core of [`SharedHistory::resolve_account_id`]'s Plex-side
-/// translation (#281) — split out from the HTTP-fetching wrapper above so the
-/// direct/fallback decision is unit-tested without a live Plex server, the
-/// same "pure core, thin HTTP wrapper" split [`crate::catalog::ingest::plex`]
-/// already uses.
-///
-/// `tautulli_id` is what [`crate::tautulli::resolve_account_id`] already
-/// resolved for `scope`; `accounts` is a live `/accounts` listing. Direct
-/// match by id first (every account except the owner), then a fallback
-/// through `rows`' Tautulli username for `scope` matched by Plex account
-/// name — see [`SharedHistory::resolve_account_id`]'s doc for why each step
-/// exists.
-fn translate_tautulli_id_to_plex(
-    tautulli_id: i64,
-    scope: &HistoryScope,
-    rows: &[HistoryRow],
-    accounts: &[PlexAccount],
-) -> Result<i64, String> {
-    // Direct: the Tautulli id already IS the Plex id for every account except
-    // the owner (#281's own diagnosis).
-    if accounts.iter().any(|a| a.id == tautulli_id) {
-        return Ok(tautulli_id);
-    }
-
-    // Fallback: translate through the Tautulli username this scope's rows
-    // report, matched against a Plex account's name.
-    let Some(username) = rows.iter().find_map(|r| r.username_for(scope)) else {
-        return Err(format!(
-            "no Plex account has id {tautulli_id} (Tautulli's account id for this scope), and \
-             no recent Tautulli row named the account to translate its username instead — \
-             regenerate once the account has recent watch history, or reconfigure `user:` with \
-             the account's Plex name directly",
-        ));
-    };
-    accounts
+/// How long the account list is reused: the shortest `roll_interval` among the
+/// channels that resolve a `single_user` account (#371). A channel that does not
+/// resolve one never asks, so its tick rate sets no window.
+fn accounts_refresh_window(channels: &[LoadedChannel]) -> Duration {
+    channels
         .iter()
-        .find(|a| a.name == username)
-        .map(|a| a.id)
-        .ok_or_else(|| {
-            format!(
-                "no Plex account is named {username:?} (this station's Tautulli username for \
-                 the account this scope resolved to Tautulli id {tautulli_id})",
-            )
-        })
-}
-
-/// The catalog this generation's [`SharedHistory`] should join watch rows
-/// against — `None` when nothing in it would ever read the result (#131).
-///
-/// Watch history reaches one place: `ScoreInputs::history`, which a Rhai script
-/// sees through a pool that names a `plugin:` (#74). A station whose channels
-/// name none has no reader, so fetching a thousand
-/// `get_history` rows and joining them against the catalog on every tick
-/// produces a `Vec<WatchEvent>` that is dropped unread.
-///
-/// Deciding here rather than inside [`SharedHistory::current`] keeps `current`
-/// a plain cache, and costs nothing in freshness: a generation holds the whole
-/// channel list already, and a station that gains a plugin pool on SIGHUP is
-/// handed a brand-new `SharedHistory` by the next generation, so the answer
-/// cannot go stale under a running station.
-fn history_catalog(
-    channels: &[LoadedChannel],
-    catalog: Option<&Arc<CatalogInfo>>,
-) -> Option<Arc<CatalogInfo>> {
-    if channels.iter().any(|c| c.config.uses_scorer_plugin()) {
-        catalog.cloned()
-    } else {
-        None
-    }
-}
-
-/// Each audience's refresh window: the shortest `roll_interval` among the
-/// channels that read that audience's history (#371). A channel that does not
-/// read history never asks, so its tick rate sets no window.
-fn history_scope_windows(channels: &[LoadedChannel]) -> HashMap<HistoryScope, Duration> {
-    let mut windows: HashMap<HistoryScope, Duration> = HashMap::new();
-    for c in channels.iter().filter(|c| c.config.uses_scorer_plugin()) {
-        windows
-            .entry(c.config.history_scope())
-            .and_modify(|w| *w = (*w).min(c.config.roll_interval))
-            .or_insert(c.config.roll_interval);
-    }
-    windows
+        .filter(|c| c.config.uses_scorer_plugin())
+        .filter(|c| matches!(c.config.account_scope(), AccountScope::User(_)))
+        .map(|c| c.config.roll_interval)
+        .min()
+        .unwrap_or(Duration::ZERO)
 }
 
 /// What an ingest pass should do about the Plex half of the catalog.
@@ -1162,24 +788,15 @@ async fn run_generation(
     let mut handles = Vec::new();
     let mut supervisor_handles = Vec::new();
     let bus = Arc::new(crate::hooks::HookBus::new(crate::hooks::collect(station)));
-    // One watch history for the whole station (#126). Built per generation
-    // because a reload can change both the roll intervals its per-scope windows
-    // come from (`history_scope_windows`, #371) and whether any channel still
-    // reads a history at all; the catalog behind it is the same one every
-    // generation shares. Only a scope some channel reads is ever asked for, so
-    // the constructor's own window is never consulted.
-    let history = Arc::new(
-        SharedHistory::new(
-            history_catalog(&station.channels, catalog),
-            // The one read of `TAUTULLI_URL`/`TAUTULLI_API_KEY` in the daemon (#132).
-            crate::tautulli::credentials_from_env(),
-            // The same `PLEX_URL`/`PLEX_TOKEN` connection the catalog ingest used
-            // at startup (#281) — not a second read of the environment.
-            plex.cloned(),
-            Duration::ZERO,
-        )
-        .with_scope_refresh(history_scope_windows(&station.channels)),
-    );
+    // One Plex account list for the whole station. Built per generation because
+    // a reload can change the roll intervals its refresh window comes from
+    // (`accounts_refresh_window`, #371).
+    let accounts = Arc::new(SharedAccounts::new(
+        // The same `PLEX_URL`/`PLEX_TOKEN` connection the catalog ingest used
+        // at startup (#281) — not a second read of the environment.
+        plex.cloned(),
+        accounts_refresh_window(&station.channels),
+    ));
     // One stop signal per spawned task. `notify_one` stores a permit if the task
     // is not yet parked, so a reload that races a slow generation startup
     // (duration probing, catch-up emit) is never lost — unlike `notify_waiters`,
@@ -1202,7 +819,7 @@ async fn run_generation(
         }
         let s = station.clone();
         let cat = catalog.cloned();
-        let hist = history.clone();
+        let acc = accounts.clone();
         let hdb = history_db.clone();
         let stop = Arc::new(Notify::new());
         stops.push(stop.clone());
@@ -1249,7 +866,7 @@ async fn run_generation(
                     tz,
                     identity_roots: &s.station.identity_roots,
                     catalog: cat.as_deref(),
-                    history: &hist,
+                    accounts: &acc,
                     history_db: &hdb,
                     station_tracks: s.station.tracks.as_ref(),
                     hooks: &hook_bus,
@@ -1562,9 +1179,8 @@ fn log_reconcile_outcome(outcome: Result<crate::reconcile::ReconcileCounts, Stat
 /// this crate reads `ETV_NEXT_DIR`, kept separate from
 /// [`rerender_etv_next`] so a test can exercise that function with an
 /// explicit directory instead of mutating process environment — see
-/// `credentials_from_env` in `tautulli.rs` for why that mutation is unsound
-/// under Rust 2024 the moment `cargo test` runs another thread that reads
-/// the environment (#132).
+/// `std::env::remove_var` being unsound under Rust 2024 once `cargo test`
+/// runs another thread that reads the environment (#132).
 fn etv_next_out_dir_from_env() -> Option<PathBuf> {
     std::env::var_os("ETV_NEXT_DIR")
         .filter(|v| !v.is_empty())
@@ -3303,30 +2919,8 @@ async fn pattern_catch_up(
     let started_empty = existing.is_empty();
     let mut first_generation = started_empty;
 
-    // Watch history is read at most once per station tick per audience — not
-    // once per generation, and not once per channel. A catch-up chains many
-    // generations in a row and they all share the same "what has been watched
-    // lately", and so does every other channel that ticks in the same refresh
-    // window *and ranks against the same people* (#126, #112). Empty when
-    // Tautulli is unset or unreachable, which degrades a scorer's ranking rather
-    // than failing the tick (#74).
-    //
-    // Asked for only by a channel that actually reads it. `history_catalog`
-    // makes this decision station-wide (#131) — nobody on the station names a
-    // scorer plugin, nobody fetches — but station-wide is too coarse now that
-    // scopes differ: without this check, one plugin channel anywhere would make
-    // every *other* channel fetch its own scope too, for a `Vec<WatchEvent>`
-    // that nothing then reads. Before #112 that cost nothing because they all
-    // shared one entry.
-    let history = if channel.config.uses_scorer_plugin() {
-        ctx.history.current(&channel.config.history_scope()).await
-    } else {
-        Arc::from(Vec::new())
-    };
-
     // The account id a scorer plugin ranks against when this channel is
-    // `single_user`-scoped (#278), resolved from the same Tautulli fetch
-    // `history` above just ran. `None` on a pooled channel and on any channel
+    // `single_user`-scoped (#278). `None` on a pooled channel and on any channel
     // with no scorer plugin at all.
     //
     // A `single_user` channel whose named user resolved to nobody fails this
@@ -3334,11 +2928,11 @@ async fn pattern_catch_up(
     // arrive as unit and a scorer plugin quietly rank against the pooled
     // vector instead — the exact silent failure #278 exists to rule out. The
     // failure is caught here and not at config load because resolving a
-    // username needs the same live Tautulli fetch `history` does; a config
-    // pass has no network (see `config::validate::validate_taste_scope`).
+    // username needs a live Plex `/accounts` fetch; a config pass has no
+    // network (see `config::validate::validate_taste_scope`).
     let account_id = if channel.config.uses_scorer_plugin() {
-        ctx.history
-            .account_id(&channel.config.history_scope())
+        ctx.accounts
+            .account_id(&channel.config.account_scope())
             .await
             .map_err(|reason| ConfigError::Validation {
                 path: channel.config_path.clone(),
@@ -3357,7 +2951,6 @@ async fn pattern_catch_up(
         config_path: &channel.config_path,
         identity_roots: ctx.identity_roots,
         path_index: ctx.catalog.map(|info| &info.path_index),
-        history,
         account_id,
         // The station's configured tz — a sequencer block (#169) reads this to
         // place its pools against the local clock (ADR 0004).
@@ -3711,7 +3304,7 @@ mod resume_fingerprint_survives_generation_tests {
     use tempfile::tempdir;
 
     fn ctx<'a>(
-        history: &'a SharedHistory,
+        accounts: &'a SharedAccounts,
         history_db: &'a Arc<HistoryDb>,
         tz: &'static Tz,
     ) -> StationContext<'a> {
@@ -3719,7 +3312,7 @@ mod resume_fingerprint_survives_generation_tests {
             tz,
             identity_roots: &[],
             catalog: None,
-            history,
+            accounts,
             history_db,
             station_tracks: None,
             hooks: Box::leak(Box::default()),
@@ -3813,7 +3406,7 @@ order = "manual"
         let dir = tempdir().unwrap();
         let channel = ch_straddling(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
-        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let accounts = SharedAccounts::new(None, Duration::ZERO);
         let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog: Option<Catalog> = None;
 
@@ -3821,7 +3414,7 @@ order = "manual"
         stamped.config_id = Some("fingerprint-under-test".into());
         let resume = pattern_catch_up(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut catalog,
             stamped,
             "startup",
@@ -3843,13 +3436,13 @@ order = "manual"
         let dir = tempdir().unwrap();
         let channel = ch_straddling(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
-        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let accounts = SharedAccounts::new(None, Duration::ZERO);
         let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog: Option<Catalog> = None;
 
         let resume = pattern_catch_up(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut catalog,
             crate::resume::ResumeMap::new(),
             "startup",
@@ -3899,7 +3492,7 @@ order = "manual"
         // two roll intervals — the hole is hours out, not at the playhead.
         pattern_catch_up(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut catalog,
             resume,
             "startup",
@@ -3983,13 +3576,13 @@ order = "manual"
         let dir = tempdir().unwrap();
         let channel = ch_list(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
-        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let accounts = SharedAccounts::new(None, Duration::ZERO);
         let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog: Option<Catalog> = None;
 
         let mut resume = pattern_catch_up(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut catalog,
             crate::resume::ResumeMap::new(),
             "startup",
@@ -4029,7 +3622,7 @@ order = "manual"
         wipe_playout_from(&channel, regen_from).await.unwrap();
         let frontier = rewind_to_surviving(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut resume,
             regen_from,
         )
@@ -4047,7 +3640,7 @@ order = "manual"
 
         pattern_catch_up(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut catalog,
             resume,
             "roll",
@@ -4164,13 +3757,13 @@ take = 2
         let dir = tempdir().unwrap();
         let channel = ch_pattern(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
-        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let accounts = SharedAccounts::new(None, Duration::ZERO);
         let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog = Some(pattern_catalog());
 
         let mut resume = pattern_catch_up(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut catalog,
             crate::resume::ResumeMap::new(),
             "startup",
@@ -4186,7 +3779,7 @@ take = 2
         let at = files[1].start + time::Duration::minutes(30);
         refresh_forward(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut resume,
             at,
             "forced",
@@ -4203,7 +3796,7 @@ take = 2
 
         pattern_catch_up(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut catalog,
             resume,
             "roll",
@@ -4224,13 +3817,13 @@ take = 2
         let dir = tempdir().unwrap();
         let channel = ch_pattern(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
-        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let accounts = SharedAccounts::new(None, Duration::ZERO);
         let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog = Some(pattern_catalog());
 
         let mut resume = pattern_catch_up(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut catalog,
             crate::resume::ResumeMap::new(),
             "startup",
@@ -4245,12 +3838,12 @@ take = 2
             .expect("the fixture airs b-e02")
             .1;
         wipe_playout_from(&channel, cut).await.unwrap();
-        rewind_to_surviving(&channel, ctx(&history, &history_db, tz), &mut resume, cut)
+        rewind_to_surviving(&channel, ctx(&accounts, &history_db, tz), &mut resume, cut)
             .await
             .unwrap();
         pattern_catch_up(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut catalog,
             resume,
             "roll",
@@ -4278,13 +3871,13 @@ take = 2
         let dir = tempdir().unwrap();
         let channel = ch_pattern(&dir);
         let tz = crate::tz::parse("UTC").unwrap();
-        let history = SharedHistory::new(None, None, None, Duration::ZERO);
+        let accounts = SharedAccounts::new(None, Duration::ZERO);
         let history_db = Arc::new(HistoryDb::open_in_memory().unwrap());
         let mut catalog = Some(pattern_catalog());
 
         let mut resume = pattern_catch_up(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut catalog,
             crate::resume::ResumeMap::new(),
             "startup",
@@ -4308,7 +3901,7 @@ take = 2
         wipe_playout_from(&channel, regen_from).await.unwrap();
         rewind_to_surviving(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut resume,
             regen_from,
         )
@@ -4317,7 +3910,7 @@ take = 2
 
         pattern_catch_up(
             &channel,
-            ctx(&history, &history_db, tz),
+            ctx(&accounts, &history_db, tz),
             &mut catalog,
             resume,
             "roll",
@@ -5000,11 +4593,10 @@ mod ingest_plan_tests {
     }
 }
 
-/// The station-wide watch history (#126): one fetch per tick, shared by every
-/// channel, refetched once the refresh window has passed — and joined to the
-/// catalog only when that fetch actually returned rows (#141).
+/// The station-wide Plex account list (#283): one `/accounts` fetch per
+/// refresh window, shared by every `single_user` channel.
 #[cfg(test)]
-mod shared_history_tests {
+mod shared_accounts_tests {
     use std::sync::Mutex as StdMutex;
 
     use tracing::field::{Field, Visit};
@@ -5056,516 +4648,9 @@ mod shared_history_tests {
         (seen, guard)
     }
 
-    /// A catalog to join against. Every `SharedHistory` in this module is built
-    /// with `None` for the Tautulli connection, which is what keeps these tests
-    /// hermetic: the dev shell exports `TAUTULLI_URL`/`TAUTULLI_API_KEY`, and a
-    /// fetch that read them would make a real network call. Passing the
-    /// connection in means the test simply withholds it — nothing touches the
-    /// process environment, so nothing races another test thread reading it
-    /// (#132). No connection means no rows, which is exactly the path an
-    /// unreachable or idle Tautulli takes: the cache still turns over on its
-    /// refresh window, but the join is skipped (#141).
-    ///
-    /// Returns the `TempDir` alongside the info: `SharedHistory` reopens the
-    /// file per join, so it has to survive the test rather than being an
-    /// in-memory catalog that exists only behind one handle.
-    fn catalog_without_tautulli() -> (Arc<CatalogInfo>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("catalog.db");
-        // Opened and dropped: this creates the schema the readers expect.
-        crate::catalog::Catalog::open(&path).unwrap();
-        (
-            Arc::new(CatalogInfo {
-                path,
-                path_index: HashMap::new(),
-            }),
-            dir,
-        )
-    }
-
-    /// When one scope's history was last fetched, or `None` if no channel has
-    /// asked for that scope yet.
-    ///
-    /// The cache is keyed by audience since #112, so a test that used to read
-    /// "the" stamp now has to say whose.
-    async fn stamp(history: &SharedHistory, scope: &HistoryScope) -> Option<tokio::time::Instant> {
-        history
-            .state
-            .lock()
-            .await
-            .get(scope)
-            .and_then(|c| c.fetched_at)
-    }
-
-    /// The acceptance criterion: N channels ticking inside one refresh window
-    /// produce **one** fetch between them, not N.
-    ///
-    /// Two independent proofs, because with no rows to join there is no
-    /// `tautulli.join` event left to count (#141). The stamp is the load-bearing
-    /// one: every pass writes `fetched_at`, so if a later channel had run its
-    /// own pass the stamp would have moved to that channel's clock reading.
-    /// Allocation identity backs it up — a fresh pass stores a newly built
-    /// `Arc` and `first` holds the original alive for the whole test, so the
-    /// allocator cannot hand the same address back.
-    #[tokio::test(start_paused = true)]
-    async fn every_channel_in_one_tick_shares_a_single_fetch() {
-        let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
-
-        // Four channels, each asking at the top of its own tick. The clock moves
-        // a second between them — well inside the hour-long window, but enough
-        // that a second pass would restamp `fetched_at` to a different instant.
-        let first = history.current(&HistoryScope::AllUsers).await;
-        let stamped_at = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
-        for _ in 0..3 {
-            tokio::time::advance(Duration::from_secs(1)).await;
-            let again = history.current(&HistoryScope::AllUsers).await;
-            assert_eq!(
-                stamp(&history, &HistoryScope::AllUsers).await.unwrap(),
-                stamped_at,
-                "a channel inside the window must be served from the cache, \
-                 leaving the stamp of the one pass that filled it",
-            );
-            assert!(
-                Arc::ptr_eq(&first, &again),
-                "every channel must get the same allocation, not a copy",
-            );
-        }
-    }
-
-    /// The cache is a refresh window, not a one-shot: a channel ticking after
-    /// the window has passed gets freshly-fetched history. Without this the
-    /// station would rank forever against whatever was watched at startup.
-    ///
-    /// The empty result of a skipped join has to obey the window exactly as a
-    /// real join's would — otherwise skipping the join trades one wasted
-    /// catalog open for a Tautulli request on every single channel tick.
-    #[tokio::test(start_paused = true)]
-    async fn the_next_tick_refetches_once_the_window_has_passed() {
-        let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(60));
-
-        let first = history.current(&HistoryScope::AllUsers).await;
-        let first_at = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
-
-        tokio::time::advance(Duration::from_secs(60)).await;
-        let second = history.current(&HistoryScope::AllUsers).await;
-        let second_at = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
-
-        assert_eq!(
-            second_at.duration_since(first_at),
-            Duration::from_secs(60),
-            "the first tick past the window must refetch and restamp the cache",
-        );
-        assert!(
-            !Arc::ptr_eq(&first, &second),
-            "a refetch must store its own result, not hand back the stale one",
-        );
-
-        let third = history.current(&HistoryScope::AllUsers).await;
-        assert!(
-            Arc::ptr_eq(&second, &third),
-            "the refetched history is shared by the rest of its window too",
-        );
-    }
-
-    /// #112's acceptance criterion, and the thing #126's single cache could not
-    /// do: two channels ranking against different people must not be served each
-    /// other's history.
-    ///
-    /// Before the cache was keyed, the second scope to ask inside a refresh
-    /// window got whatever the first scope had fetched — so a personal For You
-    /// channel would have ranked against the whole server's viewing, silently
-    /// and with no log line saying so.
-    #[tokio::test(start_paused = true)]
-    async fn two_scopes_do_not_serve_each_other_the_wrong_history() {
-        let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
-
-        let pierce = HistoryScope::User("Pierce".to_string());
-        let madi = HistoryScope::User("Madi".to_string());
-
-        history.current(&HistoryScope::AllUsers).await;
-        tokio::time::advance(Duration::from_secs(1)).await;
-        history.current(&pierce).await;
-        tokio::time::advance(Duration::from_secs(1)).await;
-        history.current(&madi).await;
-
-        let all = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
-        let p = stamp(&history, &pierce).await.unwrap();
-        let m = stamp(&history, &madi).await.unwrap();
-
-        assert_eq!(
-            p.duration_since(all),
-            Duration::from_secs(1),
-            "a new audience must run its own fetch, not read the pooled one",
-        );
-        assert_eq!(
-            m.duration_since(p),
-            Duration::from_secs(1),
-            "and so must the next one",
-        );
-        assert_eq!(
-            history.state.lock().await.len(),
-            3,
-            "three audiences asked, so three cache entries",
-        );
-    }
-
-    /// The sharing #126 bought is not lost by keying the cache: two channels
-    /// pointed at the *same* person still make one request between them.
-    ///
-    /// This is what makes "one fetch per audience" different from "one fetch per
-    /// channel" — the shape a naive per-channel fix would have produced.
-    #[tokio::test(start_paused = true)]
-    async fn channels_sharing_one_audience_share_one_fetch() {
-        let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
-        let pierce = HistoryScope::User("Pierce".to_string());
-
-        let first = history.current(&pierce).await;
-        let stamped_at = stamp(&history, &pierce).await.unwrap();
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let second = history.current(&pierce).await;
-
-        assert_eq!(
-            stamp(&history, &pierce).await.unwrap(),
-            stamped_at,
-            "the second channel on this audience must be served from the cache",
-        );
-        assert!(
-            Arc::ptr_eq(&first, &second),
-            "both channels must get the same allocation, not a copy",
-        );
-        assert_eq!(
-            history.state.lock().await.len(),
-            1,
-            "one audience, one cache entry, however many channels want it",
-        );
-    }
-
-    /// Each audience ages on its own clock. A personal channel refreshing does
-    /// not drag the server-wide pool along with it, and vice versa — otherwise
-    /// adding one personal channel would multiply the station's Tautulli traffic
-    /// by re-fetching every scope whenever any one of them expired.
-    #[tokio::test(start_paused = true)]
-    async fn one_scope_expiring_does_not_refetch_the_others() {
-        let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(60));
-        let pierce = HistoryScope::User("Pierce".to_string());
-
-        history.current(&HistoryScope::AllUsers).await;
-        let all_at = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
-
-        // Half a window later the personal scope asks for the first time, so its
-        // own window starts here — 30s out of step with the pooled one.
-        tokio::time::advance(Duration::from_secs(30)).await;
-        history.current(&pierce).await;
-        let pierce_at = stamp(&history, &pierce).await.unwrap();
-
-        // Now cross the pooled scope's expiry but not the personal one's.
-        tokio::time::advance(Duration::from_secs(31)).await;
-        history.current(&HistoryScope::AllUsers).await;
-        history.current(&pierce).await;
-
-        assert!(
-            stamp(&history, &HistoryScope::AllUsers).await.unwrap() > all_at,
-            "the pooled scope was past its window and must have refetched",
-        );
-        assert_eq!(
-            stamp(&history, &pierce).await.unwrap(),
-            pierce_at,
-            "the personal scope was still inside its own window and must not have",
-        );
-    }
-
-    /// The `/accounts` window follows the `single_user` scopes only; the pooled
-    /// scope never reads it (#371).
-    #[test]
-    fn the_accounts_window_ignores_the_pooled_scope() {
-        let history = SharedHistory::new(None, None, None, Duration::ZERO).with_scope_refresh(
-            HashMap::from([
-                (HistoryScope::AllUsers, Duration::from_secs(5)),
-                (HistoryScope::User("Pierce".into()), Duration::from_secs(60)),
-                (HistoryScope::User("Madi".into()), Duration::from_secs(90)),
-            ]),
-        );
-        assert_eq!(history.accounts_window(), Duration::from_secs(60));
-    }
-
-    /// The pooled scope stays cached across its own 1h window while a sibling
-    /// scope on a 60s tick refetches every minute (#371).
-    #[tokio::test(start_paused = true)]
-    async fn a_fast_scope_does_not_shorten_the_pooled_scope_window() {
-        let (info, _catalog_dir) = catalog_without_tautulli();
-        let pierce = HistoryScope::User("Pierce".to_string());
-        let history = SharedHistory::new(Some(info), None, None, Duration::ZERO)
-            .with_scope_refresh(HashMap::from([
-                (HistoryScope::AllUsers, Duration::from_secs(3600)),
-                (pierce.clone(), Duration::from_secs(60)),
-            ]));
-        history.current(&HistoryScope::AllUsers).await;
-        history.current(&pierce).await;
-        let all_at = stamp(&history, &HistoryScope::AllUsers).await.unwrap();
-        let pierce_at = stamp(&history, &pierce).await.unwrap();
-
-        tokio::time::advance(Duration::from_secs(61)).await;
-        history.current(&HistoryScope::AllUsers).await;
-        history.current(&pierce).await;
-
-        assert_eq!(
-            stamp(&history, &HistoryScope::AllUsers).await.unwrap(),
-            all_at
-        );
-        assert!(stamp(&history, &pierce).await.unwrap() > pierce_at);
-    }
-
-    // ---- SharedHistory::account_id (#278) ------------------------------------
-
-    /// A pooled channel has no one account to resolve, on a station with a
-    /// perfectly ordinary catalog and cache behind it.
-    #[tokio::test(start_paused = true)]
-    async fn account_id_for_all_users_is_always_none() {
-        let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
-        assert_eq!(history.account_id(&HistoryScope::AllUsers).await, Ok(None));
-    }
-
-    /// A digit-authored `single_user` scope's Tautulli id resolves with no
-    /// catalog and no Tautulli connection at all — `resolve_account_id`
-    /// needs no row for that half. But #281 requires translating it into
-    /// Plex's own id space before it can become `ctx.account_id`, and with no
-    /// `PLEX_URL`/`PLEX_TOKEN` configured there is nothing to translate
-    /// against — the digit must not be trusted as already being the Plex id,
-    /// which is exactly the silent bug #281 exists to close.
-    #[tokio::test(start_paused = true)]
-    async fn account_id_for_a_digit_scope_fails_with_no_plex_configured() {
-        let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let scope = HistoryScope::User("501".to_string());
-        let err = history.account_id(&scope).await.unwrap_err();
-        assert!(
-            err.contains("PLEX_URL") || err.contains("PLEX_TOKEN"),
-            "must say why nothing could be translated: {err}",
-        );
-    }
-
-    /// A name-authored `single_user` scope with nothing to resolve it from —
-    /// no catalog at all, so no fetch ever ran — fails naming the user rather
-    /// than defaulting to "no account", which a scorer plugin would read as
-    /// "use the pooled vector".
-    #[tokio::test(start_paused = true)]
-    async fn account_id_for_a_name_scope_with_no_catalog_fails_naming_the_user() {
-        let history = SharedHistory::new(None, None, None, Duration::ZERO);
-        let scope = HistoryScope::User("Pierce".to_string());
-        let err = history.account_id(&scope).await.unwrap_err();
-        assert!(err.contains("Pierce"), "must name the user: {err}");
-    }
-
-    /// The same failure, this time from a real fetch that came back empty —
-    /// what an unreachable Tautulli or a genuine typo in `user:` both look
-    /// like from here. #278's acceptance criterion is explicit that neither
-    /// may quietly resolve to "no account".
-    #[tokio::test(start_paused = true)]
-    async fn account_id_for_a_name_scope_with_an_empty_fetch_fails_naming_the_user() {
-        let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
-        let scope = HistoryScope::User("Madi".to_string());
-        let err = history.account_id(&scope).await.unwrap_err();
-        assert!(err.contains("Madi"), "must name the user: {err}");
-    }
-
-    /// `account_id` reads back the same fetch `current` already ran, rather
-    /// than paying for a second one — the cache stamp must not move between
-    /// the two calls inside one refresh window.
-    #[tokio::test(start_paused = true)]
-    async fn account_id_reads_the_same_fetch_current_already_ran() {
-        let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
-        let scope = HistoryScope::User("Pierce".to_string());
-
-        history.current(&scope).await;
-        let stamped_at = stamp(&history, &scope).await.unwrap();
-
-        tokio::time::advance(Duration::from_secs(1)).await;
-        let _ = history.account_id(&scope).await;
-
-        assert_eq!(
-            stamp(&history, &scope).await.unwrap(),
-            stamped_at,
-            "reading the account id inside the same window must not trigger a refetch",
-        );
-    }
-
-    /// A catalog-free station has nothing to join rows against, so it never
-    /// contacts Tautulli at all — unchanged from before #126. `current`
-    /// returns before it even takes the lock, so nothing ever stamps
-    /// `fetched_at`.
-    #[tokio::test(start_paused = true)]
-    async fn a_station_with_no_catalog_never_fetches() {
-        let history = SharedHistory::new(None, None, None, Duration::ZERO);
-
-        assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
-        assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
-        assert!(
-            history.state.lock().await.is_empty(),
-            "a station with no catalog must never engage the cache at all",
-        );
-    }
-
-    /// `tautulli.join` must mean a join happened (#141). A station with no
-    /// Tautulli configured fetches no rows, and announcing "joined watch
-    /// history to the catalog" over `rows=0, keys=0, matched=0` once a minute
-    /// forever reads as a wired-up server nobody has watched — a completely
-    /// different situation from one that was never configured.
-    #[tokio::test(start_paused = true)]
-    async fn no_rows_logs_no_join_event() {
-        let (joins, _guard) = count_events("tautulli.join");
-        let (info, _catalog_dir) = catalog_without_tautulli();
-        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
-
-        assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
-        assert_eq!(
-            *joins.lock().unwrap(),
-            0,
-            "nothing was joined, so nothing may claim a join happened",
-        );
-    }
-
-    /// The other half of #141: with no rows there is nothing to open the
-    /// catalog *for*. Pointing the station at a catalog file that does not
-    /// exist makes the open observable — a read-only open of a missing file
-    /// fails, and the failure is logged as `tautulli.catalog_unavailable`.
-    /// Silence is the proof no open was attempted.
-    #[tokio::test(start_paused = true)]
-    async fn no_rows_never_opens_the_catalog() {
-        let (failures, _guard) = count_events("tautulli.catalog_unavailable");
-        let dir = tempfile::tempdir().unwrap();
-        let info = Arc::new(CatalogInfo {
-            path: dir.path().join("never-created.db"),
-            path_index: HashMap::new(),
-        });
-        // The premise, checked rather than assumed: if this path were somehow
-        // openable the test could pass without proving anything at all.
-        assert!(
-            Catalog::open_readonly(&info.path).is_err(),
-            "the observation only works if opening this catalog really does fail",
-        );
-        let history = SharedHistory::new(Some(info), None, None, Duration::from_secs(3600));
-
-        assert!(history.current(&HistoryScope::AllUsers).await.is_empty());
-        assert_eq!(
-            *failures.lock().unwrap(),
-            0,
-            "a fetch that produced no rows must not open a catalog reader",
-        );
-    }
-
-    // ---- translate_tautulli_id_to_plex (#281) --------------------------------
-
-    fn plex_account(id: i64, name: &str) -> PlexAccount {
-        PlexAccount {
-            id,
-            name: name.to_string(),
-        }
-    }
-
-    /// A row carrying `user_id` and `user` — built through `HistoryRow`'s own
-    /// `Deserialize` impl since its fields are private to `tautulli.rs`; every
-    /// field is `#[serde(default)]`, so a row naming just these two is valid.
-    fn history_row(user_id: i64, user: &str) -> HistoryRow {
-        serde_json::from_str(&format!(r#"{{"user_id": {user_id}, "user": {user:?}}}"#)).unwrap()
-    }
-
-    /// The common case, and the one #281 must not regress: for every account
-    /// except the owner, the Tautulli id already IS the Plex id, so a direct
-    /// match resolves with no row consulted at all.
-    #[test]
-    fn direct_match_needs_no_rows() {
-        let accounts = [plex_account(1, "pierce"), plex_account(12345, "carol")];
-        assert_eq!(
-            translate_tautulli_id_to_plex(
-                12345,
-                &HistoryScope::User("12345".into()),
-                &[],
-                &accounts,
-            ),
-            Ok(12345),
-        );
-    }
-
-    /// The owner's exact mismatch #281 exists to fix: Tautulli's much larger
-    /// plex.tv id matches no Plex account directly, so the fallback reads the
-    /// row's Tautulli username and matches it against Plex's account name
-    /// instead — landing on Plex's own small server-local id.
-    #[test]
-    fn fallback_translates_through_the_tautulli_username() {
-        let accounts = [plex_account(1, "pierce"), plex_account(12345, "carol")];
-        let scope = HistoryScope::User("22831969".into());
-        let rows = [history_row(22831969, "pierce")];
-        assert_eq!(
-            translate_tautulli_id_to_plex(22831969, &scope, &rows, &accounts),
-            Ok(1)
-        );
-    }
-
-    /// The same fallback for a name-authored scope: any row answers it, since
-    /// Tautulli's own `user=` filter already narrowed every row to this one
-    /// account.
-    #[test]
-    fn fallback_works_for_a_name_authored_scope_too() {
-        let accounts = [plex_account(1, "pierce")];
-        let scope = HistoryScope::User("pierce".into());
-        let rows = [history_row(22831969, "pierce")];
-        assert_eq!(
-            translate_tautulli_id_to_plex(22831969, &scope, &rows, &accounts),
-            Ok(1)
-        );
-    }
-
-    /// Neither a direct id match nor a row to translate from — the exact
-    /// combination #281's own "digit scope with no recent plays" limitation
-    /// produces. Must fail naming the Tautulli id, not silently degrade.
-    #[test]
-    fn no_direct_match_and_no_row_fails_naming_the_tautulli_id() {
-        let accounts = [plex_account(1, "pierce")];
-        let scope = HistoryScope::User("22831969".into());
-        let err = translate_tautulli_id_to_plex(22831969, &scope, &[], &accounts).unwrap_err();
-        assert!(
-            err.contains("22831969"),
-            "must name the unresolved Tautulli id: {err}"
-        );
-    }
-
-    /// A row names a username, but nothing in Plex's own `/accounts` carries
-    /// that name — a real config error (a typo, a renamed account) must fail
-    /// naming what was actually looked up, not the id that already failed.
-    #[test]
-    fn fallback_with_no_matching_plex_account_fails_naming_the_username() {
-        let accounts = [plex_account(1, "someone_else")];
-        let scope = HistoryScope::User("22831969".into());
-        let rows = [history_row(22831969, "pierce")];
-        let err = translate_tautulli_id_to_plex(22831969, &scope, &rows, &accounts).unwrap_err();
-        assert!(err.contains("pierce"), "must name the username: {err}");
-    }
-
-    /// Id 0 must never be reachable as a direct match, even if some future
-    /// data shape resolved a Tautulli id of 0 — [`valid_accounts`] excludes it
-    /// upstream, but this pins the behaviour here too: an accounts list with
-    /// no id-0 entry (the normal, filtered shape) simply cannot match it.
-    #[test]
-    fn id_zero_is_never_a_direct_match() {
-        let accounts = [plex_account(1, "pierce")];
-        let scope = HistoryScope::User("0".into());
-        let err = translate_tautulli_id_to_plex(0, &scope, &[], &accounts).unwrap_err();
-        assert!(err.contains('0'));
-    }
-
-    // ---- Plex /accounts caching (#283) ---------------------------------------
-
     /// A `PlexEnv` good enough to move through the fetch seam — nothing here
     /// ever reaches a real socket, since every test in this section installs
-    /// its own fetcher via [`SharedHistory::with_accounts_fetch`].
+    /// its own fetcher via [`SharedAccounts::with_accounts_fetch`].
     fn fake_plex_env() -> PlexEnv {
         PlexEnv {
             base_url: "http://plex.invalid".to_string(),
@@ -5575,9 +4660,15 @@ mod shared_history_tests {
         }
     }
 
+    fn plex_account(id: i64, name: &str) -> PlexAccount {
+        PlexAccount {
+            id,
+            name: name.to_string(),
+        }
+    }
+
     /// A fetcher that counts every call in `calls` and always returns the
-    /// same three-account roster, so a digit-authored `single_user` scope can
-    /// resolve by direct id match with no rows involved.
+    /// same three-account roster.
     fn counting_accounts_fetch(calls: Arc<std::sync::atomic::AtomicUsize>) -> PlexAccountsFetch {
         Arc::new(move |_env| {
             calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5589,19 +4680,47 @@ mod shared_history_tests {
         })
     }
 
+    /// A pooled scope resolves with no Plex configured and no fetch at all.
+    #[tokio::test]
+    async fn account_id_for_all_users_is_always_none() {
+        let accounts = SharedAccounts::new(None, Duration::ZERO);
+        assert_eq!(accounts.account_id(&AccountScope::AllUsers).await, Ok(None));
+    }
+
+    /// A `single_user` scope with no Plex configured fails naming the user:
+    /// there is no pooled-vector fallback to degrade to.
+    #[tokio::test]
+    async fn a_single_user_scope_with_no_plex_fails_naming_the_user() {
+        let accounts = SharedAccounts::new(None, Duration::ZERO);
+        let err = accounts
+            .account_id(&AccountScope::User("Pierce".to_string()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Pierce") && err.contains("PLEX_URL"), "{err}");
+    }
+
+    /// A name resolves through the fetched `/accounts` list.
+    #[tokio::test(start_paused = true)]
+    async fn a_name_scope_resolves_to_the_plex_account_of_that_name() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accounts = SharedAccounts::new(Some(fake_plex_env()), Duration::from_secs(3600))
+            .with_accounts_fetch(counting_accounts_fetch(calls));
+        let scope = AccountScope::User("Madi".to_string());
+        assert_eq!(accounts.account_id(&scope).await, Ok(Some(502)));
+    }
+
     /// The acceptance criterion: three `single_user` scopes, each resolved
     /// inside the same refresh window, share one `/accounts` fetch between
     /// them rather than one apiece.
     #[tokio::test(start_paused = true)]
     async fn n_single_user_scopes_in_one_window_share_one_accounts_fetch() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let history =
-            SharedHistory::new(None, None, Some(fake_plex_env()), Duration::from_secs(3600))
-                .with_accounts_fetch(counting_accounts_fetch(Arc::clone(&calls)));
+        let accounts = SharedAccounts::new(Some(fake_plex_env()), Duration::from_secs(3600))
+            .with_accounts_fetch(counting_accounts_fetch(Arc::clone(&calls)));
 
         for (digit, expected) in [("501", 501), ("502", 502), ("503", 503)] {
-            let scope = HistoryScope::User(digit.to_string());
-            assert_eq!(history.account_id(&scope).await, Ok(Some(expected)));
+            let scope = AccountScope::User(digit.to_string());
+            assert_eq!(accounts.account_id(&scope).await, Ok(Some(expected)));
             tokio::time::advance(Duration::from_secs(1)).await;
         }
 
@@ -5617,16 +4736,15 @@ mod shared_history_tests {
     #[tokio::test(start_paused = true)]
     async fn the_accounts_cache_turns_over_after_the_refresh_window() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let history =
-            SharedHistory::new(None, None, Some(fake_plex_env()), Duration::from_secs(60))
-                .with_accounts_fetch(counting_accounts_fetch(Arc::clone(&calls)));
+        let accounts = SharedAccounts::new(Some(fake_plex_env()), Duration::from_secs(60))
+            .with_accounts_fetch(counting_accounts_fetch(Arc::clone(&calls)));
 
-        let scope = HistoryScope::User("501".to_string());
-        assert_eq!(history.account_id(&scope).await, Ok(Some(501)));
+        let scope = AccountScope::User("501".to_string());
+        assert_eq!(accounts.account_id(&scope).await, Ok(Some(501)));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         tokio::time::advance(Duration::from_secs(60)).await;
-        assert_eq!(history.account_id(&scope).await, Ok(Some(501)));
+        assert_eq!(accounts.account_id(&scope).await, Ok(Some(501)));
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
@@ -5635,23 +4753,20 @@ mod shared_history_tests {
     }
 
     /// Caching the failure too (not just a success) is what keeps an
-    /// unreachable Plex to one call per window instead of one per scope —
-    /// without this, a down server would make N calls, the same problem
-    /// #283 exists to fix, just on the error path.
+    /// unreachable Plex to one call per window instead of one per scope.
     #[tokio::test(start_paused = true)]
     async fn a_failed_accounts_fetch_is_cached_for_the_window() {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_for_fetch = Arc::clone(&calls);
-        let history =
-            SharedHistory::new(None, None, Some(fake_plex_env()), Duration::from_secs(3600))
-                .with_accounts_fetch(Arc::new(move |_env| {
-                    calls_for_fetch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    Err("plex is unreachable".to_string())
-                }));
+        let accounts = SharedAccounts::new(Some(fake_plex_env()), Duration::from_secs(3600))
+            .with_accounts_fetch(Arc::new(move |_env| {
+                calls_for_fetch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("plex is unreachable".to_string())
+            }));
 
         for digit in ["501", "502", "503"] {
-            let scope = HistoryScope::User(digit.to_string());
-            let err = history.account_id(&scope).await.unwrap_err();
+            let scope = AccountScope::User(digit.to_string());
+            let err = accounts.account_id(&scope).await.unwrap_err();
             assert!(
                 err.contains("plex is unreachable"),
                 "must surface the cached failure: {err}",
@@ -5672,7 +4787,7 @@ mod shared_history_tests {
 /// from "never ran".
 #[cfg(test)]
 mod reconcile_log_tests {
-    use super::shared_history_tests::count_events;
+    use super::shared_accounts_tests::count_events;
     use super::*;
 
     /// The whole point of #301: a sweep that changed nothing still says so, at
@@ -5689,21 +4804,10 @@ mod reconcile_log_tests {
     }
 }
 
-/// Whether a generation asks for a watch history at all (#131) — the decision
-/// [`history_catalog`] makes once, before any channel ticks.
+/// Channel-level helpers the generation computes once, before any channel ticks.
 #[cfg(test)]
-mod history_catalog_tests {
+mod channel_helper_tests {
     use super::*;
-
-    /// A catalog `history_catalog` may hand on. Nothing in this module opens
-    /// it: the decision is made from the channel list alone, so the path only
-    /// has to be distinguishable from `None`.
-    fn some_catalog() -> Arc<CatalogInfo> {
-        Arc::new(CatalogInfo {
-            path: PathBuf::from("/catalog.db"),
-            path_index: HashMap::new(),
-        })
-    }
 
     /// A one-block channel whose single pool draws from `source` — either
     /// `plugin: <path>` or `expr: <cel>`.
@@ -5718,32 +4822,6 @@ mod history_catalog_tests {
             output_folder: PathBuf::from(name),
             config: serde_norway::from_str(&yaml).unwrap(),
         }
-    }
-
-    /// The acceptance criterion: every channel drawing from a CEL expression
-    /// means nobody would read a watch history, so the generation is handed no
-    /// catalog and makes no Tautulli request — even though the station has one
-    /// configured.
-    #[test]
-    fn a_station_with_no_plugin_pool_is_given_no_catalog_to_join_against() {
-        let channels = vec![
-            channel("movies", "expr: 'item.type == \"movie\"'"),
-            channel("shows", "expr: 'item.type == \"episode\"'"),
-        ];
-
-        assert!(history_catalog(&channels, Some(&some_catalog())).is_none());
-    }
-
-    /// One plugin pool on one channel is a reader, and restores the fetch for
-    /// the whole station.
-    #[test]
-    fn one_plugin_pool_anywhere_restores_the_fetch() {
-        let channels = vec![
-            channel("movies", "expr: 'item.type == \"movie\"'"),
-            channel("foryou", "plugin: taste-engine.rhai"),
-        ];
-
-        assert!(history_catalog(&channels, Some(&some_catalog())).is_some());
     }
 
     /// The station-level `tracks:` rules shape every item's stream indexes but
@@ -5794,41 +4872,30 @@ mod history_catalog_tests {
         ch
     }
 
-    /// A channel that ticks fast shortens only its own audience's window (#371).
-    /// Every other audience keeps the shortest tick of the channels that read it,
-    /// and a channel that reads no history sets no window.
+    /// The account list is reused for the shortest tick of the channels that
+    /// resolve a `single_user` account (#371); a pooled channel, and a channel
+    /// that names no scorer plugin, set no window.
     #[test]
-    fn scope_windows_come_from_the_channels_reading_each_scope() {
+    fn the_accounts_window_is_the_shortest_single_user_tick() {
         let plugin = "plugin: taste-engine.rhai";
         let pierce = "scoring:\n  taste_scope: single_user\n  user: Pierce\n";
+        let madi = "scoring:\n  taste_scope: single_user\n  user: Madi\n";
         let channels = vec![
-            ticking("1h", "", plugin),
-            ticking("2h", "", plugin),
-            ticking("60s", pierce, plugin),
-            ticking("30s", "", "expr: 'item.type == \"movie\"'"),
+            ticking("30s", "", plugin),
+            ticking("2h", pierce, plugin),
+            ticking("60s", madi, plugin),
+            ticking("10s", pierce, "expr: 'item.type == \"movie\"'"),
         ];
 
-        let windows = history_scope_windows(&channels);
-
-        assert_eq!(
-            windows.len(),
-            2,
-            "the non-reader adds no scope: {windows:?}"
-        );
-        assert_eq!(windows[&HistoryScope::AllUsers], Duration::from_secs(3600));
-        assert_eq!(
-            windows[&HistoryScope::User("Pierce".into())],
-            Duration::from_secs(60),
-        );
+        assert_eq!(accounts_refresh_window(&channels), Duration::from_secs(60));
     }
 
-    /// A station with no `catalog_path` is unchanged — there is nothing to join
-    /// rows against, plugin pool or not.
+    /// With no `single_user` scorer channel nothing ever asks.
     #[test]
-    fn a_station_with_no_catalog_stays_catalog_free() {
-        let channels = vec![channel("foryou", "plugin: taste-engine.rhai")];
+    fn the_accounts_window_is_zero_with_no_single_user_channel() {
+        let channels = vec![ticking("30s", "", "plugin: taste-engine.rhai")];
 
-        assert!(history_catalog(&channels, None).is_none());
+        assert_eq!(accounts_refresh_window(&channels), Duration::ZERO);
     }
 }
 

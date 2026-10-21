@@ -362,28 +362,16 @@ fn validate_guide_templates(
 /// as a personal channel to whoever wrote it while behaving as the house one.
 ///
 /// A `user` that names nobody on the Plex server is *not* caught here — this is
-/// a config pass with no network. Tautulli answers an unknown user with an empty
-/// history, which surfaces at runtime as `rows=0` on the `tautulli.history`
-/// line for that scope.
-///
-/// A channel with no scorer plugin stops there: `ctx.history` just arrives
-/// empty and the generation proceeds, same as an unreachable Tautulli. A
-/// channel that *does* name a scorer plugin goes further (#278, #281):
-/// resolving `user` to the **Plex** account id `ctx.account_id` carries needs
-/// that same live Tautulli fetch, and then a live Plex `/accounts` fetch to
-/// translate into Plex's own id space — Plex's and Tautulli's only disagree
-/// for the server's owner (plex-db-ex ADR-0010), which is exactly the case
-/// that must not resolve to an empty taste vector. A `user` that cannot be
-/// carried all the way through both fails that generation loudly, naming the
-/// user, rather than letting the plugin quietly rank against the pooled
-/// vector instead. Because that Plex fetch is unavoidable — only Plex can say
-/// whether the account is the server owner — `single_user` also requires
+/// a config pass with no network. A channel that names a scorer plugin resolves
+/// `user` to the **Plex** account id `ctx.account_id` carries (#278, #281) with
+/// a live Plex `/accounts` fetch at generation time; a `user` that matches no
+/// account's id or name fails that generation loudly, naming the user, rather
+/// than letting the plugin quietly rank against the pooled vector instead.
+/// Because that fetch is unavoidable, `single_user` also requires
 /// `PLEX_URL`/`PLEX_TOKEN` here, at load, so a missing one fails at startup
 /// rather than on the first generation. The daemon's runtime error stays as
 /// the backstop for an environment that changes after load. See
-/// `daemon::pattern_catch_up`,
-/// [`crate::tautulli::resolve_account_id`], and
-/// `daemon::SharedHistory::resolve_account_id`.
+/// `daemon::pattern_catch_up` and [`crate::account::resolve`].
 fn validate_taste_scope(
     path: &Path,
     channel: &ChannelConfig,
@@ -402,20 +390,19 @@ fn validate_taste_scope(
 
     match (scoring.taste_scope, scoring.user.as_deref()) {
         (TasteScope::SingleUser, None) => bad(
-            "taste_scope: single_user requires `user` — the Tautulli username or \
-             user id whose watch history this channel ranks against",
+            "taste_scope: single_user requires `user` — the Plex account name or \
+             id whose taste this channel ranks against",
         ),
         (TasteScope::SingleUser, Some(u)) if u.trim().is_empty() => {
             bad("`user` cannot be empty under taste_scope: single_user")
         }
         (TasteScope::SingleUser, Some(_)) if !plex_configured => bad(
             "taste_scope: single_user requires PLEX_URL and PLEX_TOKEN to be set — \
-             the Tautulli user id must be translated to a Plex account id, and only \
-             Plex can say whether the account is the server owner (whose two ids differ)",
+             the `user` is looked up in Plex's own account list",
         ),
         (TasteScope::AllUsers, Some(_)) => {
             bad("`user` is only meaningful with taste_scope: single_user; \
-             the default all_users pools every user's history")
+             the default all_users pools every account")
         }
         _ => Ok(()),
     }
@@ -1795,8 +1782,7 @@ mod tests {
         assert!(msg.contains("requires `user`"), "msg = {msg}");
     }
 
-    /// A whitespace-only `user` reaches Tautulli as a filter matching nobody,
-    /// which returns an empty history — indistinguishable from a quiet week.
+    /// A whitespace-only `user` matches no Plex account.
     #[test]
     fn rejects_a_blank_user() {
         let c = channel_scoped_to(TasteScope::SingleUser, Some("   "));
@@ -1839,7 +1825,7 @@ mod tests {
         assert!(validate_channel_with_plex(&dummy_path(), &c, true).is_ok());
     }
 
-    /// #282: the Tautulli→Plex account translation is a hard requirement, so
+    /// #282: the Plex account lookup is a hard requirement, so
     /// a `single_user` channel without Plex configured fails at load, naming
     /// both variables, instead of on its first generation.
     #[test]
@@ -1872,12 +1858,12 @@ mod tests {
     fn a_channel_that_says_nothing_stays_server_wide() {
         let c = channel_with(vec![inline_block(vec![item_entry("a")])]);
         assert!(validate_channel(&dummy_path(), &c).is_ok());
-        assert_eq!(c.history_scope(), crate::tautulli::HistoryScope::AllUsers);
+        assert_eq!(c.account_scope(), crate::account::AccountScope::AllUsers);
 
         let pooled = channel_scoped_to(TasteScope::AllUsers, None);
         assert_eq!(
-            pooled.history_scope(),
-            crate::tautulli::HistoryScope::AllUsers,
+            pooled.account_scope(),
+            crate::account::AccountScope::AllUsers,
         );
     }
 
@@ -1885,15 +1871,14 @@ mod tests {
     fn a_single_user_channel_resolves_to_that_persons_scope() {
         let c = channel_scoped_to(TasteScope::SingleUser, Some("carol"));
         assert_eq!(
-            c.history_scope(),
-            crate::tautulli::HistoryScope::User("carol".into()),
+            c.account_scope(),
+            crate::account::AccountScope::User("carol".into()),
         );
     }
 
     /// Padding survives validation — only an entirely blank `user` is rejected —
     /// so it has to be stripped on the way to the scope. Left in, `" carol "`
-    /// reaches Tautulli as `user=+carol+`, matches nobody, and the channel
-    /// ranks against an empty history while looking perfectly healthy.
+    /// matches no Plex account.
     #[test]
     fn a_padded_user_is_trimmed_before_it_becomes_a_scope() {
         let c = channel_scoped_to(TasteScope::SingleUser, Some("  carol  "));
@@ -1902,8 +1887,8 @@ mod tests {
             "padding is not itself a config error, which is why trimming matters",
         );
         assert_eq!(
-            c.history_scope(),
-            crate::tautulli::HistoryScope::User("carol".into()),
+            c.account_scope(),
+            crate::account::AccountScope::User("carol".into()),
         );
     }
 
@@ -2988,9 +2973,9 @@ fn audit(ctx, picks, workspace) { #{} }"#,
             r#"
 fn hooks() { ["pool_provider"] }
 fn audit(ctx, picks, workspace) { #{} }
-fn capabilities() { ["catalog_read", "watch_history"] }
+fn capabilities() { ["catalog_read", "http"] }
 "#,
-            vec!["catalog_read", "watch_history"],
+            vec!["catalog_read", "http"],
             vec![],
         )
         .unwrap();
@@ -3004,14 +2989,14 @@ fn capabilities() { ["catalog_read", "watch_history"] }
             r#"
 fn hooks() { ["pool_provider"] }
 fn audit(ctx, picks, workspace) { #{} }
-fn capabilities() { ["catalog_read", "watch_history"] }
+fn capabilities() { ["catalog_read", "http"] }
 "#,
             vec!["catalog_read"],
             vec![],
         )
         .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("watch_history"), "msg = {msg}");
+        assert!(msg.contains("http"), "msg = {msg}");
         assert!(msg.contains("scorer.rhai"), "msg = {msg}");
     }
 
@@ -3025,12 +3010,12 @@ fn hooks() { ["pool_provider"] }
 fn audit(ctx, picks, workspace) { #{} }
 fn capabilities() { ["catalog_read"] }
 "#,
-            vec!["catalog_read", "watch_history"],
+            vec!["catalog_read", "http"],
             vec![],
         )
         .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("watch_history"), "msg = {msg}");
+        assert!(msg.contains("http"), "msg = {msg}");
         assert!(msg.contains("never declares"), "msg = {msg}");
     }
 
@@ -3049,7 +3034,7 @@ fn capabilities() { ["probe"] }
             assert!(
                 msg.contains(
                     "the pool_provider hook does not offer probe (it offers: catalog_read, \
-                     watch_history, http)"
+                     http)"
                 ),
                 "msg = {msg}"
             );

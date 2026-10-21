@@ -76,7 +76,6 @@ fn a_projection_from_the_frontier_airs_what_the_daemon_airs_next() {
         config_path: &path,
         identity_roots: &[],
         path_index: None,
-        history: Default::default(),
         account_id: None,
         tz: None,
         now,
