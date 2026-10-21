@@ -370,6 +370,17 @@ be told from a common tag without trusting the ranking. Cut what is wrong, set
 the `threshold`, and commit the result as plain config; nothing is fetched at
 generation time.
 
+Name near misses with `--not` (repeat the flag for several): a tag's score falls
+with the share of the counter-examples that carry it, and a tag every counter-example
+carries is dropped and listed in a `# dropped` comment, so the author sees why.
+Each kept line then ends `counter n/m`. A title in both lists, or a counter-example
+that matches no catalog item, fails naming the title. With no `--not` the output is
+unchanged.
+
+```sh
+etv-station -c station.yaml suggest-category "Foxy Brown (1974)" "Coffy (1973)" --not "Dirty Harry (1971)" --not "Death Wish (1974)"
+```
+
 It is a suggestion tool. A query built from the top candidates alone recovered
 73-77% of a hand-curated 92-film set at 14-15% precision. Infer one seed set per
 run: a union of dissimilar groups ranks as genre soup. A seed that matches no

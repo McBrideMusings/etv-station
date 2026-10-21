@@ -1,0 +1,55 @@
+number: 4
+name: archival-test
+# Exercises archival.rhai: three lavfi programmes on a 30-minute grid, each gap
+# filled with reels named in archival.example.json. Run it with
+# `STATION_CONFIG=examples/station-archival.yaml ./tools/dev-run.sh`.
+display_name: "Archival Test Channel"
+window_days: 1
+chunk_hours: 1
+roll_interval: "60s"
+retention_days: 1
+
+overlay:
+  file: "../../crates/etv-overlay/fixtures/channel_watermark.yaml"
+
+rule:
+  blocks:
+    - mode: "all"
+      order: "manual"
+      align: 30m
+      fill:
+        - script: ../plugins/bumpers/archival.rhai
+          capabilities: [probe, read]
+          config:
+            manifest: archival.example.json
+            tags: [ident, bumper, promo, intermission, snipe]
+      entries:
+        - kind: item
+          in_point: "0s"
+          out_point: "7m"
+          source:
+            kind: lavfi
+            params: "testsrc=size=1280x720:rate=30 [out0]; sine=frequency=440 [out1]"
+          program:
+            title: "Seven Minutes"
+            categories: ["Test"]
+
+        - kind: item
+          in_point: "0s"
+          out_point: "11m"
+          source:
+            kind: lavfi
+            params: "smptebars=size=1280x720:rate=30 [out0]; sine=frequency=880 [out1]"
+          program:
+            title: "Eleven Minutes"
+            categories: ["Test"]
+
+        - kind: item
+          in_point: "0s"
+          out_point: "17m"
+          source:
+            kind: lavfi
+            params: "mandelbrot=size=320x180:rate=30:maxiter=200 [out0]; sine=frequency=220 [out1]"
+          program:
+            title: "Seventeen Minutes"
+            categories: ["Test"]

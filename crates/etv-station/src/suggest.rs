@@ -34,6 +34,14 @@ pub enum SuggestError {
         n: usize,
         ids: String,
     },
+    #[error("counter-example {0:?} matches no catalog item")]
+    UnknownCounter(String),
+    #[error(
+        "counter-example {0:?} matches more than one catalog item; write it as \"Title (Year)\" to pick one"
+    )]
+    AmbiguousCounter(String),
+    #[error("{0:?} is in both the seeds and the counter-examples")]
+    InBothLists(String),
     #[error(
         "need at least 2 seeds with enrichment — shared tags need something to be shared across \
          (got {0})"
@@ -41,6 +49,10 @@ pub enum SuggestError {
     TooFewSeeds(usize),
     #[error("the {0} seeds share no tag; they may not be one group — infer each group separately")]
     NoSharedTags(usize),
+    #[error(
+        "all {0} shared tags are also carried by every counter-example; nothing is left to suggest"
+    )]
+    AllSharedTagsDropped(usize),
     #[error(transparent)]
     Catalog(#[from] CatalogError),
 }
@@ -51,9 +63,12 @@ pub struct Candidate {
     pub value: String,
     /// Seeds carrying the tag.
     pub seeds: usize,
+    /// Counter-examples carrying the tag.
+    pub counters: usize,
     /// Non-episode catalog entries carrying the tag, in the same namespace.
     pub corpus: i64,
-    /// `ln(1 / corpus frequency)` weighted by the share of seeds carrying it.
+    /// `ln(1 / corpus frequency)` weighted by the share of seeds carrying it and
+    /// by the share of counter-examples that do not.
     pub score: f64,
 }
 
@@ -73,6 +88,15 @@ pub struct Suggestion {
     /// Seeds with no tag in any ranked namespace: reported, not ranked.
     pub unenriched: Vec<String>,
     pub corpus_size: i64,
+    /// Distinct catalog items the counter-examples resolved to.
+    pub counters_resolved: usize,
+    /// Counter-examples that carry at least one tag in a ranked namespace.
+    pub counters_enriched: usize,
+    /// Counter-examples with no tag in any ranked namespace: reported, not counted.
+    pub counters_unenriched: Vec<String>,
+    /// Tags shared by the seeds that every enriched counter-example also carries,
+    /// in [`NAMESPACES`] order: what the two groups have in common.
+    pub dropped: Vec<(TagNs, Candidate)>,
     /// Candidates per namespace, ranked, in [`NAMESPACES`] order.
     pub groups: Vec<(TagNs, Vec<Candidate>)>,
 }
@@ -102,10 +126,12 @@ fn resolve_seed(catalog: &Catalog, spec: &str) -> Result<ResolvedSeed, SuggestEr
     }
 }
 
-/// Rank the tags `seeds` share. `top` caps each namespace's list.
+/// Rank the tags `seeds` share, lowering a tag's score by the share of
+/// `counters` that carry it. `top` caps each namespace's list.
 pub fn suggest(
     catalog: &Catalog,
     seeds: &[String],
+    counters: &[String],
     top: usize,
 ) -> Result<Suggestion, SuggestError> {
     let mut resolved: Vec<ResolvedSeed> = Vec::new();
@@ -113,6 +139,24 @@ pub fn suggest(
         let seed = resolve_seed(catalog, spec)?;
         if !resolved.iter().any(|r| r.entry_id == seed.entry_id) {
             resolved.push(seed);
+        }
+    }
+
+    let mut resolved_counters: Vec<ResolvedSeed> = Vec::new();
+    for spec in counters {
+        let counter = resolve_seed(catalog, spec).map_err(|e| match e {
+            SuggestError::UnknownSeed(t) => SuggestError::UnknownCounter(t),
+            SuggestError::AmbiguousSeed { title, .. } => SuggestError::AmbiguousCounter(title),
+            other => other,
+        })?;
+        if resolved.iter().any(|r| r.entry_id == counter.entry_id) {
+            return Err(SuggestError::InBothLists(counter.title));
+        }
+        if !resolved_counters
+            .iter()
+            .any(|r| r.entry_id == counter.entry_id)
+        {
+            resolved_counters.push(counter);
         }
     }
 
@@ -146,7 +190,34 @@ pub fn suggest(
         return Err(SuggestError::TooFewSeeds(enriched));
     }
 
+    // Counter-examples carrying each tag, keyed like `counts`.
+    let mut counter_counts: BTreeMap<&'static str, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut counters_enriched = 0usize;
+    let mut counters_unenriched = Vec::new();
+    for counter in &resolved_counters {
+        let mut any = false;
+        for ns in NAMESPACES {
+            let mut values = catalog.tags_for(&counter.entry_id, ns)?;
+            values.sort_by_key(|v| v.to_ascii_lowercase());
+            values.dedup_by_key(|v| v.to_ascii_lowercase());
+            for v in values {
+                any = true;
+                *counter_counts
+                    .entry(ns.as_str())
+                    .or_default()
+                    .entry(v.to_ascii_lowercase())
+                    .or_insert(0) += 1;
+            }
+        }
+        if any {
+            counters_enriched += 1;
+        } else {
+            counters_unenriched.push(counter.title.clone());
+        }
+    }
+
     let corpus_size = catalog.non_episode_count()?;
+    let mut dropped = Vec::new();
     let mut groups = Vec::new();
     for ns in NAMESPACES {
         let mut cands = Vec::new();
@@ -156,14 +227,30 @@ pub fn suggest(
                     continue;
                 }
                 let corpus = catalog.non_episode_count_with_tag(ns, value)?.max(1);
+                let counter_count = counter_counts
+                    .get(ns.as_str())
+                    .and_then(|m| m.get(&value.to_ascii_lowercase()))
+                    .copied()
+                    .unwrap_or(0);
                 let seed_freq = *seed_count as f64 / enriched as f64;
                 let corpus_freq = corpus as f64 / corpus_size.max(1) as f64;
-                cands.push(Candidate {
+                let counter_freq = if counters_enriched == 0 {
+                    0.0
+                } else {
+                    counter_count as f64 / counters_enriched as f64
+                };
+                let cand = Candidate {
                     value: value.clone(),
                     seeds: *seed_count,
+                    counters: counter_count,
                     corpus,
-                    score: seed_freq * (1.0 / corpus_freq).ln(),
-                });
+                    score: seed_freq * (1.0 / corpus_freq).ln() * (1.0 - counter_freq),
+                };
+                if counters_enriched > 0 && counter_count == counters_enriched {
+                    dropped.push((ns, cand));
+                } else {
+                    cands.push(cand);
+                }
             }
         }
         cands.sort_by(|a, b| {
@@ -184,6 +271,9 @@ pub fn suggest(
         .iter()
         .all(|(_, c): &(TagNs, Vec<Candidate>)| c.is_empty())
     {
+        if !dropped.is_empty() {
+            return Err(SuggestError::AllSharedTagsDropped(dropped.len()));
+        }
         return Err(SuggestError::NoSharedTags(enriched));
     }
 
@@ -192,6 +282,10 @@ pub fn suggest(
         enriched,
         unenriched,
         corpus_size,
+        counters_resolved: resolved_counters.len(),
+        counters_enriched,
+        counters_unenriched,
+        dropped,
         groups,
     })
 }
@@ -227,6 +321,32 @@ pub fn render(s: &Suggestion, name: &str) -> String {
     for title in &s.unenriched {
         let _ = writeln!(out, "# no enrichment, not ranked: {title}");
     }
+    if s.counters_resolved > 0 {
+        let _ = writeln!(
+            out,
+            "# Counter-examples: {} given, {} counted, {} without enrichment. A tag's score falls\n\
+             # with the share of counted counter-examples carrying it; one every counted\n\
+             # counter-example carries is dropped.",
+            s.counters_resolved,
+            s.counters_enriched,
+            s.counters_unenriched.len(),
+        );
+        for title in &s.counters_unenriched {
+            let _ = writeln!(out, "# no enrichment, not counted: {title}");
+        }
+        for (ns, c) in &s.dropped {
+            let _ = writeln!(
+                out,
+                "# dropped, shared with every counter-example: {} ({}) · seeds {}/{} · counter {}/{}",
+                json(&c.value),
+                ns.as_str(),
+                c.seeds,
+                s.enriched,
+                c.counters,
+                s.counters_enriched,
+            );
+        }
+    }
     let _ = writeln!(
         out,
         "# Each line: seeds carrying the tag / ranked seeds; entries carrying it / corpus (same\n\
@@ -254,9 +374,14 @@ pub fn render(s: &Suggestion, name: &str) -> String {
             if dup {
                 continue;
             }
+            let counter_note = if s.counters_enriched > 0 {
+                format!(" · counter {}/{}", c.counters, s.counters_enriched)
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 out,
-                "      - {}  # seeds {}/{} ({:.0}%) · corpus {}/{} ({:.2}%) · lift {:.1}x",
+                "      - {}  # seeds {}/{} ({:.0}%) · corpus {}/{} ({:.2}%) · lift {:.1}x{}",
                 json(&c.value),
                 c.seeds,
                 s.enriched,
@@ -265,6 +390,7 @@ pub fn render(s: &Suggestion, name: &str) -> String {
                 s.corpus_size,
                 100.0 * c.corpus as f64 / s.corpus_size.max(1) as f64,
                 c.lift(s.enriched, s.corpus_size),
+                counter_note,
             );
         }
     }
@@ -331,7 +457,13 @@ mod tests {
     #[test]
     fn ranks_by_seed_share_and_corpus_rarity_and_pins_the_output() {
         let c = fixture();
-        let s = suggest(&c, &seeds(&["Alpha", "Beta (1971)", "Gamma", "Delta"]), 10).unwrap();
+        let s = suggest(
+            &c,
+            &seeds(&["Alpha", "Beta (1971)", "Gamma", "Delta"]),
+            &[],
+            10,
+        )
+        .unwrap();
         assert_eq!(s.enriched, 4);
         assert_eq!(s.corpus_size, 10);
         let out = render(&s, "hk");
@@ -362,11 +494,11 @@ categories:
     fn the_same_seeds_give_the_same_output() {
         let c = fixture();
         let a = render(
-            &suggest(&c, &seeds(&["Alpha", "Beta", "Gamma"]), 10).unwrap(),
+            &suggest(&c, &seeds(&["Alpha", "Beta", "Gamma"]), &[], 10).unwrap(),
             "x",
         );
         let b = render(
-            &suggest(&c, &seeds(&["Gamma", "Beta", "Alpha"]), 10).unwrap(),
+            &suggest(&c, &seeds(&["Gamma", "Beta", "Alpha"]), &[], 10).unwrap(),
             "x",
         );
         assert_eq!(a, b);
@@ -375,7 +507,7 @@ categories:
     #[test]
     fn an_unknown_seed_fails_naming_it() {
         let c = fixture();
-        let err = suggest(&c, &seeds(&["Alpha", "Nonesuch"]), 10).unwrap_err();
+        let err = suggest(&c, &seeds(&["Alpha", "Nonesuch"]), &[], 10).unwrap_err();
         assert!(
             matches!(&err, SuggestError::UnknownSeed(t) if t == "Nonesuch"),
             "{err}"
@@ -385,7 +517,7 @@ categories:
     #[test]
     fn a_seed_without_enrichment_is_reported_not_ranked() {
         let c = fixture();
-        let s = suggest(&c, &seeds(&["Alpha", "Beta", "Bare"]), 10).unwrap();
+        let s = suggest(&c, &seeds(&["Alpha", "Beta", "Bare"]), &[], 10).unwrap();
         assert_eq!(s.enriched, 2);
         assert_eq!(s.unenriched, vec!["Bare".to_string()]);
         assert!(render(&s, "x").contains("# no enrichment, not ranked: Bare"));
@@ -396,7 +528,7 @@ categories:
         let c = fixture();
         // Delta is USA/Solo Actor; Gamma is Hong Kong/Action: nothing in common.
         assert!(matches!(
-            suggest(&c, &seeds(&["Gamma", "Delta"]), 10),
+            suggest(&c, &seeds(&["Gamma", "Delta"]), &[], 10),
             Err(SuggestError::NoSharedTags(2))
         ));
     }
@@ -405,15 +537,15 @@ categories:
     fn fewer_than_two_seeds_fails() {
         let c = fixture();
         assert!(matches!(
-            suggest(&c, &seeds(&["Alpha"]), 10),
+            suggest(&c, &seeds(&["Alpha"]), &[], 10),
             Err(SuggestError::TooFewSeeds(1))
         ));
         assert!(matches!(
-            suggest(&c, &seeds(&["Alpha", "Bare"]), 10),
+            suggest(&c, &seeds(&["Alpha", "Bare"]), &[], 10),
             Err(SuggestError::TooFewSeeds(1))
         ));
         assert!(matches!(
-            suggest(&c, &seeds(&["Alpha", "Alpha"]), 10),
+            suggest(&c, &seeds(&["Alpha", "Alpha"]), &[], 10),
             Err(SuggestError::TooFewSeeds(1))
         ));
     }
@@ -422,7 +554,7 @@ categories:
     fn the_output_parses_as_a_category_file() {
         let c = fixture();
         let out = render(
-            &suggest(&c, &seeds(&["Alpha", "Beta", "Gamma"]), 10).unwrap(),
+            &suggest(&c, &seeds(&["Alpha", "Beta", "Gamma"]), &[], 10).unwrap(),
             "hk",
         );
         let file: crate::config::categories::CategoryFile = serde_norway::from_str(&out).unwrap();
@@ -431,5 +563,95 @@ categories:
             file.categories[0].keywords,
             vec!["Hong Kong", "Action", "Jet Li"]
         );
+    }
+
+    #[test]
+    fn a_tag_every_counter_example_carries_is_dropped_and_named() {
+        let c = fixture();
+        // Other1..3 are USA/Action; Action is also on all three seeds.
+        let s = suggest(
+            &c,
+            &seeds(&["Alpha", "Beta", "Gamma"]),
+            &seeds(&["Other1", "Other2"]),
+            10,
+        )
+        .unwrap();
+        assert_eq!(s.counters_enriched, 2);
+        assert_eq!(s.dropped.len(), 1);
+        assert_eq!(s.dropped[0].1.value, "Action");
+        assert_eq!((s.dropped[0].1.seeds, s.dropped[0].1.counters), (3, 2));
+        let out = render(&s, "hk");
+        assert!(out.contains("# dropped, shared with every counter-example: \"Action\" (genre) · seeds 3/3 · counter 2/2"), "{out}");
+        assert!(!out.contains("      - \"Action\""), "{out}");
+        assert!(out.contains("      - \"Hong Kong\"  # seeds 3/3 (100%) · corpus 3/10 (30.00%) · lift 3.3x · counter 0/2"), "{out}");
+    }
+
+    #[test]
+    fn a_tag_two_of_three_counter_examples_carry_scores_a_third_of_its_old_score() {
+        let c = Catalog::open_in_memory().unwrap();
+        for (id, title, tags) in [
+            ("a", "A", vec!["Mid", "Clean"]),
+            ("b", "B", vec!["Mid", "Clean"]),
+            ("x", "X", vec!["Mid"]),
+            ("y", "Y", vec!["Mid"]),
+            ("z", "Z", vec!["Z"]),
+        ] {
+            let mut e = Entry::new(id, "movie", title, Source::Plex);
+            e.year = Some(1970);
+            c.upsert_entry(&e).unwrap();
+            for t in tags {
+                c.add_tag(id, TagNs::Genre, t).unwrap();
+            }
+        }
+        let score = |counters: &[String], value: &str| {
+            let s = suggest(&c, &seeds(&["A", "B"]), counters, 10).unwrap();
+            s.groups
+                .iter()
+                .flat_map(|(_, c)| c)
+                .find(|c| c.value == value)
+                .map(|c| c.score)
+                .unwrap()
+        };
+        let counters = seeds(&["X", "Y", "Z"]);
+        let plain = score(&[], "Mid");
+        assert!((score(&counters, "Mid") - plain / 3.0).abs() < 1e-9);
+        assert!((score(&counters, "Clean") - score(&[], "Clean")).abs() < 1e-9);
+        assert!(score(&counters, "Mid") < score(&counters, "Clean"));
+    }
+
+    #[test]
+    fn a_title_in_both_lists_fails_naming_it() {
+        let c = fixture();
+        let err = suggest(
+            &c,
+            &seeds(&["Alpha", "Beta"]),
+            &seeds(&["Alpha (1970)"]),
+            10,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SuggestError::InBothLists(t) if t == "Alpha (1970)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_counter_example_fails_naming_it() {
+        let c = fixture();
+        let err = suggest(&c, &seeds(&["Alpha", "Beta"]), &seeds(&["Nonesuch"]), 10).unwrap_err();
+        assert!(
+            matches!(&err, SuggestError::UnknownCounter(t) if t == "Nonesuch"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn no_counter_examples_leave_the_output_unchanged() {
+        let c = fixture();
+        let out = render(
+            &suggest(&c, &seeds(&["Alpha", "Beta", "Gamma"]), &[], 10).unwrap(),
+            "x",
+        );
+        assert!(!out.contains("counter"), "{out}");
     }
 }

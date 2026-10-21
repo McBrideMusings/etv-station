@@ -2209,6 +2209,252 @@ fn build(ctx) {
         assert!(matches!(built, Err(BumperError::Empty { .. })));
     }
 
+    fn archival_dir(manifest: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("archival.rhai");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/plugins/bumpers/archival.rhai"),
+            &script,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("archival.json"), manifest).unwrap();
+        (dir, script)
+    }
+
+    fn fixture(name: &str) -> String {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/etv-query-test/fixtures/bumpers")
+            .join(name)
+            .display()
+            .to_string()
+    }
+
+    fn archival_manifest(clips: &[(&str, &[&str], bool, Option<i64>)]) -> String {
+        let clips: Vec<_> = clips
+            .iter()
+            .map(|(name, tags, burned, minutes)| {
+                serde_json::json!({
+                    "path": fixture(name), "tags": tags,
+                    "burned_in_text": burned, "minutes": minutes,
+                })
+            })
+            .collect();
+        serde_json::json!({ "clips": clips }).to_string()
+    }
+
+    fn archival_input(gap_ms: u64, config: serde_json::Value) -> BumperInput {
+        BumperInput {
+            gap_ms,
+            config: Some(config),
+            granted: vec!["probe".into(), "read".into()],
+            ..input(None)
+        }
+    }
+
+    #[test]
+    fn archival_trims_two_frames_off_both_ends_and_leaves_burned_in_reels_bare() {
+        let (_dir, script) = archival_dir(&archival_manifest(&[(
+            "ident-45s.mp4",
+            &["ident"],
+            true,
+            None,
+        )]));
+        let built = build(&script, &archival_input(120_000, serde_json::json!({}))).unwrap();
+        let duration = probe_media(Path::new(&fixture("ident-45s.mp4")))
+            .unwrap()
+            .unwrap()["duration_ms"]
+            .as_u64()
+            .unwrap();
+        // Two frames at 30 fps is 67 ms.
+        assert_eq!(
+            clip_of(&built),
+            (fixture("ident-45s.mp4"), 67, duration - 67)
+        );
+        assert_eq!(
+            built.timeline.segments[0].duration,
+            Duration::Fixed(duration - 134)
+        );
+        assert!(built.timeline.segments[0].overlay.is_none());
+    }
+
+    #[test]
+    fn archival_cuts_a_reel_longer_than_the_gap_at_the_gap() {
+        let (_dir, script) = archival_dir(&archival_manifest(&[(
+            "ident-45s.mp4",
+            &["ident"],
+            true,
+            None,
+        )]));
+        let built = build(&script, &archival_input(10_000, serde_json::json!({}))).unwrap();
+        assert_eq!(clip_of(&built).1..clip_of(&built).2, 67..10_067);
+        assert_eq!(built.timeline.segments[0].duration, Duration::Fixed(10_000));
+    }
+
+    #[test]
+    fn archival_rejects_a_frame_rate_of_zero() {
+        let (_dir, script) = archival_dir(&archival_manifest(&[(
+            "ident-45s.mp4",
+            &["ident"],
+            true,
+            None,
+        )]));
+        let msg = build(
+            &script,
+            &archival_input(10_000, serde_json::json!({ "fps": 0 })),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains("config.fps"), "{msg}");
+    }
+
+    #[test]
+    fn archival_trims_by_the_configured_frame_rate() {
+        let (_dir, script) = archival_dir(&archival_manifest(&[(
+            "ident-45s.mp4",
+            &["ident"],
+            true,
+            None,
+        )]));
+        let built = build(
+            &script,
+            &archival_input(120_000, serde_json::json!({ "fps": 25 })),
+        )
+        .unwrap();
+        assert_eq!(clip_of(&built).1, 80);
+    }
+
+    #[test]
+    fn archival_draws_the_card_over_a_reel_without_burned_in_text() {
+        let (_dir, script) = archival_dir(&archival_manifest(&[(
+            "promo-22s.mp4",
+            &["promo"],
+            false,
+            None,
+        )]));
+        let built = build(&script, &archival_input(120_000, serde_json::json!({}))).unwrap();
+        let card = built.timeline.segments[0].overlay.as_ref().unwrap();
+        assert_eq!(card.vars["lines"], serde_json::json!(["Night"]));
+    }
+
+    #[test]
+    fn archival_finds_clips_by_tag() {
+        let (_dir, script) = archival_dir(&archival_manifest(&[
+            ("ident-45s.mp4", &["ident"], true, None),
+            ("promo-22s.mp4", &["promo", "bumper"], true, None),
+        ]));
+        let drawn = |tags: serde_json::Value| {
+            let built = build(
+                &script,
+                &archival_input(120_000, serde_json::json!({ "tags": tags })),
+            );
+            built.map(|b| clip_of(&b).0)
+        };
+        assert_eq!(
+            drawn(serde_json::json!(["promo"])).unwrap(),
+            fixture("promo-22s.mp4")
+        );
+        assert_eq!(
+            drawn(serde_json::json!(["bumper"])).unwrap(),
+            fixture("promo-22s.mp4")
+        );
+        assert_eq!(
+            drawn(serde_json::json!(["ident"])).unwrap(),
+            fixture("ident-45s.mp4")
+        );
+        assert!(matches!(
+            drawn(serde_json::json!(["snipe"])),
+            Err(BumperError::Empty { .. })
+        ));
+    }
+
+    #[test]
+    fn archival_draws_a_countdown_clip_only_for_a_gap_matching_its_minutes() {
+        let (_dir, script) = archival_dir(&archival_manifest(&[(
+            "station-bumper-18s.mp4",
+            &["countdown"],
+            true,
+            Some(5),
+        )]));
+        let at = |gap_ms| build(&script, &archival_input(gap_ms, serde_json::json!({})));
+        assert_eq!(
+            clip_of(&at(300_000).unwrap()).0,
+            fixture("station-bumper-18s.mp4")
+        );
+        assert_eq!(
+            clip_of(&at(290_000).unwrap()).0,
+            fixture("station-bumper-18s.mp4")
+        );
+        assert!(matches!(at(120_000), Err(BumperError::Empty { .. })));
+        assert!(matches!(at(600_000), Err(BumperError::Empty { .. })));
+    }
+
+    #[test]
+    fn archival_draws_the_least_recently_aired_clip() {
+        use crate::history::PlayRecord;
+        use time::macros::datetime;
+        let names = ["ident-45s.mp4", "promo-22s.mp4", "station-bumper-12s.mp4"];
+        let (_dir, script) = archival_dir(&archival_manifest(
+            &names.map(|n| (n, &["ident"][..], true, None)),
+        ));
+        let t0 = datetime!(2026-10-17 20:00 UTC);
+        let aired = |name: &str, secs: i64| PlayRecord {
+            entry_id: "archival".into(),
+            start: t0 + time::Duration::seconds(secs),
+            played_at: t0,
+            kind: AiringKind::Bumper,
+            source: Some(fixture(name)),
+            ..Default::default()
+        };
+        let drawn = |rows: Vec<PlayRecord>| {
+            let db = HistoryDb::open_in_memory().unwrap();
+            db.record("Night", &rows).unwrap();
+            let input = BumperInput {
+                history: Some(Arc::new(db)),
+                ..archival_input(120_000, serde_json::json!({}))
+            };
+            clip_of(&build(&script, &input).unwrap()).0
+        };
+        // ident aired last, promo before it: the 12s bumper never aired.
+        assert_eq!(
+            drawn(vec![aired(names[0], 600), aired(names[1], 300)]),
+            fixture(names[2])
+        );
+        // All three aired: promo is the oldest.
+        assert_eq!(
+            drawn(vec![
+                aired(names[0], 600),
+                aired(names[1], 100),
+                aired(names[2], 300),
+                aired(names[1], 50),
+            ]),
+            fixture(names[1])
+        );
+    }
+
+    #[test]
+    fn archival_names_the_manifest_when_it_is_malformed() {
+        for bad in [
+            "{ not json",
+            "{\"clips\": 3}",
+            "{\"clips\": [{\"path\": \"x\"}]}",
+            "{\"clips\": [{\"path\": \"x\", \"tags\": [\"countdown\"], \"burned_in_text\": true, \"minutes\": \"5\"}]}",
+            "{\"clips\": [{\"path\": \"x\", \"tags\": [3], \"burned_in_text\": true}]}",
+        ] {
+            let (_dir, script) = archival_dir(bad);
+            let msg = build(&script, &archival_input(120_000, serde_json::json!({})))
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("manifest archival.json"), "{bad}: {msg}");
+        }
+        let (dir, script) = archival_dir("{}");
+        std::fs::remove_file(dir.path().join("archival.json")).unwrap();
+        let msg = build(&script, &archival_input(120_000, serde_json::json!({})))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("manifest archival.json not found"), "{msg}");
+    }
+
     #[test]
     fn local_time_reads_in_the_channels_time_zone() {
         let dir = tempfile::tempdir().unwrap();
