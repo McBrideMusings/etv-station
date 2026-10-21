@@ -20,7 +20,7 @@ use crate::catalog::Catalog;
 use crate::config::{ChannelConfig, ScoringConfig};
 use crate::errors::StationError;
 use crate::history::HistoryDb;
-use crate::resolve::{ResolvedItem, resolve_channel_with_resume};
+use crate::resolve::{ResolvedItem, resolve_channel_with_cache};
 use crate::resume::{GenerationState, Progress, ResumeMap};
 use crate::score::ScoreInputs;
 
@@ -103,6 +103,7 @@ pub fn generate(
     resume: &ResumeMap,
     from: OffsetDateTime,
     target: OffsetDateTime,
+    score_cache: &mut crate::score::ScoreCache,
 ) -> Result<Generation, StationError> {
     let config = env.config;
     let state = GenerationState {
@@ -123,7 +124,7 @@ pub fn generate(
         tz: env.tz,
         account_id: env.account_id,
     };
-    let (items, resume, progress) = resolve_channel_with_resume(
+    let (items, resume, progress) = resolve_channel_with_cache(
         config,
         env.config_path,
         env.identity_roots,
@@ -144,6 +145,7 @@ pub fn generate(
         // asks "what hour does this generation start" rather than "what hour
         // is it while the daemon happens to be computing this".
         from,
+        score_cache,
     )?;
     // The ledger needs each airing's show, and only the catalog knows it. One
     // query for the whole generation rather than one per item.

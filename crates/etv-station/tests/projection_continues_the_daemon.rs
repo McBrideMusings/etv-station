@@ -91,6 +91,7 @@ fn a_projection_from_the_frontier_airs_what_the_daemon_airs_next() {
         &resume,
         t0,
         t0 + Duration::days(1),
+        &mut etv_station::score::ScoreCache::default(),
     )
     .unwrap();
     let mut frontier = t0;
@@ -121,6 +122,7 @@ fn a_projection_from_the_frontier_airs_what_the_daemon_airs_next() {
         &resume,
         frontier,
         frontier + Duration::days(1),
+        &mut etv_station::score::ScoreCache::default(),
     )
     .unwrap();
     let daemon: Vec<&str> = next.items.iter().map(|i| i.id.as_str()).collect();

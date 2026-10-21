@@ -1198,6 +1198,44 @@ pub fn build(
     fill: Option<Duration>,
     channel_rule: Option<ChannelRule<'_>>,
 ) -> Result<BlockBuild, String> {
+    build_with_cache(
+        catalog,
+        pools,
+        groups,
+        pattern,
+        cycles,
+        block_constraints,
+        state,
+        variety,
+        window_start,
+        score_env,
+        fill,
+        channel_rule,
+        &mut crate::score::ScoreCache::default(),
+    )
+}
+
+/// [`build`] against a caller-held [`crate::score::ScoreCache`], so compiled
+/// plugins and resolved sources survive from one generation to the next. A
+/// caller reusing a cache must hold the catalog and the plugin files fixed
+/// between calls; the per-call `picked_extras` are cleared here.
+#[allow(clippy::too_many_arguments)]
+pub fn build_with_cache(
+    catalog: &Catalog,
+    pools: &[Pool],
+    groups: &[ShowGroup],
+    pattern: &[PatternStep],
+    cycles: Option<usize>,
+    block_constraints: Option<&Constraints>,
+    state: &GenerationState,
+    variety: &crate::variety::Variety,
+    window_start: time::OffsetDateTime,
+    score_env: crate::score::ScoreEnv<'_>,
+    fill: Option<Duration>,
+    channel_rule: Option<ChannelRule<'_>>,
+    score_cache: &mut crate::score::ScoreCache,
+) -> Result<BlockBuild, String> {
+    score_cache.picked_extras.clear();
     // An authored `cycles` is the author saying how long a pass runs, and the
     // window does not get to argue with it. Only a derived count is bounded.
     let budget = fill.filter(|_| cycles.is_none());
@@ -1220,12 +1258,11 @@ pub fn build(
 
     // Two passes, split by whether they read the database — see
     // [`resolve_pool_sources`], which does both.
-    let mut score_cache = crate::score::ScoreCache::default();
     let pool_id_lists = resolve_pool_sources(
         catalog,
         pools,
         groups,
-        &mut score_cache,
+        score_cache,
         &opening,
         score_env,
         &mut lists,
@@ -1375,7 +1412,7 @@ pub fn build(
                     groups,
                     block_constraints,
                     state,
-                    &mut score_cache,
+                    &mut *score_cache,
                     dice,
                     score_env,
                     measure,
@@ -1404,7 +1441,7 @@ pub fn build(
                     &mut runtimes[idx],
                     block_constraints,
                     state,
-                    &mut score_cache,
+                    &mut *score_cache,
                     dice,
                     score_env,
                     measure,
@@ -5308,6 +5345,70 @@ fn audit(ctx, picks, workspace) { #{} }
             ids,
             vec!["mov-1", "mov-2", "mov-1", "mov-2"],
             "the pool should wrap its two films, not stall or error: {ids:?}",
+        );
+    }
+
+    /// A cache handed to a second `build_with_cache` keeps the plugin it
+    /// compiled for the first: rewriting the script on disk between the two
+    /// builds changes nothing, where a fresh cache would rank by the new file.
+    #[test]
+    fn a_held_score_cache_compiles_the_plugin_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fixed.rhai");
+        let write = |first: &str| {
+            std::fs::write(
+                &script,
+                format!(
+                    "fn sources() {{ #{{ movies: `item.type == \"movie\"` }} }}\n\
+                     fn pick(ctx) {{ #{{ picks: [\"{first}\", \"mov-3\"], workspace: () }} }}\n\
+                     fn audit(ctx, picks, workspace) {{ #{{}} }}\n"
+                ),
+            )
+            .unwrap();
+        };
+        let cat = catalog();
+        let pool = plugin_pool(&script);
+        let inputs = crate::score::ScoreInputs {
+            target_count: 2,
+            ..Default::default()
+        };
+        let run = |cache: &mut crate::score::ScoreCache| {
+            build_with_cache(
+                &cat,
+                std::slice::from_ref(&pool),
+                &[],
+                &[step("movies", 1)],
+                Some(2),
+                None,
+                &GenerationState::empty(),
+                &crate::variety::Variety::fixed(0),
+                time::OffsetDateTime::UNIX_EPOCH,
+                crate::score::ScoreEnv {
+                    inputs: &inputs,
+                    base_dir: std::path::Path::new("."),
+                },
+                None,
+                None,
+                cache,
+            )
+            .expect("pattern builds")
+            .ids
+        };
+
+        write("mov-1");
+        let mut held = crate::score::ScoreCache::default();
+        assert_eq!(run(&mut held), vec!["mov-1", "mov-3"]);
+
+        write("mov-2");
+        assert_eq!(
+            run(&mut held),
+            vec!["mov-1", "mov-3"],
+            "held cache reuses the compile"
+        );
+        assert_eq!(
+            run(&mut crate::score::ScoreCache::default()),
+            vec!["mov-2", "mov-3"],
+            "a fresh cache reads the new file"
         );
     }
 
