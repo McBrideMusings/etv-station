@@ -1,8 +1,8 @@
 //! Acceptance test for Sample S9 (#83): the committed `examples/samples/ghibli.yaml`
-//! query channel resolves a studio by the clean `item.studio` column, while the
-//! two brand tiers (A24, Disney) resolve by `item.labels` — the same channel
-//! shape over three metadata-reliability tiers. Proves why one `studio` string
-//! isn't enough for a brand, against a fixture catalog.
+//! query channel resolves a studio by the clean `item.studio` column, and the
+//! brand forms its header shows (A24 by studio, a Disney studio list) resolve by
+//! that column too. A user-applied Label is proven as the form that unifies the
+//! sub-studios of a brand, against a fixture catalog.
 
 use std::path::Path;
 
@@ -14,7 +14,7 @@ use etv_station::resolve::resolve_channel;
 /// - Studio Ghibli films with a clean `studio` string.
 /// - Disney-brand films whose `studio` is a *sub-studio* (Pixar/Marvel/Lucasfilm)
 ///   but which carry a user-applied "Disney" Label.
-/// - An A24 film carrying an "A24" Label (A24 is a distributor, not the studio).
+/// - An A24 film whose `studio` is "A24" and which carries an "A24" Label.
 /// - A control film in neither.
 fn brand_catalog() -> Catalog {
     let cat = Catalog::open_in_memory().unwrap();
@@ -45,9 +45,9 @@ fn brand_catalog() -> Catalog {
     // Disney brand — sub-studios, unified only by the Label.
     seed("dis:toystory", "Toy Story", "Pixar", &["Disney"]);
     seed("dis:ironman", "Iron Man", "Marvel Studios", &["Disney"]);
-    seed("dis:starwars", "Star Wars", "Lucasfilm", &["Disney"]);
-    // A24 — distributor label.
-    seed("a24:ex", "Ex Machina", "Film4", &["A24"]);
+    seed("dis:starwars", "Star Wars", "Lucasfilm Ltd.", &["Disney"]);
+    // A24 — its films carry the studio name and the distributor label.
+    seed("a24:ex", "Ex Machina", "A24", &["A24"]);
     // Control — neither.
     seed("wb:matrix", "The Matrix", "Warner Bros", &[]);
     cat
@@ -92,12 +92,25 @@ fn disney_label_spans_substudios_where_studio_string_fails() {
         .unwrap();
     disney.sort();
     assert_eq!(disney, ["dis:ironman", "dis:starwars", "dis:toystory"]);
+
+    // The studio list the sample header shows resolves the same sub-studio films.
+    let mut by_list = cat
+        .resolve_query(
+            r#"item.studio == "Walt Disney Pictures" || item.studio == "Walt Disney Productions" || item.studio == "Walt Disney Animation Studios" || item.studio == "Pixar" || item.studio == "Marvel Studios" || item.studio == "Lucasfilm Ltd.""#,
+        )
+        .unwrap();
+    by_list.sort();
+    assert_eq!(by_list, ["dis:ironman", "dis:starwars", "dis:toystory"]);
 }
 
-/// The A24 tier: a distributor Label, queryable the same way.
+/// The A24 tier: the studio column holds A24, and the A24 Label queries the same film.
 #[test]
-fn a24_label_is_queryable() {
+fn a24_is_queryable_by_studio_and_label() {
     let cat = brand_catalog();
+    assert_eq!(
+        cat.resolve_query(r#"item.studio == "A24""#).unwrap(),
+        vec!["a24:ex".to_string()],
+    );
     assert_eq!(
         cat.resolve_query(r#"item.labels.contains("A24")"#).unwrap(),
         vec!["a24:ex".to_string()],

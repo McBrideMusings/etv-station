@@ -4,15 +4,15 @@
 # `item.studio` column and played alphabetically. This is the CLEAN tier: Studio
 # Ghibli is a single production company, so a plain `studio ==` string is enough.
 #
-# Two harder brand tiers use `item.labels` instead — the same channel shape over
-# a different metadata source, because one `studio` string isn't enough for a
-# brand:
-#   - A24     — a distributor, not the production company → a user-applied Label:
-#               'item.labels.contains("A24")'
+# Two harder brand tiers use the same column with more values, because one
+# `studio` string isn't enough for a brand:
+#   - A24     — a distributor, not the production company; the studio column
+#               holds its name on its films: 'item.studio == "A24"'
 #   - Disney  — an umbrella spanning Pixar / Marvel / Lucasfilm / … sub-studios,
-#               where 'item.studio == "Disney"' matches almost nothing → a Label:
-#               'item.labels.contains("Disney")'
-# The `studio_brand_sample` acceptance test proves all three query forms.
+#               where 'item.studio == "Disney"' matches nothing, so the query
+#               lists the studios the brand owns (one query, written on one line):
+#               'item.studio == "Walt Disney Pictures" || item.studio == "Walt Disney Productions" || item.studio == "Walt Disney Animation Studios" || item.studio == "Pixar" || item.studio == "Marvel Studios" || item.studio == "Lucasfilm Ltd."'
+# The `studio_brand_sample` acceptance test proves each query form shown here.
 #
 # Registered in examples/station.yaml via the `samples/*.yaml` glob, so a
 # dev-run serves it live. Being a query channel it resolves to nothing

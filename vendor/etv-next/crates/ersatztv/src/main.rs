@@ -190,6 +190,25 @@ async fn run() -> Result<(), LineupError> {
                 });
             }
 
+            // Station-level pre-warm: respawn any channel whose worker is gone,
+            // so the first tune is immediate. Staying up with nobody watching
+            // is the worker's idle grace, which the lineup's writer raises.
+            if lineup_config.server.prewarm {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(20));
+                    loop {
+                        interval.tick().await;
+                        crate::channel_session::prewarm_sweep(
+                            &state.channels,
+                            &state.active,
+                            &state.health,
+                        )
+                        .await;
+                    }
+                });
+            }
+
             let addr = format!(
                 "{}:{}",
                 lineup_config.server.bind_address, lineup_config.server.port

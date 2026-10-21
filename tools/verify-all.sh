@@ -16,10 +16,11 @@
 # gets its own documented command, not a lowest-common-denominator merge.
 #
 # Usage:
-#   tools/verify-all.sh              # test + lint + fmt-check, both workspaces
+#   tools/verify-all.sh              # test + lint + fmt-check (both workspaces) + docs
 #   tools/verify-all.sh test         # tests only
 #   tools/verify-all.sh lint         # clippy only
 #   tools/verify-all.sh fmt-check    # rustfmt --check only (read-only)
+#   tools/verify-all.sh docs         # docs/ anchor links resolve to a heading
 #   tools/verify-all.sh fmt          # rustfmt, WRITES files
 #
 # Every selected check runs in both workspaces even if an earlier one fails;
@@ -68,6 +69,11 @@ do_fmt_check() {
     cargo +nightly fmt --all -- --check
 }
 
+do_docs() {
+  run "docs: anchor links" "$ROOT" \
+    node tools/check-doc-links.mjs
+}
+
 do_fmt() {
   run "parent: fmt" "$ROOT" \
     cargo +nightly fmt --all
@@ -76,13 +82,14 @@ do_fmt() {
 }
 
 case "${1:-all}" in
-  all)       do_test; do_lint; do_fmt_check ;;
+  all)       do_test; do_lint; do_fmt_check; do_docs ;;
   test)      do_test ;;
   lint)      do_lint ;;
   fmt-check) do_fmt_check ;;
+  docs)      do_docs ;;
   fmt)       do_fmt ;;
   *)
-    echo "usage: tools/verify-all.sh [all|test|lint|fmt-check|fmt]" >&2
+    echo "usage: tools/verify-all.sh [all|test|lint|fmt-check|docs|fmt]" >&2
     exit 2
     ;;
 esac

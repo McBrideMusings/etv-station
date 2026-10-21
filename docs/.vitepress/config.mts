@@ -30,6 +30,7 @@ export default defineConfig({
       { text: 'Roadmap', link: '/roadmap' },
       { text: 'Architecture', link: '/architecture' },
       { text: 'Schema', link: '/schema' },
+      { text: 'Plugins', link: '/plugins' },
       { text: 'File map', link: '/file-map' },
     ],
     sidebar: [
@@ -41,6 +42,7 @@ export default defineConfig({
           { text: 'Architecture', link: '/architecture' },
           { text: 'Config schema', link: '/schema' },
           { text: 'Programming principles', link: '/programming' },
+          { text: 'Writing a plugin', link: '/plugins' },
           { text: 'File map', link: '/file-map' },
         ],
       },

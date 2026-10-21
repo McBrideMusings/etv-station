@@ -67,6 +67,43 @@ pub(crate) async fn reap_channel_run_folders(
     result
 }
 
+/// One pre-warm pass: every channel with no live worker and no retry backoff
+/// gets one spawned. The heartbeat is left alone — it keeps meaning "a viewer
+/// is watching", which the exit verdict and the run-folder reap both read — so
+/// a prewarmed worker stays up through the station's idle grace, not through
+/// this sweep. Runs under the same `active` lock the spawn paths in `main`
+/// hold, so it cannot double-spawn a channel. Spawns are spaced out so a large
+/// lineup does not start every transcode in the same instant.
+pub(crate) async fn prewarm_sweep(
+    channels: &[ChannelModel],
+    active: &Arc<Mutex<HashMap<String, ChannelSession>>>,
+    health: &Arc<Mutex<HealthMap>>,
+) {
+    for channel in channels {
+        let number = channel.number();
+        let mut guard = active.lock().await;
+        if guard.contains_key(number) {
+            continue;
+        }
+        let allowed = health.lock().await.get(number).may_spawn_at(Instant::now());
+        if !allowed {
+            continue;
+        }
+        match ChannelSession::spawn(channel, Arc::clone(active), Arc::clone(health)) {
+            Ok(session) => {
+                log::info!("pre-warming channel {number}");
+                guard.insert(number.to_owned(), session);
+            }
+            Err(err) => log::error!("failed to pre-warm channel {number}: {err}"),
+        }
+        drop(guard);
+        tokio::time::sleep(PREWARM_SPAWN_SPACING).await;
+    }
+}
+
+/// Pause after each pre-warm spawn.
+const PREWARM_SPAWN_SPACING: Duration = Duration::from_secs(1);
+
 /// Why a worker exited, in one line: its exit status, plus the error text it
 /// left in [`EXIT_REASON_FILE_NAME`] if it left one. The file is removed here so
 /// the next run's exit can never be blamed on this one's cause.

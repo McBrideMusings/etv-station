@@ -48,6 +48,7 @@ The common operations:
 ./tools/verify-reburst.sh                # freeze a channel's ffmpeg until ETV-next logs a reburst, check it recovers
 ./tools/verify-all.sh                    # test + clippy + fmt --check in BOTH workspaces
 ./tools/verify-all.sh test|lint|fmt-check  # one read-only check, still across both workspaces
+./tools/verify-all.sh docs               # docs/ anchor links resolve (VitePress checks pages, not #anchors)
 ./tools/verify-all.sh fmt                # rustfmt both workspaces — WRITES files
 bun run docs:dev                         # serve VitePress docs on http://localhost:5193
 admin verify accel                       # prove channels encode on the GPU, not silently on the CPU
