@@ -3122,6 +3122,39 @@ async fn forward_channel_loop(
     }
 }
 
+/// The item map a bumper script sees for a scheduled item: the catalog
+/// columns and tags a scorer's `ctx.sets` carries (`content_rating` among
+/// them), the item's `source_ids`, and `path` when it plays a local file.
+/// Without a catalog row it carries `entry_id`, `title` and `path`.
+fn bumper_item_map(catalog: Option<&Catalog>, item: &crate::resolve::ResolvedItem) -> rhai::Map {
+    let mut map = catalog
+        .and_then(|cat| {
+            let items = crate::score::load_items(cat, std::slice::from_ref(&item.id)).ok()?;
+            let mut map = items.into_iter().next()?.try_cast::<rhai::Map>()?;
+            if let Err(e) = crate::score::add_source_ids(cat, &mut map) {
+                tracing::warn!(
+                    event = "bumper.source_ids",
+                    entry_id = %item.id,
+                    error = %e,
+                    "could not read an entry's source ids for a bumper script"
+                );
+            }
+            Some(map)
+        })
+        .unwrap_or_else(|| {
+            let mut map = rhai::Map::new();
+            map.insert("entry_id".into(), item.id.clone().into());
+            if let Some(title) = item.program.as_ref().and_then(|p| p.title.clone()) {
+                map.insert("title".into(), title.into());
+            }
+            map
+        });
+    if let crate::config::SourceConfig::Local { path } = &item.source {
+        map.insert("path".into(), path.clone().into());
+    }
+    map
+}
+
 /// Run the align/fill pass over one generation's schedule. A channel with no
 /// aligned block gets its schedule back unchanged. The bumper scripts read the
 /// airings ledger through `ctx.airings`; the rows for what they place come back
@@ -3162,38 +3195,14 @@ fn align_fill(
         .filter(|d| !d.as_os_str().is_empty())
         .map(|d| std::fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
-    let item_map = |item: &crate::resolve::ResolvedItem| -> rhai::Map {
-        if let Some(cat) = catalog
-            && let Ok(items) = crate::score::load_items(cat, std::slice::from_ref(&item.id))
-            && let Some(map) = items
-                .into_iter()
-                .next()
-                .and_then(|d| d.try_cast::<rhai::Map>())
-        {
-            let mut map = map;
-            if let Err(e) = crate::score::add_source_ids(cat, &mut map) {
-                tracing::warn!(
-                    event = "bumper.source_ids",
-                    entry_id = %item.id,
-                    error = %e,
-                    "could not read an entry's source ids for a bumper script"
-                );
-            }
-            return map;
-        }
-        let mut map = rhai::Map::new();
-        map.insert("entry_id".into(), item.id.clone().into());
-        if let Some(title) = item.program.as_ref().and_then(|p| p.title.clone()) {
-            map.insert("title".into(), title.into());
-        }
-        map
-    };
+    let item_map = |item: &crate::resolve::ResolvedItem| bumper_item_map(catalog, item);
     let env = FillEnv {
         channel: crate::bumper::hook::ChannelInfo {
             name: channel.name.clone(),
             number: channel.config.number,
             logo: None,
             vocabulary: Vec::new(),
+            tz: Some(ctx.tz),
         },
         tz: ctx.tz,
         overlay_root: &overlay_root,
@@ -5847,6 +5856,48 @@ mod tests {
         assert_eq!(
             published_fifo_path(Path::new("/data/playout/hbo")).as_deref(),
             Some("/data/playout/hbo/overlay.fifo")
+        );
+    }
+
+    #[test]
+    fn a_bumper_scripts_next_item_carries_its_rating_and_local_path() {
+        use crate::catalog::{Entry, Source};
+        let cat = Catalog::open_in_memory().unwrap();
+        cat.upsert_entry(&Entry {
+            content_rating: Some("R".into()),
+            ..Entry::new("fs:1", "movie", "Heat", Source::Plex)
+        })
+        .unwrap();
+        let item = crate::resolve::ResolvedItem {
+            block: 0,
+            id: "fs:1".into(),
+            source: crate::config::SourceConfig::Local {
+                path: "/media/heat.mkv".into(),
+            },
+            in_point: None,
+            out_point: None,
+            program: None,
+            catalog_duration: None,
+            error_card: false,
+            metadata: None,
+            guide: None,
+            guide_fields: crate::guide::GuideFields::default(),
+            tracks: None,
+            selected: None,
+            bumper: None,
+        };
+        let map = bumper_item_map(Some(&cat), &item);
+        assert_eq!(
+            map.get("content_rating")
+                .unwrap()
+                .clone()
+                .into_string()
+                .unwrap(),
+            "R"
+        );
+        assert_eq!(
+            map.get("path").unwrap().clone().into_string().unwrap(),
+            "/media/heat.mkv"
         );
     }
 

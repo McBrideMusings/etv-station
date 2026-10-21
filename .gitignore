@@ -35,6 +35,7 @@ tools/__pycache__/
 examples/channels/*
 !examples/channels/lavfi-test.yaml
 !examples/channels/align-test.yaml
+!examples/channels/up-next-test.yaml
 examples/blocks/
 examples/overlays/marquee_overlay.toml
 examples/overlays/showcase_overlay.toml

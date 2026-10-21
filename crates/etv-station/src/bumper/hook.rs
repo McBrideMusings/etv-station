@@ -9,6 +9,9 @@
 //!     // ctx.next    — item map for the programme after the gap, or () at
 //!     //               the generation frontier (the last gap of a generation
 //!     //               comes before the next programme is chosen)
+//!     //               Beyond the catalog's columns it carries `start` (unix
+//!     //               seconds the programme begins, on ctx.next only), `path`
+//!     //               (a local file's path) and `source_ids`.
 //!     // ctx.prev    — item map for the programme before the gap, or ()
 //!     // ctx.upcoming — item maps of the programmes after ctx.next, nearest
 //!     //               first, or [] (the ones already laid; a gap near the end
@@ -55,6 +58,11 @@
 //!   spawn failure, or a run that outlives
 //!   [`crate::plugin_http::GENERATION_TIMEOUT`] (the child is killed), is an
 //!   error; a nonzero `code` is the script's to read.
+//!
+//! `local_time(unix_secs)` converts an instant to the station's time zone and
+//! returns `#{ weekday, hour, minute }`, as it does for a sequencer; with
+//! `ctx.next.start` it lets a script word "Tonight" or "Tomorrow". It needs no
+//! grant.
 //!
 //! `ctx.airings(filter)` reads the airings ledger (`history.db`) and needs no
 //! grant: it is in-process and read-only. It returns an array of maps
@@ -108,6 +116,8 @@ pub struct ChannelInfo {
     pub number: i64,
     pub logo: Option<String>,
     pub vocabulary: Vec<String>,
+    /// The station's time zone, which `local_time()` reads in; `None` is UTC.
+    pub tz: Option<&'static time_tz::Tz>,
 }
 
 /// Everything `ctx` is built from.
@@ -210,6 +220,7 @@ pub fn build(script: &Path, input: &BumperInput) -> Result<BuiltTimeline, Bumper
         history: input.history.clone(),
         channel: input.channel.name.clone(),
         budget: crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET),
+        tz: input.channel.tz.unwrap_or(time_tz::timezones::db::UTC),
     });
     let mut scope = Scope::new();
     let value: Dynamic = engine
@@ -633,6 +644,7 @@ struct Host {
     channel: String,
     /// What this `build()` call has left for `ctx.http` and `ctx.exec`.
     budget: crate::plugin_http::Budget,
+    tz: &'static time_tz::Tz,
 }
 
 impl Host {
@@ -947,6 +959,10 @@ fn bumper_engine(host: Host) -> rhai::Engine {
     let usage = Usage::default();
     let mut engine = crate::score::engine();
 
+    let tz = host.tz;
+    engine.register_fn("local_time", move |secs: i64| {
+        crate::sequence::local_time_map(secs, tz)
+    });
     let h = host.clone();
     engine.register_fn("probe", move |_ctx: &mut Map, path: &str| h.probe(path));
     let h = host.clone();
@@ -1280,6 +1296,7 @@ mod tests {
                 number: 7,
                 logo: None,
                 vocabulary: vec!["alpha".into(), "beta".into(), "gamma".into()],
+                tz: None,
             },
             air_date: "2026-10-17".into(),
             draw: 0,
@@ -1949,5 +1966,229 @@ fn build(ctx) {
         assert_eq!(urls(400_000), ["/a.mp4", "/b.mp4", "/c.mp4"]);
         // A 70s gap holds one whole trailer and the start of the next.
         assert_eq!(urls(70_000), ["/a.mp4", "/b.mp4"]);
+    }
+
+    fn up_next_script() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/plugins/bumpers/up_next.rhai")
+    }
+
+    /// 2026-10-17 20:00 UTC, the hour the film after the gap starts.
+    const FILM_START: i64 = 1_792_267_200;
+
+    fn film(rating: Option<&str>, start: i64) -> Map {
+        let mut m = movie("heat", Some("555"));
+        m.insert("path".into(), "/media/heat.mkv".into());
+        m.insert("start".into(), start.into());
+        if let Some(r) = rating {
+            m.insert("content_rating".into(), r.to_string().into());
+        }
+        m
+    }
+
+    fn up_next_input(config: serde_json::Value, next: Map, granted: &[&str]) -> BumperInput {
+        BumperInput {
+            gap_ms: 120_000,
+            next: Some(next),
+            config: Some(config),
+            granted: granted.iter().map(|g| g.to_string()).collect(),
+            ..input(None)
+        }
+    }
+
+    const PICKS: &str = r#"{ "heat": { "path": "/picks/heat.mkv", "in": 120, "out": 135 } }"#;
+
+    fn clip_of(built: &BuiltTimeline) -> (String, u64, u64) {
+        match &built.timeline.segments[0].source {
+            SegmentSource::Clip {
+                path,
+                in_ms,
+                out_ms,
+            } => (path.display().to_string(), *in_ms, *out_ms),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A plex-db-ex explorer stand-in: answers `/api/search/run` with `reply`
+    /// and returns its URL plus a channel carrying each request body.
+    fn explorer(reply: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { return };
+                // Read through the body: closing on an unread body resets the client.
+                let mut head = String::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = sock.read(&mut buf).unwrap_or(0);
+                    head.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    let Some((top, body)) = head.split_once("\r\n\r\n") else {
+                        if n == 0 {
+                            break;
+                        }
+                        continue;
+                    };
+                    let want = top
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= want || n == 0 {
+                        break;
+                    }
+                }
+                let body = head.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                let _ = tx.send(format!("{}\n{body}", head.lines().next().unwrap_or("")));
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        (url, rx)
+    }
+
+    #[test]
+    fn up_next_airs_a_hand_picked_clip_with_title_time_and_channel_over_it() {
+        validate_script(&up_next_script(), &["http".into()]).unwrap();
+        let config = serde_json::json!({ "picks": serde_json::from_str::<serde_json::Value>(PICKS).unwrap() });
+        let built = build(
+            &up_next_script(),
+            &up_next_input(config, film(Some("PG"), FILM_START), &["http"]),
+        )
+        .unwrap();
+        assert_eq!(
+            clip_of(&built),
+            ("/picks/heat.mkv".into(), 120_000, 135_000)
+        );
+        let card = built.timeline.segments[0].overlay.as_ref().unwrap();
+        assert_eq!(
+            card.vars["lines"],
+            serde_json::json!(["Up next", "Film heat", "Tonight 8:00 PM", "Night"])
+        );
+    }
+
+    #[test]
+    fn up_next_words_a_film_on_a_later_day_as_tomorrow() {
+        let config = serde_json::json!({ "picks": serde_json::from_str::<serde_json::Value>(PICKS).unwrap() });
+        let next = film(Some("PG"), FILM_START + 3_600 * 4 + 60);
+        let built = build(&up_next_script(), &up_next_input(config, next, &[])).unwrap();
+        let card = built.timeline.segments[0].overlay.as_ref().unwrap();
+        assert_eq!(
+            card.vars["lines"][2],
+            serde_json::json!("Tomorrow 12:01 AM")
+        );
+    }
+
+    #[test]
+    fn up_next_skips_a_pick_above_the_slots_rating_for_broll() {
+        let config = |slot: &str| {
+            serde_json::json!({
+                "picks": serde_json::from_str::<serde_json::Value>(PICKS).unwrap(),
+                "slot_rating": slot,
+                "broll_generic": [{ "path": "/broll/a.mp4", "in": 0, "out": 20 }],
+            })
+        };
+        let aired = |rating, slot: &str| {
+            let built = build(
+                &up_next_script(),
+                &up_next_input(config(slot), film(rating, FILM_START), &[]),
+            )
+            .unwrap();
+            clip_of(&built).0
+        };
+        assert_eq!(aired(Some("R"), "PG-13"), "/broll/a.mp4");
+        assert_eq!(aired(None, "PG-13"), "/broll/a.mp4");
+        assert_eq!(aired(Some("PG-13"), "PG-13"), "/picks/heat.mkv");
+        assert_eq!(aired(Some("TV-MA"), "R"), "/picks/heat.mkv");
+    }
+
+    #[test]
+    fn up_next_plays_the_top_shot_plex_db_ex_finds_in_the_film_itself() {
+        let (url, requests) =
+            explorer(r#"{"shots":[{"item_id":"555","in_ms":2000000,"out_ms":2012000,"drawn":1}]}"#);
+        let config =
+            serde_json::json!({ "plexdb_url": url, "phrase": "a car chase", "slot_rating": "R" });
+        let built = build(
+            &up_next_script(),
+            &up_next_input(config, film(Some("R"), FILM_START), &["http"]),
+        )
+        .unwrap();
+        assert_eq!(
+            clip_of(&built),
+            ("/media/heat.mkv".into(), 2_000_000, 2_012_000)
+        );
+        let request = requests.recv().unwrap();
+        let (line, body) = request.split_once('\n').unwrap();
+        assert!(line.starts_with("POST /api/search/run"), "{line}");
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["pool"], serde_json::json!(["555"]));
+        assert_eq!(body["phrase"], "a car chase");
+        assert_eq!(body["draw"]["n"], 1);
+    }
+
+    #[test]
+    fn up_next_drops_a_searched_shot_above_the_slots_rating() {
+        let (url, _) = explorer(r#"{"shots":[{"item_id":"555","in_ms":1000,"out_ms":9000}]}"#);
+        let config = serde_json::json!({
+            "plexdb_url": url, "phrase": "x", "slot_rating": "PG",
+            "broll_generic": [{ "path": "/broll/a.mp4", "in": 0, "out": 20 }],
+        });
+        let built = build(
+            &up_next_script(),
+            &up_next_input(config, film(Some("R"), FILM_START), &["http"]),
+        )
+        .unwrap();
+        assert_eq!(clip_of(&built).0, "/broll/a.mp4");
+    }
+
+    #[test]
+    fn up_next_falls_to_broll_when_search_is_ungranted_empty_or_unreachable() {
+        let (empty, _) = explorer(r#"{"shots":[]}"#);
+        let broll = serde_json::json!([{ "path": "/broll/a.mp4", "in": 5, "out": 25 }]);
+        for (url, granted) in [
+            (empty.clone(), vec![]),
+            (empty, vec!["http"]),
+            ("http://127.0.0.1:9".to_string(), vec!["http"]),
+        ] {
+            let config =
+                serde_json::json!({ "plexdb_url": url, "phrase": "x", "broll_generic": broll });
+            let built = build(
+                &up_next_script(),
+                &up_next_input(config, film(Some("R"), FILM_START), &granted),
+            )
+            .unwrap();
+            assert_eq!(clip_of(&built), ("/broll/a.mp4".into(), 5_000, 25_000));
+        }
+    }
+
+    #[test]
+    fn up_next_with_no_clip_anywhere_returns_an_empty_timeline() {
+        let built = build(
+            &up_next_script(),
+            &up_next_input(serde_json::json!({}), film(None, FILM_START), &[]),
+        );
+        assert!(matches!(built, Err(BumperError::Empty { .. })));
+    }
+
+    #[test]
+    fn local_time_reads_in_the_channels_time_zone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = script(
+            &dir,
+            "fn hooks() { [\"bumper\"] }\nfn build(ctx) { let t = timeline(); \
+             t.push(segment().black().fixed(local_time(1792267200).hour)); t }",
+        );
+        let mut input = input(None);
+        input.channel.tz = Some(crate::tz::parse("America/New_York").unwrap());
+        let built = build(&path, &input).unwrap();
+        // 20:00 UTC is 16:00 EDT.
+        assert_eq!(built.timeline.segments[0].duration, Duration::Fixed(16_000));
     }
 }
