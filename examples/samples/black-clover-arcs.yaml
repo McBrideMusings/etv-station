@@ -13,7 +13,7 @@
 # file via `arcs:`. Being catalog-backed it resolves to nothing unless the
 # station's `catalog_path` points at a populated catalog. Its behavior is
 # proven by the `arcs_sample` acceptance test.
-number: 12
+number: 54
 name: black-clover-arcs
 display_name: "Black Clover, By Arc"
 window_days: 1
