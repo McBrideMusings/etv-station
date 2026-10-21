@@ -422,6 +422,7 @@ fn program_context_for(p: PreviewProgram) -> ProgramContext {
         metadata: p.metadata.unwrap_or(serde_json::Value::Null),
         prev_metadata: p.prev_metadata.unwrap_or(serde_json::Value::Null),
         overlay: None,
+        ..ProgramContext::unknown()
     }
 }
 
@@ -1252,6 +1253,7 @@ fn program_context_for_dump_text(p: &DumpTextProgram) -> ProgramContext {
         metadata: p.metadata.clone().unwrap_or(serde_json::Value::Null),
         prev_metadata: p.prev_metadata.clone().unwrap_or(serde_json::Value::Null),
         overlay: None,
+        ..ProgramContext::unknown()
     }
 }
 

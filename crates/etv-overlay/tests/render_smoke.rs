@@ -1126,3 +1126,71 @@ fn rating_badge_repeats_when_asked_to() {
     assert!(!up(300.0));
     assert!(up(605.0), "back 600s later");
 }
+
+/// `item_lower_third.rhai` puts the item's own genre, year and title on screen
+/// on the item's clock: dark before `first_secs`, in/hold/out, then again one
+/// interval later. A field the item lacks drops out of the label.
+#[test]
+fn item_lower_third_repeats_on_the_items_clock_and_skips_missing_fields() {
+    let script_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/scripts/item_lower_third.rhai");
+    let text = OverlayKind::Text {
+        content: "placeholder".to_string(),
+        font_family: "system-ui".to_string(),
+        font_size: 34.0,
+        letter_spacing: 0.0,
+        align: Default::default(),
+        bold: false,
+        italic: false,
+        markup: false,
+        visible_lines: None,
+        below: None,
+        color: [255, 255, 255, 235],
+        corner: Corner::BottomLeft,
+        margin: 60,
+    };
+    let mut engine = RhaiEngine::new(vec![text]);
+    engine.load_script(&script_path).unwrap();
+
+    let mut ctx = ProgramContext::unknown();
+    ctx.title = "Ghost".into();
+    ctx.year = 1990;
+    ctx.categories = vec!["Academy Award Nominee".into(), "Drama".into()];
+    let at = |ctx: &ProgramContext, elapsed: f64| {
+        let mut c = ctx.clone();
+        c.item_elapsed = elapsed;
+        engine.evaluate(0.0, 0, &c).layers[0].clone()
+    };
+    let label = |layer: &etv_overlay::rhai_engine::LayerState| match &layer.kind {
+        OverlayKind::Text { content, .. } => content.clone(),
+        _ => panic!("expected text layer"),
+    };
+
+    assert!(!at(&ctx, 299.0).visible, "dark before first_secs");
+    let sliding = at(&ctx, 300.3);
+    assert!(sliding.visible && sliding.offset_x > 0.0 && sliding.offset_x < 360.0);
+    let held = at(&ctx, 305.0);
+    assert!(held.visible);
+    assert_eq!(held.offset_x, 0.0);
+    assert_eq!(label(&held), "Academy Award Nominee — 1990 — Ghost");
+    assert!(!at(&ctx, 400.0).visible, "idle between showings");
+    let again = at(&ctx, 1205.0);
+    assert!(again.visible, "returns one interval (900s) later");
+    assert_eq!(again.offset_x, 0.0);
+
+    let mut bare = ProgramContext::unknown();
+    bare.title = "Ghost".into();
+    assert_eq!(
+        label(&at(&bare, 305.0)),
+        "Ghost",
+        "no year or genre: title only"
+    );
+    assert!(
+        !at(&ProgramContext::unknown(), 305.0).visible,
+        "an item with nothing to say draws nothing",
+    );
+
+    let mut blob = ctx.clone();
+    blob.metadata = serde_json::json!({ "lower_third": "Best Picture Nominee" });
+    assert_eq!(label(&at(&blob, 305.0)), "Best Picture Nominee");
+}
