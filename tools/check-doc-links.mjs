@@ -85,7 +85,8 @@ const anchors = new Map([...pages].map(([f, t]) => [f, anchorsOf(t)]))
 
 let bad = 0
 for (const [file, text] of pages) {
-  const lines = stripFences(text).split('\n')
+  const noCode = stripFences(text).replace(/`[^`\n]*`/g, (c) => ' '.repeat(c.length))
+  const lines = noCode.split('\n')
   lines.forEach((line, i) => {
     for (const m of line.matchAll(/\]\(([^)\s]*)#([^)\s]+)\)/g)) {
       const [, path, frag] = m
