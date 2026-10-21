@@ -229,6 +229,39 @@ pub fn resolve_channel_with_resume(
     fill: Option<Duration>,
     window_start: OffsetDateTime,
 ) -> Result<(Vec<ResolvedItem>, ResumeMap, Vec<Progress>), ConfigError> {
+    resolve_channel_with_cache(
+        config,
+        path,
+        identity_roots,
+        path_index,
+        catalog,
+        state,
+        scoring,
+        fill,
+        window_start,
+        &mut crate::score::ScoreCache::default(),
+    )
+}
+
+/// [`resolve_channel_with_resume`] against a caller-held
+/// [`crate::score::ScoreCache`], which every pattern block of the generation
+/// ranks through. The simulator holds one across its generations so a plugin
+/// compiles, and its sources resolve, once per replay instead of once per
+/// generation; see [`crate::pattern::build_with_cache`] for what the caller
+/// must hold fixed.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_channel_with_cache(
+    config: &ChannelConfig,
+    path: &Path,
+    identity_roots: &[String],
+    path_index: Option<&HashMap<String, String>>,
+    catalog: Option<&Catalog>,
+    state: &GenerationState,
+    scoring: &crate::score::ScoreInputs,
+    fill: Option<Duration>,
+    window_start: OffsetDateTime,
+    score_cache: &mut crate::score::ScoreCache,
+) -> Result<(Vec<ResolvedItem>, ResumeMap, Vec<Progress>), ConfigError> {
     // Every generation reads one fixed clock: a plugin's `timestamp()`/
     // `elapsed()` calls see `window_start`, advancing by
     // `score::PLUGIN_CLOCK_STEP` per read, for the whole resolve. Two runs of
@@ -471,6 +504,7 @@ pub fn resolve_channel_with_resume(
             &mut resume_out,
             config.guide.as_ref().map(|g| &g.text),
             channel_rule,
+            score_cache,
         )?;
         // A pattern block is constrained pool by pool, inside the interleave
         // (#115) — so it contributes no limits here. Constraining its finished
@@ -1358,6 +1392,7 @@ fn resolve_block(
     resume_out: &mut ResumeMap,
     channel_guide: Option<&GuideConfig>,
     channel_rule: Option<crate::pattern::ChannelRule<'_>>,
+    score_cache: &mut crate::score::ScoreCache,
 ) -> Result<BlockItems, ConfigError> {
     let unsupported = |message: String| ConfigError::Unsupported {
         path: path.to_path_buf(),
@@ -1390,7 +1425,7 @@ fn resolve_block(
             inputs: scoring,
             base_dir: path.parent().unwrap_or_else(|| Path::new(".")),
         };
-        let build = crate::pattern::build(
+        let build = crate::pattern::build_with_cache(
             cat,
             &include.pools,
             groups,
@@ -1403,6 +1438,7 @@ fn resolve_block(
             score_env,
             fill,
             channel_rule,
+            score_cache,
         )
         .map_err(|m| unsupported(format!("block #{idx}: {m}")))?;
         resume_out.pools.extend(build.resume.clone());

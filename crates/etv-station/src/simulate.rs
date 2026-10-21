@@ -200,6 +200,9 @@ pub fn simulate_from(
     let mut generations: Vec<SimulatedGeneration> = Vec::new();
     let mut from = start;
     let mut now = start;
+    // One cache for the whole replay: the catalog and the plugin files do not
+    // change under it, so each plugin compiles and resolves its sources once.
+    let mut score_cache = crate::score::ScoreCache::default();
 
     while now < end {
         let target = now + window;
@@ -219,8 +222,16 @@ pub fn simulate_from(
             }
             this_tick += 1;
 
-            let generation = generate(&env, Some(catalog), &ledger, &resume, from, target)
-                .map_err(|e| e.to_string())?;
+            let generation = generate(
+                &env,
+                Some(catalog),
+                &ledger,
+                &resume,
+                from,
+                target,
+                &mut score_cache,
+            )
+            .map_err(|e| e.to_string())?;
             let mut items = generation.items;
             let show_ids = generation.show_ids;
 
