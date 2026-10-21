@@ -1331,7 +1331,9 @@ draws nothing; move those three keys under a `graphics:` entry.
 
 **What a script can read.** `time`, `frame`, the current item's `title`,
 `sub_title`, `description`, `season`, `episode`, `year`, `content_rating`
-(the catalog's rating for the item, `""` when it has none), the `next_*`
+(the catalog's rating for the item, `""` when it has none), `categories`,
+`country`, `directors`, `actors` and `writers` (arrays of strings, empty when the
+item has none), `star_rating` (`""` when none), the `next_*`
 equivalents, `item_elapsed`, `item_remaining`, `item_duration` (the two summed, `-1.0`
 when either is unknown), its own `config`, and the item's opaque blob as
 `metadata` (an empty map when the item attached none, so `metadata.foo == ()`
