@@ -39,6 +39,9 @@ struct Inner {
     running: bool,
     /// When the worker's last pass finished.
     last_pass: Option<Instant>,
+    /// Why the station file did not load on the worker's last pass; cleared
+    /// by the next pass that loads it.
+    lineup_error: Option<String>,
     /// Why the worker stopped for good.
     dead: Option<String>,
 }
@@ -91,7 +94,8 @@ impl OverlapCache {
     }
 
     /// The library and each of `channels`' fingerprints, or how far the
-    /// worker has got. A missing or stale entry wakes the worker, and so does
+    /// worker has got. A station file that fails to load answers
+    /// [`Lookup::Failed`] with the loader's message. A missing or stale entry wakes the worker, and so does
     /// a failure once [`FAILED_RETRY`] has passed since the last pass.
     pub fn lookup(&self, channels: &[&Path]) -> Lookup {
         let mtimes: Vec<Option<SystemTime>> = channels.iter().map(|p| file_mtime(p)).collect();
@@ -114,9 +118,13 @@ impl OverlapCache {
         let any_failed =
             current.iter().any(|c| matches!(c, Some(Err(_)))) || matches!(g.library, Some(Err(_)));
         let retry_due = g.last_pass.is_none_or(|t| t.elapsed() >= FAILED_RETRY);
-        if stale || (any_failed && retry_due) {
+        let lineup_error = g.lineup_error.clone();
+        if stale || ((any_failed || lineup_error.is_some()) && retry_due) {
             g.wanted = true;
             self.wake.notify_all();
+        }
+        if let Some(why) = lineup_error {
+            return Lookup::Failed(why);
         }
         match &g.library {
             Some(Ok(library)) if !stale => Lookup::Ready {
@@ -190,7 +198,11 @@ impl OverlapCache {
     fn pass(&self, catalog: &Catalog) {
         let began = Instant::now();
         let result = self.resolve_lineup(catalog);
-        self.lock().last_pass = Some(Instant::now());
+        {
+            let mut g = self.lock();
+            g.last_pass = Some(Instant::now());
+            g.lineup_error = result.as_ref().err().cloned();
+        }
         match result {
             Ok((channels, resolved, failed)) => tracing::info!(
                 event = "ui.overlap.pass",
@@ -270,4 +282,26 @@ fn resolve_library(catalog: &Catalog) -> Result<Library, String> {
         movies.into_iter().collect(),
         episodes.into_iter().collect(),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A station file that does not load answers `Failed` with the loader's
+    /// message, not `Pending` forever.
+    #[test]
+    fn a_station_that_will_not_load_fails_the_lookup() {
+        let dir = std::env::temp_dir().join(format!("overlap-noload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = OverlapCache::new(dir.join("missing-station.toml"), dir.join("catalog.db"));
+        let catalog = Catalog::open_in_memory().unwrap();
+        cache.pass(&catalog);
+        match cache.lookup(&[]) {
+            Lookup::Failed(e) => assert!(!e.is_empty()),
+            Lookup::Pending { .. } => panic!("pending, not failed"),
+            Lookup::Ready { .. } => panic!("ready, not failed"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
