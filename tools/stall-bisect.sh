@@ -110,7 +110,7 @@ build() {
         tok="${ARGV[$i]}"
         if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
         case "$tok" in
-            -readrate|-readrate_initial_burst)
+            -readrate|-readrate_initial_burst|-readrate_catchup)
                 if [ "$drop_readrate" = 1 ]; then skip_next=1; continue; fi ;;
             -t)
                 # Replace ETV-next's item duration (the rest of the film) with

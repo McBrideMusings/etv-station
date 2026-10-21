@@ -62,6 +62,12 @@ build() {
         if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
         case "$tok" in
             -readrate) skip_next=1; printf -- '-readrate\n%s\n' "$rate"; continue ;;
+            # ffmpeg refuses a catch-up rate below the read rate, so a sweep
+            # rate above the recorded catch-up raises it to match.
+            -readrate_catchup)
+                skip_next=1
+                printf -- '-readrate_catchup\n%s\n' "$(awk -v r="$rate" -v c="${ARGV[$((i+1))]}" 'BEGIN{print (r > c ? r : c)}')"
+                continue ;;
             -t)        skip_next=1; printf -- '-t\n%sms\n' "$(( DUR * 1000 ))"; continue ;;
         esac
         case "$tok" in
