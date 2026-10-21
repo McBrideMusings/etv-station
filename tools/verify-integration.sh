@@ -301,9 +301,14 @@ done
 check_or_die "web UI /api/health is ok and reports tunable_channels" \
   probe_check_ui_health "$ui_body"
 
-# Stop the UI before the orphan check below, which counts every etv-station.
+# Stop the UI. The orphan check below skips --serve-ui processes (a dashboard on
+# another port is not part of the dev stack), so this UI is checked by its own
+# port instead.
 kill -TERM -- "-$ui_pid" 2>/dev/null || true
 wait $ui_pid 2>/dev/null || true
+if [ -n "$(pgrep -f -- "--serve-ui.*--ui-port $ETV_UI_PORT" 2>/dev/null || true)" ]; then
+  fail "web UI on port $ETV_UI_PORT still running after SIGTERM"
+fi
 
 # Send SIGINT to dev-run process group and wait for clean exit.
 printf 'shutting down dev stack...\n'
