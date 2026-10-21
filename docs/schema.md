@@ -708,6 +708,8 @@ temperature: 0                 # optional — every channel with no temperature:
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
 | `idle_grace_seconds` | no — default `90` | seconds a channel's worker stays warm after its last viewer leaves, so surfing back to it skips the cold start. Written into every `channelN.json`; ETV-next's worker reads it. `90` is also the floor — a smaller value is raised to it, because the overlay renderer exits after 60s without a reader and must stay under the worker's lifetime. A warm channel keeps its ffmpeg encoding for nobody, so raise it only as far as the encoder has headroom. |
+| `ffmpeg_profiles` | no | map of name → encoding picture — see [FFmpeg profiles](#ffmpeg-profiles) |
+| `active_profile` | no | the `ffmpeg_profiles` key every channel encodes with unless its own `ffmpeg_profile` names another; a key the map lacks fails the load |
 | `fonts` | no — default empty | font files, or directories whose `.ttf`, `.otf` and `.ttc` files all count, relative to this file's directory. Every overlay process registers every listed font, so a text layer's `font_family` can name any family they provide. A family no listed font provides renders in the OS sans-serif (resolved through fontconfig; the container's base image has Noto Sans and DejaVu). No font ships in the binary. A path that does not exist, or a file that is not a font, fails the station load with an error naming the path. |
 
 **How the three ingest modes are chosen.** At startup the daemon compares the
@@ -750,6 +752,7 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 | `overlay` | no | `clear` \| `{ file: <path> }` \| an inline overlay spec — see [Overlay cascade](#overlay-cascade) |
 | `tracks` | no | the channel level of the [track-selection](#track-selection) rules; blocks, pools and items refine it |
 | `subtitle` | no | `{ default_on: true \| false }` — announce this channel's subtitle track as `DEFAULT=YES`; unset leaves the station's `normalization.subtitle.default_on` |
+| `ffmpeg_profile` | no — inherits the station `active_profile` | a key of the station's `ffmpeg_profiles`; this channel encodes with that picture. A key the station lacks drops this channel from the lineup, with the key and this file named in the reason |
 | `hooks` | no — default empty | list of [event hooks](#event-hooks) scoped to this channel |
 | `rule` | **yes** | `{ blocks: [...] }` — see below |
 
@@ -1331,7 +1334,9 @@ draws nothing; move those three keys under a `graphics:` entry.
 
 **What a script can read.** `time`, `frame`, the current item's `title`,
 `sub_title`, `description`, `season`, `episode`, `year`, `content_rating`
-(the catalog's rating for the item, `""` when it has none), the `next_*`
+(the catalog's rating for the item, `""` when it has none), `categories`,
+`country`, `directors`, `actors` and `writers` (arrays of strings, empty when the
+item has none), `star_rating` (`""` when none), the `next_*`
 equivalents, `item_elapsed`, `item_remaining`, `item_duration` (the two summed, `-1.0`
 when either is unknown), its own `config`, and the item's opaque blob as
 `metadata` (an empty map when the item attached none, so `metadata.foo == ()`
@@ -3082,6 +3087,41 @@ List the `image: false` entry first. A block's entries go ahead of the inherited
 ones, so a block that lists only the `image: true` entry would burn a picture
 subtitle even in a file that also carries a text track the viewer could have
 switched off.
+
+### FFmpeg profiles
+
+```yaml
+# station.yaml
+ffmpeg_profiles:
+  quality: { resolution: 1920x1080, video_bitrate: 6000, video_codec: h264, bit_depth: 8 }
+  max:     { resolution: 1920x1080, video_bitrate: 10000 }
+  light:   { resolution: 1280x720,  video_bitrate: 4000 }
+active_profile: quality
+
+# a channel.yaml
+ffmpeg_profile: light      # this channel only
+```
+
+A profile is a named picture. Every field it sets replaces the same field of
+`normalization.video`; a field it leaves out keeps the station's value.
+
+| Profile key | Writes | Form |
+|---|---|---|
+| `resolution` | `video.width`, `video.height` | `WIDTHxHEIGHT` |
+| `video_bitrate` | `video.bitrate_kbps`, and `video.buffer_kbps` at twice it | kbps |
+| `video_codec` | `video.format` | `h264` or `hevc` |
+| `bit_depth` | `video.bit_depth` | `8` or `10` |
+
+A channel gets its own `ffmpeg_profile` if it names one, else the station's
+`active_profile`, else `normalization.video` as written. Flipping
+`active_profile` and restarting re-renders every `channelN.json` with the new
+picture.
+
+The choice is made per channel, never per block: ETV-next encodes one HLS
+session per channel from `channelN.json`, and a playout item carries no
+encoding field, so a block cannot change the picture mid-session (the same
+reason [`subtitle.default_on`](#subtitle-default_on) is a channel setting).
+There is no h264 `profile` key because ETV-next has no setting for it.
 
 ### Subtitle `default_on`
 

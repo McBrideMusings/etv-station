@@ -2615,6 +2615,7 @@ mod tests {
 
     fn channel(blocks: Vec<BlockInclude>) -> ChannelConfig {
         ChannelConfig {
+            ffmpeg_profile: None,
             logo: None,
             temperature: None,
             subtitle: None,

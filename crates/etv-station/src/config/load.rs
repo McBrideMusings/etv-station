@@ -212,6 +212,17 @@ fn load_one_channel(
     expand_categories(&mut config, channel_path, categories)?;
     attach_chronologies(&mut config, channel_path, chronologies)?;
     validate::validate_channel(channel_path, &config)?;
+    if let Some(key) = &config.ffmpeg_profile
+        && !station.ffmpeg_profiles.contains_key(key)
+    {
+        return Err(ConfigError::Validation {
+            path: channel_path.to_path_buf(),
+            message: format!(
+                "ffmpeg_profile {key:?} is not a key of the station's ffmpeg_profiles (have: {})",
+                validate::profile_keys(station)
+            ),
+        });
+    }
     let name = resolve_identity(channel_path, &config)?;
     apply_station_variety(&mut config, station, &name);
     // After `resolve_blocks`, so a block-file body's own `overlay:` has
@@ -1388,6 +1399,8 @@ mod tests {
 
     fn station_config() -> StationConfig {
         StationConfig {
+            active_profile: None,
+            ffmpeg_profiles: Default::default(),
             temperature: None,
             tracks: None,
             overlay: None,

@@ -323,6 +323,15 @@ impl RhaiEngine {
         scope.push_constant("year", program.year);
         // The item's catalog rating, verbatim ("TV-MA", "PG-13"), "" when none.
         scope.push_constant("content_rating", program.content_rating.clone());
+        // Genre tags, countries, star rating and credited names: arrays of
+        // strings (empty when the item has none), so a script reads
+        // `categories.len()` or `directors[0]` after a length check.
+        scope.push_constant("categories", string_array(&program.categories));
+        scope.push_constant("country", string_array(&program.country));
+        scope.push_constant("star_rating", program.star_rating.clone());
+        scope.push_constant("directors", string_array(&program.directors));
+        scope.push_constant("actors", string_array(&program.actors));
+        scope.push_constant("writers", string_array(&program.writers));
         scope.push_constant("next_title", program.next_title.clone());
         scope.push_constant("next_sub_title", program.next_sub_title.clone());
         scope.push_constant("next_season", program.next_season);
@@ -370,6 +379,10 @@ impl RhaiEngine {
         }
         Ok(state)
     }
+}
+
+fn string_array(items: &[String]) -> rhai::Array {
+    items.iter().cloned().map(Dynamic::from).collect()
 }
 
 /// The engine for whichever playout item overlay is airing, rebuilt only when

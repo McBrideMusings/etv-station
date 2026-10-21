@@ -236,6 +236,8 @@ The `etv-overlay pipe` subprocess (one per channel, supervised by `overlay_super
 | `metadata`       | dynamic | currently-airing item's opaque `metadata` blob, verbatim (an empty map if absent) |
 | `prev_metadata`  | dynamic | the previous item's `metadata` blob, verbatim (`()` if none) |
 | `content_rating` | string  | currently-airing item's catalog rating, e.g. `TV-MA`, `R` (`""` if none) |
+| `categories`, `country`, `directors`, `actors`, `writers` | array | currently-airing item's `program.categories`, `country` and `credits` names (empty array if none) |
+| `star_rating`    | string  | currently-airing item's `program.star_rating`, verbatim (`""` if none) |
 | `config`         | map     | this graphic's own `config:` (empty map if unset) |
 | `vars`           | map     | the `vars` of the airing item's `overlay` entry (empty map when it has none); an item's script draws the layers it declares in its result (`docs/schema.md` § Graphics) |
 

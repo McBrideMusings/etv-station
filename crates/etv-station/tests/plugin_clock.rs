@@ -94,6 +94,7 @@ fn audit(ctx, picks, workspace) { #{} }
 
 fn plugin_channel(plugin: &Path) -> ChannelConfig {
     ChannelConfig {
+        ffmpeg_profile: None,
         logo: None,
         temperature: None,
         subtitle: None,

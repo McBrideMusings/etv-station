@@ -49,6 +49,18 @@ pub struct ProgramContext {
     /// through as written: normalising it is the script's concern, since the
     /// catalog also holds ratings from other schemes (`Approved`, `16+`).
     pub content_rating: String,
+    /// The item's genre / category tags as the playout entry lists them
+    /// (`program.categories`); empty when it has none.
+    pub categories: Vec<String>,
+    /// Country (or countries) of origin (`program.country`); empty when absent.
+    pub country: Vec<String>,
+    /// The pre-formatted star rating (`program.star_rating`, e.g. `4 / 5`), or
+    /// an empty string.
+    pub star_rating: String,
+    /// Credited names by role (`program.credits`); an actor is its name only.
+    pub directors: Vec<String>,
+    pub actors: Vec<String>,
+    pub writers: Vec<String>,
     pub next_title: String,
     pub next_sub_title: String,
     /// The one-item lookahead's counterparts to [`Self::season`],
@@ -143,6 +155,12 @@ impl ProgramContext {
             episode: -1,
             year: -1,
             content_rating: String::new(),
+            categories: Vec::new(),
+            country: Vec::new(),
+            star_rating: String::new(),
+            directors: Vec::new(),
+            actors: Vec::new(),
+            writers: Vec::new(),
             next_title: String::new(),
             next_sub_title: String::new(),
             next_season: -1,
@@ -210,6 +228,30 @@ struct ProgramRow {
     /// the overlay parses the chunk files itself.
     #[serde(default)]
     content_rating: Option<String>,
+    #[serde(default)]
+    categories: Option<Vec<String>>,
+    #[serde(default)]
+    country: Option<Vec<String>>,
+    #[serde(default)]
+    star_rating: Option<String>,
+    #[serde(default)]
+    credits: Option<CreditsRow>,
+}
+
+/// `program.credits`; each role is independently optional.
+#[derive(Deserialize, Clone, Default)]
+struct CreditsRow {
+    #[serde(default)]
+    director: Vec<String>,
+    #[serde(default)]
+    actor: Vec<ActorRow>,
+    #[serde(default)]
+    writer: Vec<String>,
+}
+
+#[derive(Deserialize, Clone)]
+struct ActorRow {
+    name: String,
 }
 
 /// Loads and caches the channel's chunked playout JSON. Call
@@ -376,6 +418,7 @@ fn context_from_rows(
 ) -> ProgramContext {
     let cur = program_fields(now);
     let nxt = program_fields(next);
+    let credits = now.and_then(|p| p.credits.as_ref());
     ProgramContext {
         title: cur.title,
         sub_title: cur.sub_title,
@@ -386,6 +429,14 @@ fn context_from_rows(
         content_rating: now
             .and_then(|p| p.content_rating.clone())
             .unwrap_or_default(),
+        categories: now.and_then(|p| p.categories.clone()).unwrap_or_default(),
+        country: now.and_then(|p| p.country.clone()).unwrap_or_default(),
+        star_rating: now.and_then(|p| p.star_rating.clone()).unwrap_or_default(),
+        directors: credits.map(|c| c.director.clone()).unwrap_or_default(),
+        actors: credits
+            .map(|c| c.actor.iter().map(|a| a.name.clone()).collect())
+            .unwrap_or_default(),
+        writers: credits.map(|c| c.writer.clone()).unwrap_or_default(),
         next_title: nxt.title,
         next_sub_title: nxt.sub_title,
         next_season: nxt.season,
@@ -805,5 +856,41 @@ mod tests {
         assert_eq!(src.current_at(datetime!(2026-04-12 23:00 UTC)).title, "");
         // After the last item
         assert_eq!(src.current_at(datetime!(2026-04-13 03:00 UTC)).title, "");
+    }
+
+    /// The enrichment the station writes under `program` reaches the context,
+    /// and an item without any of it reads as empty lists and strings.
+    #[test]
+    fn enrichment_fields_reach_the_context_and_default_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk(
+            dir.path(),
+            "chunk_a.json",
+            r#"{ "version": "test", "items": [
+                { "id": "a", "start": "2026-04-13T00:00:00Z", "finish": "2026-04-13T00:10:00Z",
+                  "program": { "title": "Ghost", "categories": ["Drama", "Romance"],
+                    "country": ["United States"], "star_rating": "4 / 5",
+                    "credits": { "director": ["Jerry Zucker"],
+                      "actor": [{ "name": "Whoopi Goldberg", "role": "Oda Mae" }],
+                      "writer": ["Bruce Joel Rubin"] } } },
+                { "id": "b", "start": "2026-04-13T00:10:00Z", "finish": "2026-04-13T00:20:00Z",
+                  "program": { "title": "Bare" } }
+            ] }"#,
+        );
+        let mut src = ProgramContextSource::new(dir.path().to_path_buf());
+        src.refresh().unwrap();
+
+        let ghost = src.current_at(datetime!(2026-04-13 00:05 UTC));
+        assert_eq!(ghost.categories, ["Drama", "Romance"]);
+        assert_eq!(ghost.country, ["United States"]);
+        assert_eq!(ghost.star_rating, "4 / 5");
+        assert_eq!(ghost.directors, ["Jerry Zucker"]);
+        assert_eq!(ghost.actors, ["Whoopi Goldberg"]);
+        assert_eq!(ghost.writers, ["Bruce Joel Rubin"]);
+
+        let bare = src.current_at(datetime!(2026-04-13 00:15 UTC));
+        assert!(bare.categories.is_empty() && bare.country.is_empty());
+        assert!(bare.directors.is_empty() && bare.actors.is_empty() && bare.writers.is_empty());
+        assert_eq!(bare.star_rating, "");
     }
 }
