@@ -291,8 +291,8 @@ matches. Compare it to a threshold with the ordinary operators — `>=`, `>`, `=
 single `genres.contains(...)` is one shared tag.
 
 A keyword matches when it is a case-insensitive substring of the title, or equals
-(ignoring case) one tag value: any genre, label, cast or director, as `item.tags`
-does. A keyword repeated in the list counts once. The station ships no keyword
+(ignoring case) one tag value: any genre, label, cast, director, writer or country
+(any tag value in the catalog), as `item.tags` does. A keyword repeated in the list counts once. The station ships no keyword
 sets; the list is the channel author's.
 
 Plex genre is multi-valued, so `item.genres.contains("Comedy")` admits both
@@ -351,6 +351,31 @@ look in and a name to remember, and buys nothing over writing the set inline in
 that pool. Reach for a category when a second pool wants the same set: the reuse
 is the whole payoff. The station ships no categories; what "kung fu" means is
 the channel author's.
+
+#### Suggesting a category from example titles (#175)
+
+Writing a keyword set by hand is guesswork; naming films that *are* the thing is
+easier. `etv-station suggest-category` takes two or more titles (`Title` or
+`Title (Year)`), reads the tags the catalog already holds for them, and prints a
+`categories:` entry in the shape above:
+
+```sh
+etv-station -c station.yaml suggest-category "Five Deadly Venoms (1978)" "Drunken Master (1978)" --name kung-fu
+```
+
+Candidates are grouped by tag namespace (country, genre, director, cast, writer,
+label). Each line carries how many seeds have the tag and how many catalog
+entries have it, plus the lift (seed share over catalog share), so a keeper can
+be told from a common tag without trusting the ranking. Cut what is wrong, set
+the `threshold`, and commit the result as plain config; nothing is fetched at
+generation time.
+
+It is a suggestion tool. A query built from the top candidates alone recovered
+73-77% of a hand-curated 92-film set at 14-15% precision. Infer one seed set per
+run: a union of dissimilar groups ranks as genre soup. A seed that matches no
+catalog item, or two items (add the year), fails naming the title; a seed with no
+enrichment is listed and left out of the ranking; fewer than two ranked seeds
+fails.
 
 These fail at load, not at air time:
 
