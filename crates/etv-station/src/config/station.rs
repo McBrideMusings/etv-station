@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use ersatztv_channel::config::{FfmpegConfig, NormalizationConfig};
+use ersatztv_channel::config::{FfmpegConfig, NormalizationConfig, VideoFormat};
 use serde::{Deserialize, Serialize};
 
 use super::overlay::OverlayDecl;
@@ -183,10 +183,12 @@ pub struct StationConfig {
     pub ffmpeg: FfmpegConfig,
 
     /// ETV-next's `normalization:` block — the playback profile handed to
-    /// every rendered `channelN.json`. Required, not defaulted: a station with
-    /// no playback profile should fail to load rather than silently emit an
-    /// empty one that ETV-next then rejects (`audio`/`video` are required
-    /// there too).
+    /// every rendered `channelN.json`. The block itself is required: a station
+    /// with no playback profile should fail to load rather than silently emit
+    /// an empty one that ETV-next then rejects (`audio`/`video` are required
+    /// there too). Inside `video`, a field left unset takes the station
+    /// default picture (see [`fill_default_picture`]).
+    #[serde(deserialize_with = "deserialize_normalization")]
     pub normalization: NormalizationConfig,
 
     /// Station-wide guide settings; a channel's `guide:` overrides them.
@@ -270,6 +272,36 @@ pub(crate) fn default_ffmpeg() -> FfmpegConfig {
     serde_json::from_value(serde_json::json!({})).expect("every FfmpegConfig field defaults")
 }
 
+/// The station's default picture: 1920x1080, 6000 kbps, h264 High, 8-bit SDR.
+/// ETV-next tone-maps an HDR source down to SDR for an 8-bit h264 target, so
+/// no field here asks for HDR passthrough.
+const DEFAULT_VIDEO_WIDTH: u32 = 1920;
+const DEFAULT_VIDEO_HEIGHT: u32 = 1080;
+const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 6000;
+/// Twice the bitrate, the same ratio the audio block's 192/384 uses.
+const DEFAULT_VIDEO_BUFFER_KBPS: u32 = 12000;
+const DEFAULT_VIDEO_BIT_DEPTH: u8 = 8;
+
+/// Fills every unset `video` field with the station default picture. A field
+/// the station file sets keeps its value.
+pub(crate) fn fill_default_picture(norm: &mut NormalizationConfig) {
+    let video = &mut norm.video;
+    video.format.get_or_insert(VideoFormat::H264);
+    video.bit_depth.get_or_insert(DEFAULT_VIDEO_BIT_DEPTH);
+    video.width.get_or_insert(DEFAULT_VIDEO_WIDTH);
+    video.height.get_or_insert(DEFAULT_VIDEO_HEIGHT);
+    video.bitrate_kbps.get_or_insert(DEFAULT_VIDEO_BITRATE_KBPS);
+    video.buffer_kbps.get_or_insert(DEFAULT_VIDEO_BUFFER_KBPS);
+}
+
+fn deserialize_normalization<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<NormalizationConfig, D::Error> {
+    let mut norm = NormalizationConfig::deserialize(d)?;
+    fill_default_picture(&mut norm);
+    Ok(norm)
+}
+
 /// A `NormalizationConfig` with every field left unset, for tests that build a
 /// `StationConfig` literal and don't care about the playback profile.
 /// `audio`/`video` are required, but every field inside them is `Option`.
@@ -281,7 +313,29 @@ pub(crate) fn empty_normalization_for_test() -> NormalizationConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::derive_channel_seed;
+    use super::{NormalizationConfig, derive_channel_seed, fill_default_picture};
+
+    /// An empty `video:` block takes the station default picture; a field the
+    /// station file sets survives.
+    #[test]
+    fn default_picture_is_1080p_6mbps_h264_8bit() {
+        let mut norm: NormalizationConfig =
+            serde_json::from_value(serde_json::json!({"audio": {}, "video": {"width": 1280}}))
+                .unwrap();
+        fill_default_picture(&mut norm);
+        let v = serde_json::to_value(&norm).unwrap()["video"].clone();
+        assert_eq!(v["width"], 1280);
+        assert_eq!(v["height"], 1080);
+        assert_eq!(v["bitrate_kbps"], 6000);
+        assert_eq!(v["buffer_kbps"], 12000);
+        assert_eq!(v["format"], "h264");
+        assert_eq!(v["bit_depth"], 8);
+
+        let mut bare: NormalizationConfig =
+            serde_json::from_value(serde_json::json!({"audio": {}, "video": {}})).unwrap();
+        fill_default_picture(&mut bare);
+        assert_eq!(bare.video.width, Some(1920));
+    }
 
     /// Fixed algorithm, fixed output. A pinned station seed has to reproduce
     /// the same channel seed on every machine and every release, so this holds

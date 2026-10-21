@@ -67,10 +67,10 @@ normalization:
   video:
     format: h264
     bit_depth: 8
-    width: 1280
-    height: 720
-    bitrate_kbps: 2000
-    buffer_kbps: 4000
+    width: 1920
+    height: 1080
+    bitrate_kbps: 6000
+    buffer_kbps: 12000
     # Baked in for the dev sample (Mac hardware accel), unlike the deployed
     # station's config where this is left unset and comes from ETV_ACCEL.
     accel: videotoolbox

@@ -13,6 +13,13 @@ pub enum CatalogError {
         source: rusqlite::Error,
     },
 
+    #[error("catalog file {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("catalog sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 

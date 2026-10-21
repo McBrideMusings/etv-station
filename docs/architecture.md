@@ -46,6 +46,12 @@ block → pool → item       title, channels,           .stream_index          
 applies the cascaded `tracks:` rules ([schema](/schema#track-selection)) and
 `rule.rs` writes the winners into the item's `tracks`.
 
+**The default picture is 1080p.** A `normalization.video` field the station
+file leaves unset takes 1920x1080, 6000 kbps (12000 kbps buffer), h264 High,
+8-bit (`fill_default_picture` in `crates/etv-station/src/config/station.rs`).
+ETV-next tone-maps an HDR source to SDR for that target, so a 10-bit HDR file
+never reaches a client that cannot take it.
+
 **A text subtitle is a track the viewer switches on and off.** The station's
 `normalization.subtitle.mode` is `convert`: ETV-next writes the text as WebVTT
 beside every video segment, lists those in `live_sub.m3u8`, and the top-level
