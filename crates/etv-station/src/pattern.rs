@@ -4412,6 +4412,124 @@ mod tests {
         assert_ne!(a, run(8), "a different seed should roll different sizes");
     }
 
+    fn range_step(pool: &str, min: usize, max: usize, from: TakeFrom) -> PatternStep {
+        PatternStep {
+            pool: pool.into(),
+            take: Take::Range { min, max },
+            from,
+            chance: 1.0,
+        }
+    }
+
+    /// The episode numbers of a `got-eN` / `inv-eN` id list, asserting the
+    /// whole list belongs to one series.
+    fn one_series_episodes(ids: &[String]) -> (String, Vec<usize>) {
+        let show = ids[0].split("-e").next().unwrap().to_string();
+        let eps = ids
+            .iter()
+            .map(|id| {
+                let (s, n) = id.split_once("-e").unwrap();
+                assert_eq!(s, show, "visit crossed series: {ids:?}");
+                n.parse().unwrap()
+            })
+            .collect();
+        (show, eps)
+    }
+
+    /// Under `rotate: slot` the rolled number is how many slots the visit
+    /// fills: a one-step, one-cycle build airs exactly the rolled count, and
+    /// across seeds every count in the range appears and none outside it.
+    #[test]
+    fn a_take_range_under_rotate_slot_fills_the_rolled_number_of_slots() {
+        let mut lens = std::collections::BTreeSet::new();
+        for seed in 0..32 {
+            let mut pool = shows_pool();
+            pool.rotate = Rotate::Slot;
+            let (ids, _) = build_with(
+                vec![pool],
+                vec![range_step("shows", 2, 4, TakeFrom::Start)],
+                Some(1),
+                &GenerationState::empty(),
+                seed,
+            );
+            lens.insert(ids.len());
+        }
+        assert_eq!(lens.into_iter().collect::<Vec<_>>(), vec![2, 3, 4]);
+    }
+
+    /// A plugin's per-entry `take` replaces the number the range rolled: the
+    /// override of 3 sits outside the 1-2 range, so every seed airs 3.
+    #[test]
+    fn a_plugin_take_override_replaces_a_rolled_range() {
+        for seed in 0..16 {
+            let dir = tempfile::tempdir().unwrap();
+            let pool = override_pool(
+                dir.path(),
+                r#"#{ entry_id: "got-e1", take: 3 },
+                   "got-e2", "got-e3", "got-e4", "got-e5", "got-e6""#,
+            );
+            let (ids, _) = build_with(
+                vec![pool],
+                vec![range_step("shows", 1, 2, TakeFrom::Start)],
+                Some(1),
+                &GenerationState::empty(),
+                seed,
+            );
+            assert_eq!(ids, vec!["got-e1", "got-e2", "got-e3"], "seed {seed}");
+        }
+    }
+
+    /// `from: end` with a range cuts the last `rolled` episodes of one
+    /// series, in list order, and the rolled size varies across seeds.
+    #[test]
+    fn a_take_range_from_end_airs_the_last_rolled_episodes_of_a_series() {
+        let mut lens = std::collections::BTreeSet::new();
+        for seed in 0..32 {
+            let (ids, _) = build_with(
+                vec![shows_pool()],
+                vec![range_step("shows", 2, 3, TakeFrom::End)],
+                Some(1),
+                &GenerationState::empty(),
+                seed,
+            );
+            let (show, eps) = one_series_episodes(&ids);
+            let last = if show == "got" { 6 } else { 3 };
+            let want: Vec<usize> = (last + 1 - eps.len()..=last).collect();
+            assert_eq!(eps, want, "seed {seed}: not the series' tail: {ids:?}");
+            lens.insert(ids.len());
+        }
+        assert_eq!(lens.into_iter().collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    /// `from: random` with a range cuts a consecutive in-order window of the
+    /// rolled size inside one series, and the size varies across seeds.
+    #[test]
+    fn a_take_range_from_random_airs_a_consecutive_window_of_the_rolled_size() {
+        let mut lens = std::collections::BTreeSet::new();
+        let mut starts = std::collections::BTreeSet::new();
+        for seed in 0..32 {
+            let (ids, _) = build_with(
+                vec![shows_pool()],
+                vec![range_step("shows", 2, 3, TakeFrom::Random)],
+                Some(1),
+                &GenerationState::empty(),
+                seed,
+            );
+            let (_, eps) = one_series_episodes(&ids);
+            assert!(
+                eps.windows(2).all(|w| w[1] == w[0] + 1),
+                "seed {seed}: not consecutive in order: {ids:?}"
+            );
+            starts.insert(eps[0]);
+            lens.insert(ids.len());
+        }
+        assert!(
+            starts.iter().any(|&e| e > 1),
+            "every window began at the series top: {starts:?}"
+        );
+        assert_eq!(lens.into_iter().collect::<Vec<_>>(), vec![2, 3]);
+    }
+
     #[test]
     fn an_unknown_pool_in_a_step_is_an_error() {
         let cat = catalog();
