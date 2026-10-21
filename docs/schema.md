@@ -2219,9 +2219,9 @@ config load rather than mid-generation:
   the plugin to declare the `pool_provider` hook, but it only declares: sequencer`
 - A script declaring a name outside the table is refused, and the message lists
   the names that exist: `declares unknown hook "warp_drive" — known hooks are:
-  pool_provider, sequencer`
+  pool_provider, sequencer, annotate, bumper`
 - A script declaring an empty array is refused: `declares no hooks — a plugin
-  must declare at least one of: pool_provider, sequencer`
+  must declare at least one of: pool_provider, sequencer, annotate, bumper`
 
 #### Changing the plugin contract is a breaking change for deployed scripts
 
