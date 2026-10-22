@@ -235,6 +235,25 @@ fn rating_cutoff(ctx) {
     }
 }
 
+// An optional filter on the `awards` enrichment namespace, `awards: { match:
+// ["Academy Award"] }`. A title is a candidate only when at least one of its
+// awards values starts with one of the entries (case-sensitive prefix); every
+// other title leaves the pool before ranking. Returns () when the pool sets no
+// `awards:`.
+fn awards_filter(ctx) {
+    let a = ctx.config["awards"];
+    if a == () { return (); }
+    let m = if type_of(a) == "map" { a["match"] } else { () };
+    let ok = type_of(m) == "array" && m.len > 0;
+    if ok {
+        for e in m { if type_of(e) != "string" || e == "" { ok = false; } }
+    }
+    if !ok {
+        throw "pool " + ctx.pool + ": config.awards must be a map with a non-empty `match` list of non-empty strings, e.g. { match: [\"Academy Award\"] }";
+    }
+    m
+}
+
 // The number in a ratings fact's value, or () when it does not parse.
 fn rating_number(v) {
     if type_of(v) == "i64" || type_of(v) == "f64" { return v.to_float(); }
@@ -749,6 +768,31 @@ fn pick(ctx) {
         units = kept_units;
     }
 
+    // The awards filter (`config.awards`): one bulk fetch of the `awards`
+    // namespace, keeping a unit when any award value starts with a `match`
+    // entry. The values that matched ride along for the audit.
+    let awards_match = awards_filter(ctx);
+    let awards_of = #{};
+    if awards_match != () {
+        let awards = ds.enrichment_for_many(units, "awards");
+        let kept_units = [];
+        for u in units {
+            let facts = awards[u];
+            if facts == () { continue; }
+            let hit = [];
+            for f in facts {
+                if f.key != "award" || type_of(f.value) != "string" { continue; }
+                for m in awards_match {
+                    if f.value.starts_with(m) { hit.push(f.value); break; }
+                }
+            }
+            if hit.len == 0 { continue; }
+            awards_of[u] = hit;
+            kept_units.push(u);
+        }
+        units = kept_units;
+    }
+
     // Every unit's id, gathered once so enrichment can be fetched in a
     // single bulk call before the loop below (plex-db-ex#40) — #172 measured
     // the per-candidate alternative at 101 million steps and 6m34s on an
@@ -1116,6 +1160,7 @@ fn pick(ctx) {
             walk: walk_row,
             seen_boosted: seen_boosted,
             rating: if cutoff == () { () } else { #{ source: cutoff.source, value: rating_of[id] } },
+            awards: if awards_match == () { () } else { #{ matched: awards_of[id] } },
             id: id,
             score: score,
             base_score: base_score,
@@ -1427,6 +1472,7 @@ fn pick(ctx) {
             seen_boosted: row.seen_boosted,
             walk: row.walk,
             rating: row.rating,
+            awards: row.awards,
             recency_factor: row.recency_factor,
             aired_rank: row.aired_rank,
             rank: row.rank,
@@ -1828,6 +1874,7 @@ fn audit(ctx, picks, workspace) {
                 // the closeness the score was multiplied by.
                 walk: r.walk,
                 rating: r.rating,
+                awards: r.awards,
                 recency_factor: r.recency_factor,
                 aired_rank: r.aired_rank,
                 // The series this entry was ranked as, on a shows pool.

@@ -1941,12 +1941,13 @@ and the verdict names the half the pick came from — so `admin audit` says
 which of two sibling pools aired something without the reader holding the
 config.
 
-#### `seen_boost` and `rating` — lean toward played titles, cut on a rating
+#### `seen_boost`, `rating` and `awards` — lean toward played titles, cut on a rating or an award
 
 ```yaml
 config:
   seen_boost: 1.5                          # multiplier on titles in the account's plays; 1.0 = off
   rating: { source: letterboxd, min: 6.5 } # or max:, or both
+  awards: { match: ["Academy Award"] }    # or ["Academy Award for Best Picture"]
 ```
 
 **`seen_boost`** multiplies the final score (after recency damping) of every
@@ -1960,8 +1961,16 @@ the source name). Values use the source's own scale: letterboxd 0–10, tomatoes
 0–100. A title with no value from that source is dropped. On a shows pool the
 value is the show's.
 
-Audit detail carries `seen_boosted` (bool) and `rating: { source, value }`
-(null on a pool with no `rating:`).
+**`awards`** keeps titles with at least one value in the `awards` enrichment
+namespace (key `award`, e.g. `Academy Award for Best Picture`) that starts with
+one of the `match` entries. The prefix is case-sensitive. A title with no awards
+is dropped. `match` must be a non-empty list of non-empty strings; anything else
+fails the generation with a message naming the pool. On a shows pool it reads
+the show's awards.
+
+Audit detail carries `seen_boosted` (bool), `rating: { source, value }` (null on
+a pool with no `rating:`) and `awards: { matched: [...] }` (null on a pool with
+no `awards:`).
 
 #### `walk` — build the pool by walking tags out from seed tags
 
