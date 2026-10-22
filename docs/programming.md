@@ -182,6 +182,25 @@ schedules:
 `advance: resume` carries the strip on from the last episode aired, across
 generations and across the hours other blocks fill.
 
+**A strip that cycles shows week by week.** A pool with `rotate: 1w` holds one
+show from Monday midnight to the next, then moves to the next show in its
+rotation; `advance: resume` has a show that returns continue after the episode it
+last aired. This is 002's series of the week, 090-bravo, and 003's Bravo strip
+(one Housewives city every weekday for a week). Under `group_by: season` the
+span holds one season, which gives a Drag Race season per week. A rotation slot
+cannot do this alone: it draws once per placement, so an afternoon schedule
+changes show every day.
+
+```yaml
+pools:
+  - name: strip
+    expr: 'item.show in ["Show A", "Show B", "Show C"]'
+    order: "season:asc,episode:asc"
+    rotate: 1w
+    advance: resume
+pattern: [{ pool: strip, take: 1 }]
+```
+
 **Across channels.** By default a show that strips on two channels keeps a
 separate place on each. Add `cursor_scope: global` to the pool and it continues
 from the latest episode of that show aired on any channel; the second channel to
@@ -216,6 +235,10 @@ then the season 5 premiere, in one week (Slate).
 order: "season:asc,episode:asc"
 advance: resume
 ```
+
+A serialized drama held in order for a week (085-hbo's dramas): `rotate: 1w`
+with `order: "season:asc,episode:asc"` and `advance: resume` airs one drama
+Monday to Sunday in broadcast order, then the next drama the following Monday.
 
 Shuffled from the first airing: `order: "random"`. A seeded run of
 consecutive episodes from a random starting point: `from: random` on the

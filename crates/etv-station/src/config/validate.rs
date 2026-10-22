@@ -669,6 +669,20 @@ fn validate_steps(
                 step.pool
             )));
         }
+        // `all` empties the held series in one visit, so the span would end on
+        // the first day: the series is finished and the pool moves on.
+        if step.take == Take::All
+            && let Some(pool) = include.pools.iter().find(|p| p.name == step.pool)
+            && let Some(span) = pool.rotate.span()
+        {
+            return Err(bad(format!(
+                "{label} step #{step_idx} has take = \"all\" but pool {:?} sets \
+                 rotate = {:?}, which holds one series for the span — \"all\" empties \
+                 it in a single visit. Use an explicit count",
+                step.pool,
+                humantime::format_duration(span).to_string()
+            )));
+        }
         // `all` empties the series whatever the cut position, so a `from` beside
         // it is a line the author wrote that does nothing. Refused on the same
         // grounds as a constraint that would not constrain.

@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::de::{self, Deserializer, Visitor};
 use serde::ser::Serializer;
@@ -239,8 +240,9 @@ pub enum Select {
 }
 
 /// *When* the series changes — orthogonal to [`Select`], which says *which*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Authored as `visit`, `slot`, or a duration (`1d`, `1w`, `4w`) for a span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Rotate {
     /// One series per visit to the step: `take = 3` is three consecutive
     /// episodes of the same show (a mini-binge), then rotate on the next visit.
@@ -248,6 +250,60 @@ pub enum Rotate {
     Visit,
     /// A new series every item: `take = 3` spreads across three series.
     Slot,
+    /// One series held for a whole period: the pool picks its series the way
+    /// `Visit` does, then keeps it for every visit — across generations and
+    /// across separate placements of its slot — until the period rolls over.
+    /// A whole-week span counts its periods from a local Monday midnight; any
+    /// other span from the epoch, like the `seed` clock.
+    Span(Duration),
+}
+
+/// The shortest span a pool can hold a series for.
+pub const MIN_SPAN: Duration = Duration::from_secs(86_400);
+
+impl Rotate {
+    /// The span a pool holds a series for, or `None` for `visit` and `slot`.
+    pub fn span(self) -> Option<Duration> {
+        match self {
+            Rotate::Span(d) => Some(d),
+            Rotate::Visit | Rotate::Slot => None,
+        }
+    }
+}
+
+impl Serialize for Rotate {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Rotate::Visit => serializer.serialize_str("visit"),
+            Rotate::Slot => serializer.serialize_str("slot"),
+            Rotate::Span(d) => {
+                serializer.serialize_str(&humantime::format_duration(*d).to_string())
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Rotate {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        match text.as_str() {
+            "visit" => Ok(Rotate::Visit),
+            "slot" => Ok(Rotate::Slot),
+            other => {
+                let span = humantime::parse_duration(other).map_err(|_| {
+                    de::Error::custom(format!(
+                        "rotate: {other:?} is not `visit`, `slot` or a span like `1d`, `1w`, `4w`"
+                    ))
+                })?;
+                if span < MIN_SPAN {
+                    return Err(de::Error::custom(format!(
+                        "rotate: a span must be at least 1d (got {other:?})"
+                    )));
+                }
+                Ok(Rotate::Span(span))
+            }
+        }
+    }
 }
 
 /// Where a pool picks up when the generator runs again.
@@ -775,6 +831,28 @@ mod tests {
     use super::*;
     use crate::config::Dir;
     use crate::config::NoRepeatWithin;
+
+    #[test]
+    fn rotate_reads_visit_slot_or_a_span_of_at_least_a_day() {
+        let rotate = |v: &str| serde_norway::from_str::<Rotate>(v);
+        assert_eq!(rotate("visit").unwrap(), Rotate::Visit);
+        assert_eq!(rotate("slot").unwrap(), Rotate::Slot);
+        assert_eq!(
+            rotate("1w").unwrap(),
+            Rotate::Span(Duration::from_secs(7 * 86_400))
+        );
+        assert_eq!(
+            rotate("4w").unwrap().span(),
+            Some(Duration::from_secs(28 * 86_400))
+        );
+        assert!(
+            rotate("12h")
+                .unwrap_err()
+                .to_string()
+                .contains("at least 1d")
+        );
+        assert!(rotate("fortnightly").is_err());
+    }
 
     #[test]
     fn parses_a_pool_with_defaults_from_yaml() {

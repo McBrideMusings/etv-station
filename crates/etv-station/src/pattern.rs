@@ -90,7 +90,7 @@ use crate::config::{
 };
 use crate::constrain::{ItemKeys, Limits, RepeatGap, order_constrained};
 use crate::guide::GuideConfig;
-use crate::resume::{GenerationState, PoolResume};
+use crate::resume::{GenerationState, Hold, PoolResume};
 
 /// Upper bound on an explicitly-authored `cycles`. A derived count needs no cap
 /// — it is bounded by the pools' own sizes.
@@ -257,6 +257,11 @@ struct PoolRuntime<'a> {
     /// rotation parked on it at the visit's start, so a prefix of its items
     /// can be resumed by drawing the rest.
     visit_resumable: bool,
+    /// The series a `rotate: <span>` pool is holding and for which period.
+    hold: Option<Hold>,
+    /// The span period the next visit airs in, `(start, end)`. Set by the
+    /// walk before each visit of a span pool; `None` for every other pool.
+    period: Option<(time::OffsetDateTime, time::OffsetDateTime)>,
 }
 
 impl PoolRuntime<'_> {
@@ -443,6 +448,57 @@ impl PoolRuntime<'_> {
         }
         self.forced += 1;
         start
+    }
+
+    /// The series that opens a visit: the held one while a `rotate: <span>`
+    /// period lasts, otherwise whichever [`Self::eligible_pick`] picks.
+    ///
+    /// A pick made under a span becomes the hold for the period. A held series
+    /// that has run out (its last episode aired, so it is `finished`) or has
+    /// left the pool ends the hold early, and the pick moves on to the series
+    /// after it. A hold from an earlier period does the same: the pool moves
+    /// to the series after the one it held.
+    fn first_series(
+        &mut self,
+        roll: &RollKey,
+        nonce: u64,
+        channel: &mut ChannelHistory,
+    ) -> Option<usize> {
+        let Some((period_start, period_end)) = self.period else {
+            return self.eligible_pick(roll, nonce, channel);
+        };
+        if let Some(hold) = &self.hold {
+            let held = self.series.iter().position(|s| s.key == hold.series);
+            if hold.period_start == period_start
+                && let Some(si) = held
+                && !self.series[si].finished
+            {
+                return Some(si);
+            }
+            if self.cfg.select == Select::RoundRobin
+                && let Some(si) = held
+            {
+                self.rotation = self.series_after(si).unwrap_or(si);
+            }
+        }
+        let si = self.eligible_pick(roll, nonce, channel)?;
+        self.hold = Some(Hold {
+            series: self.series[si].key.clone(),
+            period_start,
+            period_end,
+        });
+        Some(si)
+    }
+
+    /// Every series is one film — nothing for a span to hold. A movie has no
+    /// `show_id`, so its series key is its own entry id; an episode's series is
+    /// keyed by its show.
+    fn is_films_only(&self) -> bool {
+        !self.series.is_empty()
+            && self
+                .series
+                .iter()
+                .all(|s| s.ids.len() == 1 && s.key == s.ids[0])
     }
 
     /// Which series opens a visit, honouring both `select` and the pool's
@@ -639,7 +695,7 @@ impl PoolRuntime<'_> {
                 self.visit_resumable = false;
                 Ok(out)
             }
-            Rotate::Visit => self.serve(take, from, roll, 0, done, channel),
+            Rotate::Visit | Rotate::Span(_) => self.serve(take, from, roll, 0, done, channel),
         }
     }
 
@@ -659,9 +715,9 @@ impl PoolRuntime<'_> {
         done: usize,
         channel: &mut ChannelHistory,
     ) -> Result<Vec<String>, String> {
-        let first = self.eligible_pick(roll, nonce, channel);
+        let first = self.first_series(roll, nonce, channel);
         let override_take = match self.cfg.rotate {
-            Rotate::Visit => first.and_then(|si| self.take_override_for(si)),
+            Rotate::Visit | Rotate::Span(_) => first.and_then(|si| self.take_override_for(si)),
             Rotate::Slot => None,
         };
         // `all` is sized from the series the visit just picked, so it has to be
@@ -764,6 +820,16 @@ impl PoolRuntime<'_> {
             };
         }
 
+        // A held series that ran short and spilled onto another one hands the
+        // hold to the series that finished the visit: that is the series the
+        // pool moved on to, and it keeps the rest of the period.
+        if let (Some(hold), Some(si)) = (self.hold.as_mut(), last)
+            && self.period.is_some()
+            && Some(si) != first
+        {
+            hold.series = self.series[si].key.clone();
+        }
+
         for &si in contributed.keys() {
             self.lap.insert(self.series[si].key.clone());
         }
@@ -845,6 +911,7 @@ impl PoolRuntime<'_> {
                 Select::Random => None,
             },
             list: self.list_key.clone(),
+            hold: self.hold.clone(),
             // Only a resuming pool reads its lap back; a `restart` pool opens
             // on its top every generation whatever it visited.
             lap: if self.cfg.advance == Advance::Resume {
@@ -1249,7 +1316,8 @@ pub fn build_with_cache(
         .iter()
         .map(|p| variety.dice(window_start, Some(p)))
         .collect();
-    let rotating = opening.iter().any(|d| d.rotates());
+    let rotating =
+        opening.iter().any(|d| d.rotates()) || pools.iter().any(|p| p.rotate.span().is_some());
     let measure = budget.is_some() || rotating;
 
     // Every rotating plugin pool's list for its period, as the sidecar holds
@@ -1421,6 +1489,11 @@ pub fn build_with_cache(
                     &out,
                 )?;
             }
+            // After the rollover above, which swaps the runtime for a fresh one.
+            runtimes[idx].period = pools[idx]
+                .rotate
+                .span()
+                .map(|span| variety.span_period(airs_at, span));
             let roll = RollKey {
                 seed: dice.seed,
                 cycle,
@@ -1555,6 +1628,22 @@ pub fn build_with_cache(
                 }
                 if let Some(p) = dice.temperature_period {
                     detail.insert("temperature_period".into(), p.into());
+                }
+                // A span pool's draw says which series it is holding and until
+                // when, so a week of one show reads as a hold, not a coincidence.
+                if let Some(hold) = &runtimes[idx].hold {
+                    detail.insert(
+                        "held_series".into(),
+                        serde_json::Value::String(hold.series.clone()),
+                    );
+                    detail.insert(
+                        "held_until".into(),
+                        serde_json::Value::String(
+                            hold.period_end
+                                .format(&time::format_description::well_known::Rfc3339)
+                                .unwrap_or_default(),
+                        ),
+                    );
                 }
                 // A plugin pool's position is read from the list as ranked
                 // for the period: a pool's own constraints reorder what it
@@ -2615,7 +2704,19 @@ fn pool_runtime<'a>(
         list_key: dice.list_key(cfg),
         lap: BTreeSet::new(),
         visit_resumable: false,
+        hold: prev
+            .and_then(|p| p.hold.clone())
+            .filter(|_| cfg.rotate.span().is_some()),
+        period: None,
     };
+    if cfg.rotate.span().is_some() && rt.is_films_only() {
+        return Err(format!(
+            "pool {:?} sets rotate: {}, but every series it resolves is a single film — a span \
+             holds nothing on a films-only pool. Use rotate: visit or slot",
+            cfg.name,
+            humantime::format_duration(cfg.rotate.span().unwrap_or_default()),
+        ));
+    }
     // Seeded through the same path a draw takes, so the window is trimmed to
     // `reach` by one rule rather than two.
     rt.remember(&seam);
@@ -3916,6 +4017,7 @@ mod tests {
             "shows".into(),
             PoolResume {
                 list: None,
+                hold: None,
                 lap: Vec::new(),
                 next: Some("show:inv".into()),
                 drawn: Vec::new(),
@@ -3981,6 +4083,7 @@ mod tests {
             "shows".into(),
             PoolResume {
                 list: None,
+                hold: None,
                 lap: vec!["show:inv".into()],
                 next: Some("show:inv".into()),
                 drawn: Vec::new(),
