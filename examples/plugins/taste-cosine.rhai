@@ -233,6 +233,9 @@ fn rating_cutoff(ctx) {
     if r.min == () && r.max == () {
         throw "config.rating needs a `min`, a `max`, or both";
     }
+    if r.source != "consensus" && ctx.config["rating_weights"] != () {
+        throw "config.rating_weights applies only to `rating: { source: consensus }`";
+    }
     #{
         source: r.source,
         min: if r.min == () { () } else { r.min.to_float() },
@@ -272,6 +275,7 @@ fn rating_weights(ctx) {
                 throw "config.rating_weights." + name + " must be a number, got " + w;
             }
             w = w.to_float();
+            if w.is_nan() || w.is_infinite() { throw "config.rating_weights." + name + " must be a finite number, got " + w; }
             if w < 0.0 { throw "config.rating_weights." + name + " must not be negative, got " + w; }
             weights[name] = w;
         }

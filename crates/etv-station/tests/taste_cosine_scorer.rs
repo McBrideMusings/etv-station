@@ -2009,6 +2009,7 @@ fn a_bad_rating_weight_fails_the_load_naming_it() {
         (serde_json::json!({ "rotten": 1 }), "rotten"),
         (serde_json::json!({ "imdb": -1 }), "imdb"),
         (serde_json::json!({ "imdb": "heavy" }), "imdb"),
+        (serde_json::json!({ "imdb": f64::INFINITY }), "imdb"),
     ] {
         let err = consensus_scorer()
             .try_pick_for(
