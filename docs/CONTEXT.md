@@ -147,3 +147,7 @@ A set of profile edits for one channel, held in server memory under an id the da
 ## Dashboard
 
 The single web page at `/` served by `etv-station --serve-ui`: tabs (Channels, Guide, Health) and, on Channels, a lineup rail with Schedule, Pattern, Pools and Graphics views.
+
+## Frontier
+
+The far end of already-built playback: the last moment with scheduled content. Past it, nothing is scheduled yet.

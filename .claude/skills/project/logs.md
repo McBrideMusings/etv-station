@@ -48,6 +48,7 @@ Never ask pierce to paste a prod log; read it over SSH. `UNRAID_HOST` and `UNRAI
 
 | Log | Holds | Fetch |
 |---|---|---|
+| Loki `{container="etv-station"}` | The container stdout below, shipped by Alloy on the host; 90 days retained, queryable by time without ssh | `logcli query --since=12h '{container="etv-station"} \|= "reburst: lead exhausted"'` (`LOKI_ADDR` from `~/.claude/.env`); count rebursts with `logcli query --since=12h --limit=5000 '…' \| wc -l`. Lines exist from 2026-10-23 17:06 UTC (1:06pm EDT) on; earlier ones are in `docker logs` only |
 | Container stdout | Both programs' tracing, one JSON object per line with a UTC `timestamp`, `level` and `fields.event` (`chunk.write`, `calendar.select`, `bumper.fill`, `mem.sample`, …) | `ssh "$UNRAID_USER@$UNRAID_HOST" docker logs --since <t> --until <t> etv-station`; `admin logs` follows it live |
 | `data/diag/access.log` | ETV-next's per-HTTP-message access log: client address, path, status | `ssh … tail -n 200 /mnt/user/appdata/etv-station/data/diag/access.log` |
 | `data/diag/stream-events.log` | The stream event watcher: segment and playlist events per channel | as above; `admin diag` follows both together |
