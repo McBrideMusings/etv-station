@@ -121,7 +121,22 @@ with the sibling channels that share its pools or plugin.
 
 ## Step 5 — the report
 
-In chat, in this order:
+Write the report as markdown to `<scratch>/report-<folder>.md`, then render it as a
+document beside this pane:
+
+```sh
+~/.claude/tools/wheel-report channel-review-<folder> <scratch>/report-<folder>.md
+```
+
+That is `~/.claude/tools/wheel-report` — one procedure for every long report: it
+converts the markdown with pandoc, writes it into the Wheel artifact
+`channel-review-<folder>` under this repo's `.wheel/artifacts/` (gitignored), and
+opens or reuses a web pane on it. Re-running with the same name rewrites the same
+page. It exits 3 outside a Wheel agent pane (`WHEEL_PANE` unset); then the whole
+report goes in chat instead. With the page open, chat carries only the headline,
+the three numbers, and the fixes' option lines, so `1A`/`go` can be typed here.
+
+The report, in this order:
 
 1. **Headline**: the finding that costs a viewer the most, as a number
    (minutes of error card per day, airings in the wrong language).

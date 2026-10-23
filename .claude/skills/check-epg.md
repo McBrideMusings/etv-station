@@ -21,7 +21,7 @@ This requires `./tools/dev-run.sh` to be running. If the server is not up, tell 
 curl -s -o /tmp/etv-epg.xml -w "%{http_code}" http://127.0.0.1:8409/xmltv.xml
 ```
 
-If HTTP code is not 200, the server is down or returned an error — check `tmp/dev.*.log` with the `read-logs` skill.
+If HTTP code is not 200, the server is down or returned an error — check `tmp/dev.*.log` with the `project` skill's logs.md.
 
 ### 2. Read the EPG XML
 

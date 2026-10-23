@@ -1,8 +1,3 @@
----
-name: verify-project
-description: Boot the etv-station daemon locally and watch it schedule and emit playout. Use when verifying a change to this repo before committing.
----
-
 # Verify etv-station
 
 Rust daemon that schedules channels and writes playout JSON. It ships as a Docker

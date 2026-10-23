@@ -504,6 +504,6 @@ Work down; stop when one answers it.
 
 ## Related
 
-- `verify-project` — booting the daemon locally and the freeze-tool table.
+- `project` (verify.md) — booting the daemon locally and the freeze-tool table.
 - `crates/etv-overlay/src/phase_watchdog.rs` — the overlay clock's implementation.
 - Global `diagnose` — the method this skill plugs into.

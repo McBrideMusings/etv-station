@@ -79,3 +79,6 @@ deploy/unraid-template.xml
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+.wheel/
+wheel.toml

@@ -41,7 +41,7 @@ ffmpeg -y -rw_timeout 15000000 -i http://127.0.0.1:8409/channel/1.m3u8 -frames:v
 ffmpeg -y -rw_timeout 15000000 -i http://127.0.0.1:8409/channel/2.m3u8 -frames:v 1 -q:v 2 /tmp/etv-frame-ch2.jpg
 ```
 
-**If ffmpeg times out or errors:** The HLS stream may not be producing segments yet. Wait 10–15s after channel start and retry. Check dev logs with `read-logs` if it keeps failing.
+**If ffmpeg times out or errors:** The HLS stream may not be producing segments yet. Wait 10–15s after channel start and retry. Check dev logs per the `project` skill's logs.md if it keeps failing.
 
 **Note:** ffmpeg typically outputs several lines of version/codec info to stderr before the frame. This is normal. A successful grab exits 0 and produces the image file.
 

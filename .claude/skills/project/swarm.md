@@ -1,9 +1,4 @@
----
-name: swarm-worker
-description: "How a swarm worker builds and tests etv-station beside other workers: heavy commands, the two cargo workspaces, per-worker ETV_PORT and docs port. Read before the first build or test in a swarm worktree."
----
-
-# swarm-worker — etv-station
+# Swarm workers — etv-station
 
 `H` below means `"$HOME/.claude/skills/swarm/swarm" heavy --`.
 

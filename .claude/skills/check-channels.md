@@ -67,4 +67,4 @@ For each channel, report:
 - **Playlist valid** — does the master playlist look well-formed?
 - **Segments present** — did the variant playlist contain `.ts` segments?
 
-If something is down, check the most recent `tmp/dev.*.log` (use the `read-logs` skill) to see why.
+If something is down, check the most recent `tmp/dev.*.log` (see the `project` skill's logs.md) to see why.

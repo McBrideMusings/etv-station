@@ -1,8 +1,3 @@
----
-name: read-logs
-description: Read runtime logs from the last dev run or other command. Use when the user says they ran the app and something didn't work, or when you need to check what happened during the last run.
----
-
 # Read Logs
 
 Dev and tooling runs write output to timestamped log files in `tmp/`. The file name pattern is:
@@ -46,3 +41,19 @@ Read from the **bottom** of the log file (last 80 lines). The user typically qui
 - Don't read the entire log file upfront if it's large
 - Don't ask the user to paste logs — just read the file
 - Don't shell out to tail/view logs — use the Read tool directly on the file
+
+## Production: the Unraid container
+
+Never ask pierce to paste a prod log; read it over SSH. `UNRAID_HOST` and `UNRAID_USER` (default `root`) are in `.env`. Every read below is read-only and goes ahead unasked.
+
+| Log | Holds | Fetch |
+|---|---|---|
+| Container stdout | Both programs' tracing, one JSON object per line with a UTC `timestamp`, `level` and `fields.event` (`chunk.write`, `calendar.select`, `bumper.fill`, `mem.sample`, …) | `ssh "$UNRAID_USER@$UNRAID_HOST" docker logs --since <t> --until <t> etv-station`; `admin logs` follows it live |
+| `data/diag/access.log` | ETV-next's per-HTTP-message access log: client address, path, status | `ssh … tail -n 200 /mnt/user/appdata/etv-station/data/diag/access.log` |
+| `data/diag/stream-events.log` | The stream event watcher: segment and playlist events per channel | as above; `admin diag` follows both together |
+| `data/diag/ffmpeg-argv-ch<N>.log` | The exact ffmpeg argv per transcode, one argument per line | as above |
+| `data/diag/ffmpeg-progress-ch<N>-<stamp>-<pid>.log` | Per-second `frame`, `fps`, `out_time`, `speed` for one transcode | as above |
+
+`--since`/`--until` take an RFC 3339 time or a duration (`10m`). Times in the container are UTC; the station's own `tz` (America/Chicago) only shapes chunk boundaries.
+
+Filter one channel or event with `jq` on this machine: `… docker logs --since 1h etv-station 2>&1 | jq -c 'select(.fields.channel=="003-for-madi")'`.

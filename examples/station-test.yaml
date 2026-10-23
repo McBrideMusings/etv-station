@@ -1,5 +1,5 @@
 # THE committed no-media/no-Plex local verification config — see
-# .claude/skills/verify-project/SKILL.md. One lavfi channel, nothing on disk to
+# .claude/skills/project/verify.md. One lavfi channel, nothing on disk to
 # mount, no ${VAR} expansions, so it boots on any machine with no setup.
 #
 # Run it from the repo root: `output_base` below resolves against the process's
