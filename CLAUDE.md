@@ -55,6 +55,7 @@ admin verify accel                       # prove channels encode on the GPU, not
 admin backup                             # snapshot history.db / catalog.db / .device_id on the host
 admin audit <channel> [--next N]         # why each upcoming item is on a channel's schedule
 admin plugin-check                       # would this branch's binary load the plugin scripts prod has?
+admin playout <channel> [--days N] [--prod]  # open a channel's generated playout (airings, rotation draws, bumpers) in a Wheel pane
 
 git subtree pull --prefix=vendor/etv-next etv-upstream main --squash   # absorb upstream ErsatzTV/next
 ```
