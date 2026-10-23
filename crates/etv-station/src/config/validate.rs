@@ -677,10 +677,10 @@ fn validate_steps(
         {
             return Err(bad(format!(
                 "{label} step #{step_idx} has take = \"all\" but pool {:?} sets \
-                 rotate = {:?}, which holds one series for the span — \"all\" empties \
+                 rotate = \"{}\", which holds one series for the span — \"all\" empties \
                  it in a single visit. Use an explicit count",
                 step.pool,
-                humantime::format_duration(span).to_string()
+                super::pool::span_label(span)
             )));
         }
         // `all` empties the series whatever the cut position, so a `from` beside
@@ -2690,6 +2690,28 @@ mod tests {
         // The same pool with an explicit count is fine.
         let mut p = pool("shows");
         p.rotate = Rotate::Slot;
+        let b = pattern_block(vec![p], vec![step("shows", 3)]);
+        assert!(validate_channel(&dummy_path(), &channel_with(vec![b])).is_ok());
+    }
+
+    /// `all` empties the held series in one visit, so a span would end on day
+    /// one. The refusal names the span as the author wrote it (`1w`), not as
+    /// humantime prints seven days.
+    #[test]
+    fn rejects_take_all_on_a_span_pool_naming_the_authored_span() {
+        let mut p = pool("shows");
+        p.rotate = Rotate::Span(std::time::Duration::from_secs(7 * 86_400));
+        let b = pattern_block(vec![p], vec![step_all("shows")]);
+        let err = format!(
+            "{}",
+            validate_channel(&dummy_path(), &channel_with(vec![b])).unwrap_err()
+        );
+        assert!(err.contains("rotate = \"1w\""), "err = {err}");
+        assert!(!err.contains("7days"), "err = {err}");
+
+        // The same pool with an explicit count is fine.
+        let mut p = pool("shows");
+        p.rotate = Rotate::Span(std::time::Duration::from_secs(7 * 86_400));
         let b = pattern_block(vec![p], vec![step("shows", 3)]);
         assert!(validate_channel(&dummy_path(), &channel_with(vec![b])).is_ok());
     }

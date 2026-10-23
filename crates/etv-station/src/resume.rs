@@ -291,6 +291,10 @@ pub struct PoolResume {
 pub struct Hold {
     /// The held series' key ([`PoolResume::next`] names series the same way).
     pub series: String,
+    /// What the series is called on screen: its show's name, or a film's title.
+    /// Absent on a hold written before the name was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// The period's first instant. Two holds are the same period exactly when
     /// their starts are equal.
     #[serde(with = "time::serde::rfc3339")]
@@ -503,6 +507,8 @@ pub fn sidecar_path(output_folder: &Path) -> PathBuf {
 pub struct HoldRow {
     pub pool: String,
     pub series: String,
+    /// The series' on-screen name; the key stands in when none was recorded.
+    pub title: String,
     pub period_start: OffsetDateTime,
     pub period_end: OffsetDateTime,
 }
@@ -522,6 +528,7 @@ pub fn read_holds(output_folder: &Path, now: OffsetDateTime) -> Vec<HoldRow> {
             let hold = state.hold?;
             (hold.period_end > now).then_some(HoldRow {
                 pool,
+                title: hold.title.unwrap_or_else(|| hold.series.clone()),
                 series: hold.series,
                 period_start: hold.period_start,
                 period_end: hold.period_end,
@@ -541,6 +548,7 @@ pub fn holds_json(rows: &[HoldRow], tz: &'static time_tz::Tz) -> serde_json::Val
                 serde_json::json!({
                     "pool": r.pool,
                     "series": r.series,
+                    "title": r.title,
                     "period_start": local(r.period_start),
                     "period_end": local(r.period_end),
                 })
@@ -561,7 +569,7 @@ pub fn holds_text(rows: &[HoldRow], tz: &'static time_tz::Tz) -> String {
         out.push_str(&format!(
             "[{}] holding {} until {}\n",
             r.pool,
-            r.series,
+            r.title,
             r.period_end
                 .to_timezone(tz)
                 .format(&Rfc3339)
@@ -909,6 +917,7 @@ mod tests {
             PoolResume {
                 hold: Some(Hold {
                     series: "show:a".into(),
+                    title: Some("Show A".into()),
                     period_start: time::macros::datetime!(2026-10-19 04:00 UTC),
                     period_end: time::macros::datetime!(2026-10-26 04:00 UTC),
                 }),
@@ -921,8 +930,9 @@ mod tests {
         let json = holds_json(&rows, tz);
         assert_eq!(json[0]["pool"], "strip");
         assert_eq!(json[0]["series"], "show:a");
+        assert_eq!(json[0]["title"], "Show A");
         assert_eq!(json[0]["period_end"], "2026-10-26T00:00:00-04:00");
-        assert!(holds_text(&rows, tz).contains("holding show:a until 2026-10-26T00:00:00-04:00"));
+        assert!(holds_text(&rows, tz).contains("holding Show A until 2026-10-26T00:00:00-04:00"));
         // A period that has ended holds nothing.
         assert!(read_holds(dir.path(), time::macros::datetime!(2026-10-27 00:00 UTC)).is_empty());
     }

@@ -5250,6 +5250,7 @@ fn annotate(ctx, item) { #{ seen: item.entry_id, title: item.title } }"#,
         // still names the show and the Monday that ends its week.
         let hold = last.pool("strip").unwrap().hold.clone().expect("a hold");
         assert_eq!(hold.series, "show:a");
+        assert_eq!(hold.title.as_deref(), Some("a"));
         assert_eq!(
             hold.period_end,
             time::macros::datetime!(2026-10-26 00:00 UTC)

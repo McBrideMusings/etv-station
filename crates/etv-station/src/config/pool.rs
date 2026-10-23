@@ -261,6 +261,19 @@ pub enum Rotate {
 /// The shortest span a pool can hold a series for.
 pub const MIN_SPAN: Duration = Duration::from_secs(86_400);
 
+/// A span the way it is authored: whole weeks as `1w`, whole days as `3d`,
+/// anything else as humantime prints it.
+pub fn span_label(span: Duration) -> String {
+    let secs = span.as_secs();
+    if span.subsec_nanos() == 0 && secs > 0 && secs.is_multiple_of(7 * 86_400) {
+        format!("{}w", secs / (7 * 86_400))
+    } else if span.subsec_nanos() == 0 && secs > 0 && secs.is_multiple_of(86_400) {
+        format!("{}d", secs / 86_400)
+    } else {
+        humantime::format_duration(span).to_string()
+    }
+}
+
 impl Rotate {
     /// The span a pool holds a series for, or `None` for `visit` and `slot`.
     pub fn span(self) -> Option<Duration> {

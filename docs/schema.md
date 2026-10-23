@@ -2936,11 +2936,13 @@ from 1970-01-01 00:00 local, the clock `seed: { rotate }` uses. The `seed` and
   naming the pool: a span holds nothing on a films-only pool.
 
 **Observing it.** The pool's draw log (`select` stage `detail`) carries
-`held_series` and `held_until`. The Review JSON carries `holds`, beside
-`rotations`: one row per span pool, `{pool, series, period_start, period_end}`,
-read from the sidecar without running a generation, with the instants on the
-station's wall clock. `etv-station --audit <channel>` prints the same rows as
-`[pool] holding <series> until <end>`.
+`held_series`, `held_title` (the show's name or the film's title) and
+`held_until`. The Review JSON carries `holds`, beside `rotations`: one row per
+span pool, `{pool, series, title, period_start, period_end}`, read from the
+sidecar without running a generation, with the instants on the station's wall
+clock. `etv-station --audit <channel>` prints the same rows as
+`[pool] holding <title> until <end>`. A hold the sidecar recorded without a
+title shows its series key in the title's place.
 
 A span is not available on a rotation slot's members (`slots:`), and it does
 not change the `seed` or `temperature` rotate clocks.

@@ -259,6 +259,9 @@ struct PoolRuntime<'a> {
     visit_resumable: bool,
     /// The series a `rotate: <span>` pool is holding and for which period.
     hold: Option<Hold>,
+    /// Display name of each series key, filled for a `rotate: <span>` pool only:
+    /// the show name, or a film's title.
+    series_titles: HashMap<String, String>,
     /// The span period the next visit airs in, `(start, end)`. Set by the
     /// walk before each visit of a span pool; `None` for every other pool.
     period: Option<(time::OffsetDateTime, time::OffsetDateTime)>,
@@ -467,12 +470,13 @@ impl PoolRuntime<'_> {
         let Some((period_start, period_end)) = self.period else {
             return self.eligible_pick(roll, nonce, channel);
         };
-        if let Some(hold) = &self.hold {
+        if let Some(hold) = &mut self.hold {
             let held = self.series.iter().position(|s| s.key == hold.series);
             if hold.period_start == period_start
                 && let Some(si) = held
                 && !self.series[si].finished
             {
+                hold.title = self.series_titles.get(&hold.series).cloned();
                 return Some(si);
             }
             if self.cfg.select == Select::RoundRobin
@@ -484,6 +488,7 @@ impl PoolRuntime<'_> {
         let si = self.eligible_pick(roll, nonce, channel)?;
         self.hold = Some(Hold {
             series: self.series[si].key.clone(),
+            title: self.series_titles.get(&self.series[si].key).cloned(),
             period_start,
             period_end,
         });
@@ -828,6 +833,7 @@ impl PoolRuntime<'_> {
             && Some(si) != first
         {
             hold.series = self.series[si].key.clone();
+            hold.title = self.series_titles.get(&hold.series).cloned();
         }
 
         for &si in contributed.keys() {
@@ -1636,6 +1642,12 @@ pub fn build_with_cache(
                         "held_series".into(),
                         serde_json::Value::String(hold.series.clone()),
                     );
+                    if let Some(title) = &hold.title {
+                        detail.insert(
+                            "held_title".into(),
+                            serde_json::Value::String(title.clone()),
+                        );
+                    }
                     detail.insert(
                         "held_until".into(),
                         serde_json::Value::String(
@@ -2687,6 +2699,25 @@ fn pool_runtime<'a>(
         dice.seed,
     )?;
 
+    let series_titles = if cfg.rotate.span().is_some() {
+        let firsts: Vec<String> = series
+            .iter()
+            .filter_map(|s| s.ids.first().cloned())
+            .collect();
+        let entries = catalog.entries_for(&firsts).map_err(|e| e.to_string())?;
+        series
+            .iter()
+            .filter_map(|s| {
+                let e = entries.get(s.ids.first()?)?;
+                Some((
+                    s.key.clone(),
+                    e.show.clone().unwrap_or_else(|| e.title.clone()),
+                ))
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
     let mut rt = PoolRuntime {
         cfg,
         series,
@@ -2707,6 +2738,7 @@ fn pool_runtime<'a>(
         hold: prev
             .and_then(|p| p.hold.clone())
             .filter(|_| cfg.rotate.span().is_some()),
+        series_titles,
         period: None,
     };
     if cfg.rotate.span().is_some() && rt.is_films_only() {
@@ -2714,7 +2746,7 @@ fn pool_runtime<'a>(
             "pool {:?} sets rotate: {}, but every series it resolves is a single film — a span \
              holds nothing on a films-only pool. Use rotate: visit or slot",
             cfg.name,
-            humantime::format_duration(cfg.rotate.span().unwrap_or_default()),
+            crate::config::span_label(cfg.rotate.span().unwrap_or_default()),
         ));
     }
     // Seeded through the same path a draw takes, so the window is trimmed to
