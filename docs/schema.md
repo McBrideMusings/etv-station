@@ -1941,12 +1941,15 @@ and the verdict names the half the pick came from — so `admin audit` says
 which of two sibling pools aired something without the reader holding the
 config.
 
-#### `seen_boost` and `rating` — lean toward played titles, cut on a rating
+#### `seen_boost`, `rating` and `awards` — lean toward played titles, cut on a rating or an award
 
 ```yaml
 config:
   seen_boost: 1.5                          # multiplier on titles in the account's plays; 1.0 = off
   rating: { source: letterboxd, min: 6.5 } # or max:, or both
+  # rating: { source: consensus, min: 70 } # one weighted mean of every source
+  # rating_weights: { rogerebert: 0.5 }    # consensus only; unnamed sources weigh 1.0
+  awards: { match: ["Academy Award"] }    # or ["Academy Award for Best Picture"]
 ```
 
 **`seen_boost`** multiplies the final score (after recency damping) of every
@@ -1960,8 +1963,29 @@ the source name). Values use the source's own scale: letterboxd 0–10, tomatoes
 0–100. A title with no value from that source is dropped. On a shows pool the
 value is the show's.
 
-Audit detail carries `seen_boosted` (bool) and `rating: { source, value }`
-(null on a pool with no `rating:`).
+**`source: consensus`** cuts on one value per title instead of one source's:
+the weighted mean of every rating the title has, each rescaled to 0–100.
+imdb, letterboxd, metacriticuser and myanimelist (0–10) count ×10; trakt, tmdb,
+popcorn, tomatoes and metacritic (0–100) count ×1; rogerebert (0–4) counts ×25.
+Vote counts are ignored. `min` and `max` are on the 0–100 scale. A title needs
+at least three sources with a weight above 0; one with fewer is dropped.
+
+**`rating_weights`** (consensus only) is a map of source name to weight. A
+source it does not name weighs 1.0, and 0 turns a source off. A negative or
+non-numeric weight, or a name that is not one of the ten sources, fails the
+load naming it.
+
+**`awards`** keeps titles with at least one value in the `awards` enrichment
+namespace (key `award`, e.g. `Academy Award for Best Picture`) that starts with
+one of the `match` entries. The prefix is case-sensitive. A title with no awards
+is dropped. `match` must be a non-empty list of non-empty strings; anything else
+fails the generation with a message naming the pool. On a shows pool it reads
+the show's awards.
+
+Audit detail carries `seen_boosted` (bool), `rating: { source, value }` (null on
+a pool with no `rating:`; a consensus also carries `used`, the number of sources
+in the mean, and `weights`, the weight each of them carried) and `awards:
+{ matched: [...] }` (null on a pool with no `awards:`).
 
 #### `walk` — build the pool by walking tags out from seed tags
 
@@ -2893,6 +2917,50 @@ script never declares. `examples/plugins/attribution.rhai` is a worked
 example: it asks Tautulli who has recently watched each item and returns
 `#{ attribution: "Watched recently by bob and carol" }`, which an overlay script
 reads as `metadata.attribution`. `ctx.http` calls across the whole pass share one 30-second budget; once it is spent, further calls error and those items stay unannotated.
+
+### Pool `rotate` — when a pool changes series
+
+```yaml
+rotate: visit | slot | <span>     # span: 1d, 1w, 4w … at least 1d
+```
+
+| Value | The pool changes series |
+|---|---|
+| `visit` (default) | on every visit to the pattern step: `take: 3` is three consecutive episodes of one show |
+| `slot` | on every item: `take: 3` spreads across three series |
+| `<span>` | when the period rolls over. The pool picks a series the way `visit` does (same `select`, `order`, `group_by`, `groups`), then keeps it for every visit, across generations and across separate placements of its slot, until the period ends. The first visit after the rollover moves to the next series |
+
+**Periods.** A span of whole weeks (`1w`, `7d`, `2w`, any multiple of 7 days)
+counts its periods from a **local Monday midnight** in the station's `tz`, so
+`1w` rolls over every Monday at 00:00 local. Any other span (`1d`, `3d`) counts
+from 1970-01-01 00:00 local, the clock `seed: { rotate }` uses. The `seed` and
+`temperature` clocks are unchanged.
+
+**What a hold keeps.**
+
+- `advance: resume` keeps each series' place as it does for `visit`: a series
+  that returns in a later period continues after the episode it last aired.
+- A series that runs out mid-period (its last episode aired) follows
+  `on_short`, and the pool moves on early. When `on_short: next` spills the
+  visit onto the following series, that series is held for the rest of the
+  period.
+- The held series and its period are stored in the `.resume` sidecar with the
+  pool's other state, so a restart, a regeneration, a rewind to a checkpoint
+  and the Review simulation all hold the same series.
+- A pool whose every series is a single film fails its generation with an error
+  naming the pool: a span holds nothing on a films-only pool.
+
+**Observing it.** The pool's draw log (`select` stage `detail`) carries
+`held_series`, `held_title` (the show's name or the film's title) and
+`held_until`. The Review JSON carries `holds`, beside `rotations`: one row per
+span pool, `{pool, series, title, period_start, period_end}`, read from the
+sidecar without running a generation, with the instants on the station's wall
+clock. `etv-station --audit <channel>` prints the same rows as
+`[pool] holding <title> until <end>`. A hold the sidecar recorded without a
+title shows its series key in the title's place.
+
+A span is not available on a rotation slot's members (`slots:`), and it does
+not change the `seed` or `temperature` rotate clocks.
 
 ### Pattern step `take` — how many items one visit draws
 

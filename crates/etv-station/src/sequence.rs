@@ -957,6 +957,7 @@ fn arrange(ctx) {
             "movies".into(),
             PoolResume {
                 list: None,
+                hold: None,
                 lap: Vec::new(),
                 next: Some("show:whatever".into()),
                 drawn: Vec::new(),

@@ -219,6 +219,11 @@ fn seen_boost(ctx) {
 // `ratings` enrichment namespace where the fact's key is the source name. A
 // title with no value from that source is dropped from a rated pool. Returns
 // () when the pool sets no `rating:`.
+//
+// `source: consensus` instead cuts on one weighted mean of every source the
+// title has, each rescaled to 0-100 (see `consensus_value`); its `min` and
+// `max` are on that 0-100 scale. The returned map then carries `weights`, one
+// weight per source, validated here so a bad one fails the load.
 fn rating_cutoff(ctx) {
     let r = ctx.config["rating"];
     if r == () { return (); }
@@ -228,11 +233,105 @@ fn rating_cutoff(ctx) {
     if r.min == () && r.max == () {
         throw "config.rating needs a `min`, a `max`, or both";
     }
+    if r.source != "consensus" && ctx.config["rating_weights"] != () {
+        throw "config.rating_weights applies only to `rating: { source: consensus }`";
+    }
     #{
         source: r.source,
         min: if r.min == () { () } else { r.min.to_float() },
         max: if r.max == () { () } else { r.max.to_float() },
+        weights: if r.source == "consensus" { rating_weights(ctx) } else { () },
     }
+}
+
+// How many points of the 0-100 consensus scale one point of each mdblist
+// source is worth. Also the list of the ten sources `rating_weights` accepts.
+fn rating_scales() {
+    #{
+        imdb: 10.0, letterboxd: 10.0, metacriticuser: 10.0, myanimelist: 10.0,
+        trakt: 1.0, tmdb: 1.0, popcorn: 1.0, tomatoes: 1.0, metacritic: 1.0,
+        rogerebert: 25.0,
+    }
+}
+
+// The consensus weight of every source: `config.rating_weights` over a default
+// of 1.0. A weight of 0 turns a source off; a negative one, a non-number, or a
+// name that is not one of the ten sources is refused.
+fn rating_weights(ctx) {
+    let given = ctx.config["rating_weights"];
+    if given != () && type_of(given) != "map" {
+        throw "config.rating_weights must be a map of source name to weight, e.g. { rogerebert: 0.5 }";
+    }
+    let scales = rating_scales();
+    let weights = #{};
+    for name in scales.keys() { weights[name] = 1.0; }
+    if given != () {
+        for name in given.keys() {
+            if !scales.contains(name) {
+                throw "config.rating_weights names `" + name + "`, which is not one of the ten rating sources";
+            }
+            let w = given[name];
+            if type_of(w) != "i64" && type_of(w) != "f64" {
+                throw "config.rating_weights." + name + " must be a number, got " + w;
+            }
+            w = w.to_float();
+            if w.is_nan() || w.is_infinite() { throw "config.rating_weights." + name + " must be a finite number, got " + w; }
+            if w < 0.0 { throw "config.rating_weights." + name + " must not be negative, got " + w; }
+            weights[name] = w;
+        }
+    }
+    weights
+}
+
+// The consensus of one title's ratings facts: the weighted mean of its scores
+// rescaled to 0-100, over the sources it has with a weight above 0. Returns
+// () when fewer than three such sources exist, so a title two sources rated
+// is dropped from a rated pool. Else `#{ value, used, weights }`: the mean,
+// how many sources went into it, and the weight applied to each of them.
+fn consensus_value(facts, weights) {
+    let scales = rating_scales();
+    let sum = 0.0;
+    let total = 0.0;
+    let applied = #{};
+    for f in facts {
+        let scale = scales[f.key];
+        if scale == () || applied.contains(f.key) { continue; }
+        let w = weights[f.key];
+        if w <= 0.0 { continue; }
+        let n = rating_number(f.value);
+        if n == () { continue; }
+        sum += w * n * scale;
+        total += w;
+        applied[f.key] = w;
+    }
+    if applied.len() < 3 { return (); }
+    #{ value: sum / total, used: applied.len(), weights: applied }
+}
+
+// The audit's `rating` field for a kept title: the source and value, and for a
+// consensus also how many sources went in and the weight each carried.
+fn rating_detail(source, kept) {
+    if source != "consensus" { return #{ source: source, value: kept.value }; }
+    #{ source: source, value: kept.value, used: kept.used, weights: kept.weights }
+}
+
+// An optional filter on the `awards` enrichment namespace, `awards: { match:
+// ["Academy Award"] }`. A title is a candidate only when at least one of its
+// awards values starts with one of the entries (case-sensitive prefix); every
+// other title leaves the pool before ranking. Returns () when the pool sets no
+// `awards:`.
+fn awards_filter(ctx) {
+    let a = ctx.config["awards"];
+    if a == () { return (); }
+    let m = if type_of(a) == "map" { a["match"] } else { () };
+    let ok = type_of(m) == "array" && m.len > 0;
+    if ok {
+        for e in m { if type_of(e) != "string" || e == "" { ok = false; } }
+    }
+    if !ok {
+        throw "pool " + ctx.pool + ": config.awards must be a map with a non-empty `match` list of non-empty strings, e.g. { match: [\"Academy Award\"] }";
+    }
+    m
 }
 
 // The number in a ratings fact's value, or () when it does not parse.
@@ -732,18 +831,49 @@ fn pick(ctx) {
         for u in units {
             let facts = ratings[u];
             let val = ();
+            let how = ();
             if facts != () {
-                for f in facts {
-                    if f.key == cutoff.source {
-                        let n = rating_number(f.value);
-                        if n != () { val = n; break; }
+                if cutoff.source == "consensus" {
+                    how = consensus_value(facts, cutoff.weights);
+                    if how != () { val = how.value; }
+                } else {
+                    for f in facts {
+                        if f.key == cutoff.source {
+                            let n = rating_number(f.value);
+                            if n != () { val = n; break; }
+                        }
                     }
                 }
             }
             if val == () { continue; }
             if cutoff.min != () && val < cutoff.min { continue; }
             if cutoff.max != () && val > cutoff.max { continue; }
-            rating_of[u] = val;
+            rating_of[u] = if how == () { #{ value: val } } else { how };
+            kept_units.push(u);
+        }
+        units = kept_units;
+    }
+
+    // The awards filter (`config.awards`): one bulk fetch of the `awards`
+    // namespace, keeping a unit when any award value starts with a `match`
+    // entry. The values that matched ride along for the audit.
+    let awards_match = awards_filter(ctx);
+    let awards_of = #{};
+    if awards_match != () {
+        let awards = ds.enrichment_for_many(units, "awards");
+        let kept_units = [];
+        for u in units {
+            let facts = awards[u];
+            if facts == () { continue; }
+            let hit = [];
+            for f in facts {
+                if f.key != "award" || type_of(f.value) != "string" { continue; }
+                for m in awards_match {
+                    if f.value.starts_with(m) { hit.push(f.value); break; }
+                }
+            }
+            if hit.len == 0 { continue; }
+            awards_of[u] = hit;
             kept_units.push(u);
         }
         units = kept_units;
@@ -1115,7 +1245,8 @@ fn pick(ctx) {
         scored.push(#{
             walk: walk_row,
             seen_boosted: seen_boosted,
-            rating: if cutoff == () { () } else { #{ source: cutoff.source, value: rating_of[id] } },
+            rating: if cutoff == () { () } else { rating_detail(cutoff.source, rating_of[id]) },
+            awards: if awards_match == () { () } else { #{ matched: awards_of[id] } },
             id: id,
             score: score,
             base_score: base_score,
@@ -1427,6 +1558,7 @@ fn pick(ctx) {
             seen_boosted: row.seen_boosted,
             walk: row.walk,
             rating: row.rating,
+            awards: row.awards,
             recency_factor: row.recency_factor,
             aired_rank: row.aired_rank,
             rank: row.rank,
@@ -1828,6 +1960,7 @@ fn audit(ctx, picks, workspace) {
                 // the closeness the score was multiplied by.
                 walk: r.walk,
                 rating: r.rating,
+                awards: r.awards,
                 recency_factor: r.recency_factor,
                 aired_rank: r.aired_rank,
                 // The series this entry was ranked as, on a shows pool.

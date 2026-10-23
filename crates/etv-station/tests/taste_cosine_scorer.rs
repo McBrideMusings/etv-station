@@ -1753,7 +1753,10 @@ fn write_boost_fixture(path: &Path) {
                  ('tie-b', 'ratings', 'letterboxd', '5.2', 't'),
                  ('tie-b', 'ratings', 'tomatoes', '10', 't'),
                  ('tie-z', 'ratings', 'letterboxd', '7.4', 't'),
-                 ('tie-z', 'ratings', 'tomatoes', '62', 't');
+                 ('tie-z', 'ratings', 'tomatoes', '62', 't'),
+                 ('tie-z', 'awards', 'award', 'Academy Award for Best Picture', 't'),
+                 ('tie-z', 'awards', 'award', 'Golden Globe Award', 't'),
+                 ('tie-b', 'awards', 'award', 'Cannes Film Festival', 't');
              INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
                  ('h1', 'tie-z', 42, 1700000000);",
         )
@@ -1894,6 +1897,181 @@ fn a_rated_pool_drops_a_title_with_no_value_and_the_audit_names_the_value() {
     );
     let unrated = pick_config(&boost_scorer(), serde_json::json!({}));
     assert!(detail_of(&unrated[0])["rating"].is_null());
+}
+
+#[test]
+fn an_awards_filter_keeps_only_titles_with_a_matching_award() {
+    let picked = pick_config(
+        &boost_scorer(),
+        serde_json::json!({ "awards": { "match": ["Academy Award"] } }),
+    );
+    assert_eq!(
+        order_of(&picked),
+        ["tie-z"],
+        "tie-b has only a Cannes award, tie-a has none"
+    );
+    assert_eq!(
+        detail_of(&picked[0])["awards"],
+        serde_json::json!({ "matched": ["Academy Award for Best Picture"] })
+    );
+    let plain = pick_config(&boost_scorer(), serde_json::json!({}));
+    assert!(detail_of(&plain[0])["awards"].is_null());
+}
+
+#[test]
+fn a_malformed_awards_block_is_refused_naming_the_pool() {
+    for bad in [
+        serde_json::json!("Academy Award"),
+        serde_json::json!({}),
+        serde_json::json!({ "match": [] }),
+        serde_json::json!({ "match": [""] }),
+        serde_json::json!({ "match": "Academy Award" }),
+    ] {
+        let err = boost_scorer()
+            .try_pick_for(
+                "movies",
+                0,
+                10,
+                Some(serde_json::json!({ "awards": bad })),
+                Some(42),
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("config.awards"), "{err}");
+        assert!(err.contains("pool "), "{err}");
+    }
+}
+
+/// Three films sharing one keyword. `con-4` has four rated sources, `con-3`
+/// three (one on the 0-4 rogerebert scale), `con-2` only two.
+fn write_consensus_fixture(path: &Path) {
+    empty_store(path)
+        .execute_batch(
+            "INSERT INTO items (item_id, type) VALUES
+                 ('con-2', 'movie'), ('con-3', 'movie'), ('con-4', 'movie');
+             INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
+                 ('con-2', 'keywords', 'keyword', 'k', 't'),
+                 ('con-3', 'keywords', 'keyword', 'k', 't'),
+                 ('con-4', 'keywords', 'keyword', 'k', 't'),
+                 ('con-2', 'ratings', 'imdb', '9.0', 't'),
+                 ('con-2', 'ratings', 'tomatoes', '90', 't'),
+                 ('con-3', 'ratings', 'imdb', '8.0', 't'),
+                 ('con-3', 'ratings', 'tomatoes', '60', 't'),
+                 ('con-3', 'ratings', 'rogerebert', '4', 't'),
+                 ('con-4', 'ratings', 'imdb', '8.0', 't'),
+                 ('con-4', 'ratings', 'letterboxd', '7.0', 't'),
+                 ('con-4', 'ratings', 'tomatoes', '90', 't'),
+                 ('con-4', 'ratings', 'metacritic', '60', 't');",
+        )
+        .unwrap();
+}
+
+fn consensus_scorer() -> Scorer {
+    Scorer::new(
+        &catalog_of(["con-2", "con-3", "con-4"]),
+        write_consensus_fixture,
+    )
+}
+
+/// Ids kept (sorted) by a consensus cutoff of `min` with the given weights.
+/// A pool the cutoff empties makes the scorer refuse to pick, which reads here
+/// as no ids.
+fn consensus_ids(min: f64, weights: serde_json::Value) -> Vec<String> {
+    let config = serde_json::json!({
+        "rating": { "source": "consensus", "min": min },
+        "rating_weights": weights,
+        "exploration_fraction": 0.0,
+    });
+    match consensus_scorer().try_pick_for("movies", 0, 10, Some(config), Some(42), &[]) {
+        Ok(picked) => {
+            let mut v: Vec<String> = picked.into_iter().map(|p| p.id).collect();
+            v.sort();
+            v
+        }
+        Err(e) => {
+            assert!(e.contains("picked nothing"), "{e}");
+            Vec::new()
+        }
+    }
+}
+
+#[test]
+fn a_consensus_is_the_mean_of_the_rescaled_scores_and_drops_a_two_source_title() {
+    // con-4: (80 + 70 + 90 + 60) / 4 = 75; con-3: (80 + 60 + 100) / 3 = 80;
+    // con-2 has two sources and is dropped whatever its scores.
+    assert_eq!(
+        consensus_ids(0.0, serde_json::json!({})),
+        ["con-3", "con-4"]
+    );
+    assert_eq!(consensus_ids(75.5, serde_json::json!({})), ["con-3"]);
+    assert_eq!(consensus_ids(80.0, serde_json::json!({})), ["con-3"]);
+    assert!(consensus_ids(80.5, serde_json::json!({})).is_empty());
+
+    let picked = pick_config(
+        &consensus_scorer(),
+        serde_json::json!({ "rating": { "source": "consensus", "min": 0 } }),
+    );
+    let con4 = picked.iter().find(|p| p.id == "con-4").unwrap();
+    let rating = &detail_of(con4)["rating"];
+    assert_eq!(rating["source"], "consensus");
+    assert_close(rating["value"].as_f64().unwrap(), 75.0, "con-4 consensus");
+    assert_eq!(rating["used"], 4);
+    assert_eq!(
+        rating["weights"],
+        serde_json::json!({ "imdb": 1.0, "letterboxd": 1.0, "tomatoes": 1.0, "metacritic": 1.0 })
+    );
+}
+
+#[test]
+fn a_zero_weight_turns_a_source_off_and_can_leave_a_title_under_three() {
+    // con-3 loses rogerebert and falls to two sources; con-4 loses imdb and
+    // keeps three: (70 + 90 + 60) / 3.
+    let w = serde_json::json!({ "rogerebert": 0 });
+    assert_eq!(consensus_ids(0.0, w), ["con-4"]);
+    let w = serde_json::json!({ "imdb": 0 });
+    assert_eq!(consensus_ids(73.0, w.clone()), ["con-4"]);
+    assert!(consensus_ids(74.0, w).is_empty());
+}
+
+#[test]
+fn a_heavier_weight_moves_the_consensus_toward_its_source() {
+    // con-3 with rogerebert at 2: (80 + 60 + 2 * 100) / 4 = 85, up from 80;
+    // at 0.5: (80 + 60 + 50) / 2.5 = 76, down from 80.
+    assert_eq!(
+        consensus_ids(84.0, serde_json::json!({ "rogerebert": 2 })),
+        ["con-3"]
+    );
+    assert!(consensus_ids(86.0, serde_json::json!({ "rogerebert": 2 })).is_empty());
+    assert!(consensus_ids(76.5, serde_json::json!({ "rogerebert": 0.5 })).is_empty());
+    assert_eq!(
+        consensus_ids(75.5, serde_json::json!({ "rogerebert": 0.5 })),
+        ["con-3"]
+    );
+}
+
+#[test]
+fn a_bad_rating_weight_fails_the_load_naming_it() {
+    for (weights, needle) in [
+        (serde_json::json!({ "rotten": 1 }), "rotten"),
+        (serde_json::json!({ "imdb": -1 }), "imdb"),
+        (serde_json::json!({ "imdb": "heavy" }), "imdb"),
+        (serde_json::json!({ "imdb": f64::INFINITY }), "imdb"),
+    ] {
+        let err = consensus_scorer()
+            .try_pick_for(
+                "movies",
+                0,
+                10,
+                Some(serde_json::json!({
+                    "rating": { "source": "consensus", "min": 0 },
+                    "rating_weights": weights,
+                })),
+                Some(42),
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains(needle), "{err}");
+    }
 }
 
 /// The house term divides rather than subtracts, so no weight — however

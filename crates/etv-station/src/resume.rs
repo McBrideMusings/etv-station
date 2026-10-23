@@ -278,6 +278,30 @@ pub struct PoolResume {
     /// the list the next generation holds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub drawn: Vec<String>,
+    /// The series a `rotate: <span>` pool is holding, and the period it holds
+    /// it for. Recorded whatever `advance` is: a span carries the held series
+    /// across generations and separate placements of the pool's slot, and a
+    /// `restart` pool would otherwise forget it at every generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<Hold>,
+}
+
+/// One series held for one period of a `rotate: <span>` pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hold {
+    /// The held series' key ([`PoolResume::next`] names series the same way).
+    pub series: String,
+    /// What the series is called on screen: its show's name, or a film's title.
+    /// Absent on a hold written before the name was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The period's first instant. Two holds are the same period exactly when
+    /// their starts are equal.
+    #[serde(with = "time::serde::rfc3339")]
+    pub period_start: OffsetDateTime,
+    /// The first instant of the following period: when the pool moves on.
+    #[serde(with = "time::serde::rfc3339")]
+    pub period_end: OffsetDateTime,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -476,6 +500,83 @@ impl GenerationState {
 
 pub fn sidecar_path(output_folder: &Path) -> PathBuf {
     output_folder.join(SIDECAR_NAME)
+}
+
+/// One `rotate: <span>` pool's current hold, as the Review and `--audit` show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldRow {
+    pub pool: String,
+    pub series: String,
+    /// The series' on-screen name; the key stands in when none was recorded.
+    pub title: String,
+    pub period_start: OffsetDateTime,
+    pub period_end: OffsetDateTime,
+}
+
+/// The holds still in force at `now`, read from the sidecar without running a
+/// generation. A hold whose period has ended is no longer a hold: the pool
+/// moves on at its next visit.
+pub fn read_holds(output_folder: &Path, now: OffsetDateTime) -> Vec<HoldRow> {
+    let Ok(bytes) = std::fs::read(sidecar_path(output_folder)) else {
+        return Vec::new();
+    };
+    parse(&bytes)
+        .0
+        .pools
+        .into_iter()
+        .filter_map(|(pool, state)| {
+            let hold = state.hold?;
+            (hold.period_end > now).then_some(HoldRow {
+                pool,
+                title: hold.title.unwrap_or_else(|| hold.series.clone()),
+                series: hold.series,
+                period_start: hold.period_start,
+                period_end: hold.period_end,
+            })
+        })
+        .collect()
+}
+
+/// The holds as the Review JSON's `holds` rows, instants on `tz`'s wall clock.
+pub fn holds_json(rows: &[HoldRow], tz: &'static time_tz::Tz) -> serde_json::Value {
+    use time::format_description::well_known::Rfc3339;
+    use time_tz::OffsetDateTimeExt;
+    let local = |t: OffsetDateTime| t.to_timezone(tz).format(&Rfc3339).unwrap_or_default();
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|r| {
+                serde_json::json!({
+                    "pool": r.pool,
+                    "series": r.series,
+                    "title": r.title,
+                    "period_start": local(r.period_start),
+                    "period_end": local(r.period_end),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// The holds as the text block `--audit` prints; empty when there are none.
+pub fn holds_text(rows: &[HoldRow], tz: &'static time_tz::Tz) -> String {
+    use time::format_description::well_known::Rfc3339;
+    use time_tz::OffsetDateTimeExt;
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n== span holds: the series each rotate span pool is holding ==\n");
+    for r in rows {
+        out.push_str(&format!(
+            "[{}] holding {} until {}\n",
+            r.pool,
+            r.title,
+            r.period_end
+                .to_timezone(tz)
+                .format(&Rfc3339)
+                .unwrap_or_default(),
+        ));
+    }
+    out
 }
 
 /// Read the sidecar, or an empty map if there is none.
@@ -802,5 +903,37 @@ mod tests {
         let a = tokio::fs::read(sidecar_path(dir1.path())).await.unwrap();
         let b = tokio::fs::read(sidecar_path(dir2.path())).await.unwrap();
         assert_eq!(a, b);
+    }
+
+    /// The Review reads the hold off the sidecar, and its week ends on the
+    /// station's Monday midnight, not UTC's.
+    #[test]
+    fn holds_read_back_from_the_sidecar_end_on_local_monday_midnight() {
+        let tz = time_tz::timezones::db::america::NEW_YORK;
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = ResumeMap::new();
+        map.pools.insert(
+            "strip".into(),
+            PoolResume {
+                hold: Some(Hold {
+                    series: "show:a".into(),
+                    title: Some("Show A".into()),
+                    period_start: time::macros::datetime!(2026-10-19 04:00 UTC),
+                    period_end: time::macros::datetime!(2026-10-26 04:00 UTC),
+                }),
+                ..Default::default()
+            },
+        );
+        std::fs::write(sidecar_path(dir.path()), serde_json::to_vec(&map).unwrap()).unwrap();
+        let now = time::macros::datetime!(2026-10-21 12:00 UTC);
+        let rows = read_holds(dir.path(), now);
+        let json = holds_json(&rows, tz);
+        assert_eq!(json[0]["pool"], "strip");
+        assert_eq!(json[0]["series"], "show:a");
+        assert_eq!(json[0]["title"], "Show A");
+        assert_eq!(json[0]["period_end"], "2026-10-26T00:00:00-04:00");
+        assert!(holds_text(&rows, tz).contains("holding Show A until 2026-10-26T00:00:00-04:00"));
+        // A period that has ended holds nothing.
+        assert!(read_holds(dir.path(), time::macros::datetime!(2026-10-27 00:00 UTC)).is_empty());
     }
 }

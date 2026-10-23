@@ -691,6 +691,13 @@ fn channel_review(
             ROTATION_PREVIEW_PLACEMENTS,
         )),
     );
+    obj.insert(
+        "holds".into(),
+        crate::resume::holds_json(
+            &crate::resume::read_holds(&lc.output_folder, time::OffsetDateTime::now_utc()),
+            tz,
+        ),
+    );
     obj.insert("airings".into(), json!(airings_json));
     obj.insert("bumpers".into(), json!(bumpers_json(&real.bumpers, end)));
     obj.insert("items".into(), json!(items));
