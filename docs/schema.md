@@ -1947,6 +1947,8 @@ config.
 config:
   seen_boost: 1.5                          # multiplier on titles in the account's plays; 1.0 = off
   rating: { source: letterboxd, min: 6.5 } # or max:, or both
+  # rating: { source: consensus, min: 70 } # one weighted mean of every source
+  # rating_weights: { rogerebert: 0.5 }    # consensus only; unnamed sources weigh 1.0
 ```
 
 **`seen_boost`** multiplies the final score (after recency damping) of every
@@ -1960,8 +1962,21 @@ the source name). Values use the source's own scale: letterboxd 0–10, tomatoes
 0–100. A title with no value from that source is dropped. On a shows pool the
 value is the show's.
 
+**`source: consensus`** cuts on one value per title instead of one source's:
+the weighted mean of every rating the title has, each rescaled to 0–100.
+imdb, letterboxd, metacriticuser and myanimelist (0–10) count ×10; trakt, tmdb,
+popcorn, tomatoes and metacritic (0–100) count ×1; rogerebert (0–4) counts ×25.
+Vote counts are ignored. `min` and `max` are on the 0–100 scale. A title needs
+at least three sources with a weight above 0; one with fewer is dropped.
+
+**`rating_weights`** (consensus only) is a map of source name to weight. A
+source it does not name weighs 1.0, and 0 turns a source off. A negative or
+non-numeric weight, or a name that is not one of the ten sources, fails the
+load naming it.
+
 Audit detail carries `seen_boosted` (bool) and `rating: { source, value }`
-(null on a pool with no `rating:`).
+(null on a pool with no `rating:`). For a consensus it also carries `used`, the
+number of sources in the mean, and `weights`, the weight each of them carried.
 
 #### `walk` — build the pool by walking tags out from seed tags
 
