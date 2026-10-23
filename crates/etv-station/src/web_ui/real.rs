@@ -23,9 +23,18 @@ pub const UNKNOWN_BLOCK: usize = usize::MAX;
 /// The most history rows read for one view.
 const HISTORY_ROW_LIMIT: usize = 100_000;
 
+/// A bumper segment the align/fill pass placed in the published playout.
+pub struct RealBumper {
+    pub id: String,
+    pub start: OffsetDateTime,
+    pub duration: Duration,
+}
+
 pub struct Real {
     /// Programme airings from the span's start, in time order.
     pub airings: Vec<SimulatedAiring>,
+    /// The published bumper segments from the span's start, in time order.
+    pub bumpers: Vec<RealBumper>,
     /// Where the published playout ends; `None` when nothing is published.
     pub frontier: Option<OffsetDateTime>,
 }
@@ -62,9 +71,9 @@ pub fn open_history(output_base: &Path) -> Result<Option<HistoryDb>, String> {
         .map_err(|e| format!("open {}: {e}", path.display()))
 }
 
-/// Every item of the channel's chunk files finishing after `since`, bumper
-/// segments out, deduplicated on `(id, start)` (a boundary-straddling item is
-/// written into both neighbouring chunks).
+/// Every item of the channel's chunk files finishing after `since`,
+/// deduplicated on `(id, start)` (a boundary-straddling item is written into
+/// both neighbouring chunks).
 fn published_items(
     lc: &LoadedChannel,
     since: OffsetDateTime,
@@ -81,12 +90,7 @@ fn published_items(
         };
         let playout: Playout = serde_json::from_slice(&bytes)
             .map_err(|e| format!("parse {}: {e}", file.path.display()))?;
-        items.extend(
-            playout
-                .items
-                .into_iter()
-                .filter(|i| i.finish > since && !is_bumper_id(&i.id)),
-        );
+        items.extend(playout.items.into_iter().filter(|i| i.finish > since));
     }
     items.sort_by_key(|i| i.start);
     items.dedup_by(|a, b| a.id == b.id && a.start == b.start);
@@ -104,7 +108,17 @@ pub fn read(
     since: OffsetDateTime,
     nominal: Duration,
 ) -> Result<Real, String> {
-    let items = published_items(lc, since)?;
+    let (bumper_items, items): (Vec<_>, Vec<_>) = published_items(lc, since)?
+        .into_iter()
+        .partition(|i| is_bumper_id(&i.id));
+    let bumpers = bumper_items
+        .into_iter()
+        .map(|i| RealBumper {
+            id: i.id,
+            start: i.start,
+            duration: i.finish - i.start,
+        })
+        .collect();
     let frontier = items.iter().map(|i| i.finish).max();
     let mut by_start: HashMap<(String, i64), &ersatztv_playout::playout::PlayoutItem> = items
         .iter()
@@ -196,7 +210,11 @@ pub fn read(
         }
         airings.sort_by_key(|a| a.start);
     }
-    Ok(Real { airings, frontier })
+    Ok(Real {
+        airings,
+        bumpers,
+        frontier,
+    })
 }
 
 /// The state a projection from the channel's frontier starts from.

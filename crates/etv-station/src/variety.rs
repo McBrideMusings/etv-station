@@ -268,6 +268,29 @@ impl Variety {
             .min()
     }
 
+    /// The period of length `span` that holds `at`, as `(start, end)` instants.
+    ///
+    /// A span of whole weeks counts its periods from a local Monday midnight,
+    /// so `1w` rolls over at the start of each week; any other span counts
+    /// from 1970-01-01 00:00 local, the clock `seed: { rotate }` uses.
+    pub fn span_period(
+        &self,
+        at: OffsetDateTime,
+        span: Duration,
+    ) -> (OffsetDateTime, OffsetDateTime) {
+        let secs = span.as_secs().max(1) as i64;
+        let anchor = if secs % WEEK_SECS == 0 {
+            FIRST_MONDAY_SECS
+        } else {
+            0
+        };
+        let start = anchor + (local_secs(at, self.tz) - anchor).div_euclid(secs) * secs;
+        (
+            local_to_utc(start, at, self.tz),
+            local_to_utc(start + secs, at, self.tz),
+        )
+    }
+
     fn channel_salt(&self) -> u64 {
         crate::catalog::identity::fnv1a_64(&self.channel)
     }
@@ -277,6 +300,12 @@ impl Variety {
         crate::catalog::identity::fnv1a_64(&format!("{}/{name}", self.channel))
     }
 }
+
+const WEEK_SECS: i64 = 7 * 86_400;
+
+/// 1970-01-05 00:00, the first Monday after the epoch (1970-01-01 was a
+/// Thursday), in seconds since the epoch.
+const FIRST_MONDAY_SECS: i64 = 4 * 86_400;
 
 /// Seconds since 1970-01-01 00:00 on the local wall clock at `at`.
 fn local_secs(at: OffsetDateTime, tz: &'static Tz) -> i64 {

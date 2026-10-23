@@ -5128,4 +5128,199 @@ fn annotate(ctx, item) { #{ seen: item.entry_id, title: item.title } }"#,
             rotation_generation(&state, time::macros::datetime!(2026-10-15 20:00 UTC));
         assert_eq!(next_day[0], "m1");
     }
+
+    // ---- span pools (etv-station-6nsf.1) -----------------------------------
+
+    /// Shows `a`, `b`, `c`, each with the episode counts given.
+    fn strip_catalog(counts: [i64; 3]) -> Catalog {
+        let c = Catalog::open_in_memory().unwrap();
+        for (show, count) in ["a", "b", "c"].into_iter().zip(counts) {
+            for n in 1..=count {
+                let id = format!("{show}{n}");
+                let mut e = CatEntry::new(&id, "episode", format!("Title {id}"), Source::Plex);
+                e.show_id = Some(format!("show:{show}"));
+                e.show = Some(show.to_string());
+                e.season = Some(1);
+                e.episode = Some(n);
+                e.duration_ms = Some(22 * 3_600_000);
+                c.upsert_entry(&e).unwrap();
+                c.add_source(&EntrySource {
+                    source: Source::LocalFs,
+                    source_id: format!("fs-{id}"),
+                    entry_id: id.clone(),
+                    playback_path: format!("/media/{id}.mkv"),
+                    last_seen: None,
+                    missing_since: None,
+                    unairable_reason: None,
+                })
+                .unwrap();
+            }
+        }
+        c
+    }
+
+    /// Slot `strip` draws two episodes per placement from a pool of the three
+    /// shows holding one for `rotate`; it is placed 20:00-21:00 every day.
+    fn strip_channel(rotate: &str) -> ChannelConfig {
+        let mut block = include_with(vec![]);
+        block.pools = vec![
+            serde_norway::from_str(&format!(
+                "name: strip\nexpr: 'item.type == \"episode\"'\nrotate: {rotate}\n\
+                 advance: resume\norder: 'season:asc,episode:asc'"
+            ))
+            .unwrap(),
+        ];
+        block.pattern = serde_norway::from_str("[{pool: strip, take: 2}]").unwrap();
+        block.cycles = Some(1);
+        let mut c = channel(vec![include_with(vec![Entry::Item(Box::new(
+            item_entry_secs("filler", 600),
+        ))])]);
+        c.rule.slots.insert("strip".into(), block);
+        c.rule.schedules =
+            serde_norway::from_str(r#"[{name: nightly, hours: {"20..21": strip}}]"#).unwrap();
+        c
+    }
+
+    /// The first show-letter each day's placement airs, for `days` days from
+    /// Monday 2026-10-19, with the sidecar written out and read back between
+    /// generations as the daemon does. Also returns every day's full ids and
+    /// the last sidecar.
+    fn run_strip(cat: &Catalog, rotate: &str, days: u8) -> (Vec<Vec<String>>, ResumeMap) {
+        let cfg = strip_channel(rotate);
+        let mut state = GenerationState::empty();
+        let mut aired = Vec::new();
+        let mut last = ResumeMap::new();
+        let monday = time::macros::datetime!(2026-10-19 20:00 UTC);
+        for day in 0..days {
+            let at = monday + time::Duration::days(i64::from(day));
+            let (items, next, _) = resolve_channel_with_resume(
+                &cfg,
+                path(),
+                &[],
+                None,
+                Some(cat),
+                &state,
+                &Default::default(),
+                Some(Duration::from_secs(86_400)),
+                at,
+            )
+            .unwrap();
+            aired.push(items.iter().map(|i| i.id.clone()).collect());
+            let json = serde_json::to_string(&next).unwrap();
+            last = serde_json::from_str(&json).unwrap();
+            state = advance_state(cat, &state, last.clone(), &items);
+        }
+        (aired, last)
+    }
+
+    fn first_show(day: &[String]) -> char {
+        day[0].chars().next().unwrap()
+    }
+
+    #[test]
+    fn a_week_span_airs_one_show_each_weekday_then_the_next_from_monday() {
+        let (aired, _) = run_strip(&strip_catalog([40, 40, 40]), "1w", 12);
+        let shows: String = aired.iter().map(|d| first_show(d)).collect();
+        assert_eq!(
+            shows, "aaaaaaabbbbb",
+            "Mon-Sun is one show; the next Monday moves on"
+        );
+        for day in &aired {
+            assert!(
+                day.iter().all(|id| id.starts_with(first_show(day))),
+                "{day:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_show_that_returns_resumes_after_the_episode_it_last_aired() {
+        let (aired, _) = run_strip(&strip_catalog([40, 40, 40]), "1w", 22);
+        // Week one airs a1..a14 (two a day), weeks two and three are b and c,
+        // and week four returns to a.
+        assert_eq!(aired[6], ["a13", "a14"]);
+        assert_eq!(aired[21], ["a15", "a16"]);
+    }
+
+    #[test]
+    fn the_held_show_survives_a_sidecar_reload_mid_week() {
+        let cat = strip_catalog([40, 40, 40]);
+        let (aired, last) = run_strip(&cat, "1w", 3);
+        // Wednesday's sidecar (written to JSON and read back by `run_strip`)
+        // still names the show and the Monday that ends its week.
+        let hold = last.pool("strip").unwrap().hold.clone().expect("a hold");
+        assert_eq!(hold.series, "show:a");
+        assert_eq!(hold.title.as_deref(), Some("a"));
+        assert_eq!(
+            hold.period_end,
+            time::macros::datetime!(2026-10-26 00:00 UTC)
+        );
+        assert_eq!(aired[2], ["a5", "a6"]);
+    }
+
+    #[test]
+    fn a_show_that_runs_out_mid_week_hands_the_week_to_the_next() {
+        let (aired, _) = run_strip(&strip_catalog([3, 40, 40]), "1w", 8);
+        // Tuesday's visit spills onto b; b keeps the rest of the week.
+        assert_eq!(aired[0], ["a1", "a2"]);
+        assert_eq!(aired[1], ["a3", "b1"]);
+        let rest: Vec<&str> = aired[2..7].iter().map(|d| d[0].as_str()).collect();
+        assert_eq!(rest, ["b2", "b4", "b6", "b8", "b10"]);
+        // The week after goes to the show after b.
+        assert_eq!(first_show(&aired[7]), 'c');
+    }
+
+    #[test]
+    fn a_span_on_a_films_only_pool_fails_the_generation_naming_the_pool() {
+        let mut block = interleave_block(crate::config::Advance::Resume);
+        block.pools.retain(|p| p.name == "movies");
+        block.pools[0].rotate = crate::config::Rotate::Span(Duration::from_secs(7 * 86_400));
+        block.pattern.retain(|s| s.pool == "movies");
+        let cfg = channel(vec![block]);
+        let err = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&interleave_catalog()),
+            &GenerationState::empty(),
+            &Default::default(),
+            None,
+            t0(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("\"movies\"") && err.contains("films-only"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_hold_survives_the_daily_seed_rolling_over_inside_one_generation() {
+        // One generation lays nine 22-hour episodes, crossing eight daily seed
+        // rollovers and the Monday that ends the week.
+        let cat = strip_catalog([40, 40, 40]);
+        let mut block = strip_channel("1w").rule.slots.remove("strip").unwrap();
+        block.pattern = serde_norway::from_str("[{pool: strip, take: 1}]").unwrap();
+        block.cycles = Some(9);
+        let cfg = channel(vec![block]);
+        let (items, _, _) = resolve_channel_with_resume(
+            &cfg,
+            path(),
+            &[],
+            None,
+            Some(&cat),
+            &GenerationState::empty(),
+            &Default::default(),
+            None,
+            time::macros::datetime!(2026-10-19 00:00 UTC),
+        )
+        .unwrap();
+        let shows: String = items
+            .iter()
+            .map(|i| first_show(std::slice::from_ref(&i.id)))
+            .collect();
+        assert_eq!(shows, "aaaaaaaab");
+    }
 }

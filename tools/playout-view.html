@@ -1,0 +1,132 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Playout</title>
+<meta name="color-scheme" content="light dark">
+<style>
+  :root { --bg:#fff; --fg:#1b1d21; --dim:#6b7280; --line:#e3e5e8; --accent:#2457d6; --proj:#f4f6fb; --bump:#9a6a00; --rot:#7a3db8; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181c; --fg:#e6e8eb; --dim:#98a0ab; --line:#2c3037; --accent:#7ba3ff; --proj:#1c2028; --bump:#e0b04a; --rot:#c39bf0; }
+  }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:13px/1.45 -apple-system, system-ui, sans-serif; }
+  h1 { font-size:18px; margin:0 0 2px; }
+  h2 { font-size:13px; margin:22px 0 6px; padding-top:8px; border-top:2px solid var(--line); }
+  .sub { color:var(--dim); margin-bottom:10px; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
+  .chip { border:1px solid var(--line); border-radius:12px; padding:1px 9px; }
+  .chip b { color:var(--accent); }
+  table { border-collapse:collapse; width:100%; }
+  td, th { text-align:left; padding:3px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:500; }
+  .scroll { overflow-x:auto; }
+  tr.projected td { background:var(--proj); }
+  tr.bumper td { color:var(--bump); font-size:12px; }
+  td.t { white-space:nowrap; font-variant-numeric:tabular-nums; }
+  td.d { white-space:nowrap; text-align:right; color:var(--dim); }
+  .rot { color:var(--rot); }
+  .dim { color:var(--dim); }
+  details { margin:6px 0; }
+  summary { cursor:pointer; color:var(--dim); }
+  #notices { color:var(--bump); }
+</style>
+<body>
+<div id="app" class="dim">Waiting for data…</div>
+<script src=".wheel/client.js"></script>
+<script>
+const app = document.getElementById("app");
+const el = (tag, cls, text) => {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+};
+const dur = (s) => {
+  const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+  return h ? `${h}h ${String(m).padStart(2, "0")}m` : s < 60 ? `${s}s` : `${m}m`;
+};
+
+function render(d) {
+  const tf = new Intl.DateTimeFormat("en-US", { timeZone: d.tz, hour: "numeric", minute: "2-digit" });
+  const df = new Intl.DateTimeFormat("en-US", { timeZone: d.tz, weekday: "long", month: "short", day: "numeric" });
+  const at = (ts) => tf.format(new Date(ts * 1000));
+  app.replaceChildren();
+  app.className = "";
+
+  app.append(el("h1", "", `${d.number ?? ""} ${d.display_name || d.name || d.channel}`.trim()));
+  app.append(el("div", "sub",
+    `${d.channel} · ${d.span.label} · ${d.airings.length} airings, ${d.bumpers.length} bumpers · ${d.tz}`));
+  if ((d.notices || []).length) app.append(el("div", "", d.notices.join(" ")));
+  app.append(el("div", "dim", "Bumpers show for the published span only; the projection does not run the bumper fill."));
+
+  const chips = el("div", "chips");
+  for (const p of d.principles || []) {
+    const c = el("span", "chip");
+    c.append(el("span", "", p.name + " "));
+    c.append(el("b", "", p.grade === null || p.grade === undefined ? "n/a" : `${p.grade}/3`));
+    c.title = p.measure || p.not_scored || "";
+    chips.append(c);
+  }
+  app.append(chips);
+
+  const blocks = el("details");
+  blocks.append(el("summary", "", `${d.blocks.length} blocks and pools`));
+  const bw = el("div", "scroll"), bt = el("table");
+  bt.innerHTML = "<tr><th>block / slot</th><th>pools</th><th>placed</th></tr>";
+  for (const b of d.blocks) {
+    const tr = el("tr");
+    tr.append(el("td", "", b.name), el("td", "", (b.pools || []).join(", ")), el("td", "dim", (b.placed || []).join("; ")));
+    bt.append(tr);
+  }
+  bw.append(bt); blocks.append(bw); app.append(blocks);
+
+  const rots = el("details");
+  rots.open = true;
+  rots.append(el("summary", "", `${(d.rotations || []).length} upcoming rotation draws`));
+  const rw = el("div", "scroll"), rt = el("table");
+  rt.innerHTML = "<tr><th>placement</th><th>rotation</th><th>drawn</th><th>reason</th></tr>";
+  for (const r of d.rotations || []) {
+    const ts = Math.floor(Date.parse(r.start) / 1000);
+    const tr = el("tr");
+    tr.append(el("td", "t", `${df.format(new Date(ts * 1000))} ${at(ts)}`), el("td", "rot", r.rotation),
+      el("td", "", r.airs), el("td", "dim", r.reason));
+    rt.append(tr);
+  }
+  rw.append(rt); rots.append(rw); app.append(rots);
+
+  const rows = [
+    ...d.airings.map((a) => ({ t: a.start, a })),
+    ...d.bumpers.map((b) => ({ t: b.start, b })),
+  ].sort((x, y) => x.t - y.t);
+  const days = d.day_starts;
+  for (let i = 0; i < days.length - 1; i++) {
+    const todays = rows.filter((r) => (i === 0 || r.t >= days[i]) && r.t < days[i + 1]);
+    if (!todays.length) continue;
+    app.append(el("h2", "", df.format(new Date(days[i] * 1000))));
+    const w = el("div", "scroll"), t = el("table");
+    t.innerHTML = "<tr><th>start</th><th>title</th><th>kind</th><th>pool</th><th>slot</th><th>rotation draw</th><th>length</th></tr>";
+    for (const r of todays) {
+      const tr = el("tr");
+      if (r.b) {
+        tr.className = "bumper";
+        tr.dataset.row = "bumper";
+        tr.append(el("td", "t", at(r.b.start)), el("td", "", "bumper"), el("td", "", "bumper"),
+          el("td"), el("td"), el("td"), el("td", "d", dur(r.b.duration_secs)));
+      } else {
+        const a = r.a;
+        tr.dataset.row = "airing";
+        if (a.projected) tr.className = "projected";
+        const draw = el("td", a.rotation ? "rot" : "dim");
+        draw.textContent = a.rotation ? `${a.rotation} → ${a.slot ?? "?"}${a.rotation_reason ? " — " + a.rotation_reason : ""}` : "";
+        tr.append(el("td", "t", at(a.start)), el("td", "", a.label), el("td", "", a.kind),
+          el("td", "", a.pool), el("td", "", a.rotation ? "" : (a.slot || "")), draw, el("td", "d", dur(a.duration_secs)));
+      }
+      t.append(tr);
+    }
+    w.append(t); app.append(w);
+  }
+  wheel.set("airings", app.querySelectorAll('tr[data-row="airing"]').length);
+  wheel.set("bumpers", app.querySelectorAll('tr[data-row="bumper"]').length);
+}
+
+const data = /*PLAYOUT_DATA*/null;
+try { render(data); } catch (e) { app.textContent = "render failed: " + e; wheel.set("error", String(e)); }
+</script>

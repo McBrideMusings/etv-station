@@ -468,6 +468,7 @@ fn channel_review(
         day_starts.push(crate::tz::add_chunk(last, 24, tz));
     }
     let end = *day_starts.last().expect("non-empty");
+    let span_days = (end - start).whole_days().max(1) as usize;
     let real_count = real.airings.len();
     let all: Vec<crate::simulate::SimulatedAiring> =
         real.airings.into_iter().chain(projected).collect();
@@ -610,10 +611,12 @@ fn channel_review(
         });
     }
 
+    let placer = Placer::new(lc, tz, span_days, now);
     let airings_json: Vec<Value> = airings
         .iter()
         .enumerate()
         .map(|(i, a)| {
+            let placed = placer.place(simulated[i].block, a.start);
             json!({
                 "index": i,
                 "id": a.id,
@@ -625,6 +628,10 @@ fn channel_review(
                 "projected": i >= real_count,
                 "offset_secs": (a.start - start).whole_seconds(),
                 "duration_secs": a.duration.whole_seconds(),
+                "slot": placed.slot,
+                "schedule": placed.schedule,
+                "rotation": placed.rotation,
+                "rotation_reason": placed.rotation_reason,
                 "ranking": ranking_of(simulated[i].metadata.as_ref()),
                 "audit": audits[i],
             })
@@ -684,7 +691,15 @@ fn channel_review(
             ROTATION_PREVIEW_PLACEMENTS,
         )),
     );
+    obj.insert(
+        "holds".into(),
+        crate::resume::holds_json(
+            &crate::resume::read_holds(&lc.output_folder, time::OffsetDateTime::now_utc()),
+            tz,
+        ),
+    );
     obj.insert("airings".into(), json!(airings_json));
+    obj.insert("bumpers".into(), json!(bumpers_json(&real.bumpers, end)));
     obj.insert("items".into(), json!(items));
     obj.insert("titles".into(), json!(titles));
     obj.insert(
@@ -697,6 +712,120 @@ fn channel_review(
         ),
     );
     Ok((if pending { 202 } else { 200 }, out))
+}
+
+/// The published bumper segments that start inside the span, as the page lists
+/// them between the programmes. Only the real span has any: a projection does
+/// not run the align/fill pass.
+fn bumpers_json(bumpers: &[real::RealBumper], end: time::OffsetDateTime) -> Vec<Value> {
+    bumpers
+        .iter()
+        .filter(|b| b.start < end)
+        .map(|b| {
+            json!({
+                "id": b.id,
+                "start": b.start.unix_timestamp(),
+                "duration_secs": b.duration.whole_seconds(),
+            })
+        })
+        .collect()
+}
+
+/// What the schedule says about the slot an airing aired in.
+struct Placement {
+    /// The slot that aired: the placed slot, or the member a rotation drew.
+    /// `None` for an any-time block.
+    slot: Option<String>,
+    /// The `rule.schedules` entry that placed it.
+    schedule: Option<String>,
+    /// The rotation the schedule placed, when `slot` is a member it drew.
+    rotation: Option<String>,
+    /// Why the rotation drew that member, when the draw is one the preview
+    /// still reaches.
+    rotation_reason: Option<String>,
+}
+
+/// Looks up the slot, schedule and rotation draw behind an airing from the
+/// channel's calendar, the `.resume` sidecar's recorded draws and the rotation
+/// preview.
+struct Placer<'a> {
+    rule: &'a config::RuleConfig,
+    calendar: Option<crate::calendar::Calendar<'a>>,
+    /// The draws the daemon recorded, by rotation.
+    drawn: std::collections::BTreeMap<String, crate::resume::RotationResume>,
+    /// `(rotation, placement start)` to the preview's reason for the draw.
+    reasons: HashMap<(String, i64), String>,
+}
+
+impl<'a> Placer<'a> {
+    fn new(
+        lc: &'a config::LoadedChannel,
+        tz: &'static time_tz::Tz,
+        span_days: usize,
+        now: time::OffsetDateTime,
+    ) -> Self {
+        let drawn = crate::rotation::read_rotations(&lc.output_folder);
+        // Every placement the span can hold, however many ranges a day a
+        // schedule gives the rotation.
+        let reasons = crate::rotation::preview_channel(
+            &lc.config,
+            tz,
+            &drawn,
+            now,
+            ROTATION_PREVIEW_PLACEMENTS.max(span_days * 8),
+        )
+        .into_iter()
+        .map(|r| ((r.rotation, r.start.unix_timestamp()), r.reason))
+        .collect();
+        Self {
+            rule: &lc.config.rule,
+            calendar: crate::calendar::Calendar::new(&lc.config.rule, tz),
+            drawn,
+            reasons,
+        }
+    }
+
+    /// `block` is the airing's `rule.blocks` index, `usize::MAX` for a real
+    /// airing, which does not record one.
+    fn place(&self, block: usize, start: time::OffsetDateTime) -> Placement {
+        let on_air = self.calendar.as_ref().map(|c| c.on_air(start));
+        let Some(crate::calendar::OnAir::Slot {
+            slot,
+            schedule,
+            placement,
+            ..
+        }) = on_air
+        else {
+            return Placement {
+                slot: self.rule.slot_name(block).map(str::to_string),
+                schedule: None,
+                rotation: None,
+                rotation_reason: None,
+            };
+        };
+        let Some(placement) = placement else {
+            return Placement {
+                slot: Some(slot.to_string()),
+                schedule: Some(schedule.to_string()),
+                rotation: None,
+                rotation_reason: None,
+            };
+        };
+        let member = self.rule.slot_name(block).map(str::to_string).or_else(|| {
+            self.drawn
+                .get(slot)?
+                .recent
+                .iter()
+                .find(|d| d.at.unix_timestamp() == placement)
+                .map(|d| d.member.clone())
+        });
+        Placement {
+            slot: member,
+            schedule: Some(schedule.to_string()),
+            rotation: Some(slot.to_string()),
+            rotation_reason: self.reasons.get(&(slot.to_string(), placement)).cloned(),
+        }
+    }
 }
 
 /// A label for every item the audit trails in `audits` name as passed over

@@ -1286,8 +1286,16 @@ fn audit(config_path: &Path, target: &str, next: usize, audit_out: Option<&Path>
         ),
         Err(_) => Vec::new(),
     };
+    let holds = match etv_station::tz::parse(&station.station.tz) {
+        Ok(tz) => etv_station::resume::holds_text(
+            &etv_station::resume::read_holds(&channel.output_folder, now),
+            tz,
+        ),
+        Err(_) => String::new(),
+    };
     let report = audit_report::render(&channel.name, now, &items)
-        + etv_station::rotation::render_text(&rotations).as_str();
+        + etv_station::rotation::render_text(&rotations).as_str()
+        + holds.as_str();
     match audit_out {
         Some(path) if path == Path::new("-") => {
             print!("{report}");
