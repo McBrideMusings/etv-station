@@ -1753,7 +1753,10 @@ fn write_boost_fixture(path: &Path) {
                  ('tie-b', 'ratings', 'letterboxd', '5.2', 't'),
                  ('tie-b', 'ratings', 'tomatoes', '10', 't'),
                  ('tie-z', 'ratings', 'letterboxd', '7.4', 't'),
-                 ('tie-z', 'ratings', 'tomatoes', '62', 't');
+                 ('tie-z', 'ratings', 'tomatoes', '62', 't'),
+                 ('tie-z', 'awards', 'award', 'Academy Award for Best Picture', 't'),
+                 ('tie-z', 'awards', 'award', 'Golden Globe Award', 't'),
+                 ('tie-b', 'awards', 'award', 'Cannes Film Festival', 't');
              INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
                  ('h1', 'tie-z', 42, 1700000000);",
         )
@@ -1894,6 +1897,49 @@ fn a_rated_pool_drops_a_title_with_no_value_and_the_audit_names_the_value() {
     );
     let unrated = pick_config(&boost_scorer(), serde_json::json!({}));
     assert!(detail_of(&unrated[0])["rating"].is_null());
+}
+
+#[test]
+fn an_awards_filter_keeps_only_titles_with_a_matching_award() {
+    let picked = pick_config(
+        &boost_scorer(),
+        serde_json::json!({ "awards": { "match": ["Academy Award"] } }),
+    );
+    assert_eq!(
+        order_of(&picked),
+        ["tie-z"],
+        "tie-b has only a Cannes award, tie-a has none"
+    );
+    assert_eq!(
+        detail_of(&picked[0])["awards"],
+        serde_json::json!({ "matched": ["Academy Award for Best Picture"] })
+    );
+    let plain = pick_config(&boost_scorer(), serde_json::json!({}));
+    assert!(detail_of(&plain[0])["awards"].is_null());
+}
+
+#[test]
+fn a_malformed_awards_block_is_refused_naming_the_pool() {
+    for bad in [
+        serde_json::json!("Academy Award"),
+        serde_json::json!({}),
+        serde_json::json!({ "match": [] }),
+        serde_json::json!({ "match": [""] }),
+        serde_json::json!({ "match": "Academy Award" }),
+    ] {
+        let err = boost_scorer()
+            .try_pick_for(
+                "movies",
+                0,
+                10,
+                Some(serde_json::json!({ "awards": bad })),
+                Some(42),
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("config.awards"), "{err}");
+        assert!(err.contains("pool "), "{err}");
+    }
 }
 
 /// Three films sharing one keyword. `con-4` has four rated sources, `con-3`
