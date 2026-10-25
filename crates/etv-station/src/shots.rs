@@ -166,8 +166,25 @@ fn round(v: f64, scale: f64) -> f64 {
     (v * scale).round() / scale
 }
 
+/// Why a file has no shot list. A permanent failure is about the file and is
+/// stored, so the file is not tried again until its path changes; a transient
+/// one is about the machine (no ffmpeg, a stale mount, a timeout, a stop) and
+/// is retried on the next pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DetectError {
+    Permanent(String),
+    Transient(String),
+}
+
+impl std::fmt::Display for DetectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Permanent(m) | Self::Transient(m)) = self;
+        f.write_str(m)
+    }
+}
+
 /// The first video stream's frame rate, or why there is none.
-fn frame_rate(path: &Path) -> Result<f64, String> {
+fn frame_rate(path: &Path) -> Result<f64, DetectError> {
     let args: Vec<OsString> = [
         "-v",
         "error",
@@ -186,7 +203,7 @@ fn frame_rate(path: &Path) -> Result<f64, String> {
     .chain([path.as_os_str().to_owned()])
     .collect();
     let out = match crate::ffprobe::run_bounded(&args, crate::ffprobe::PROBE_TIMEOUT)
-        .map_err(|e| format!("cannot run ffprobe: {e}"))?
+        .map_err(|e| DetectError::Transient(format!("cannot run ffprobe: {e}")))?
     {
         crate::ffprobe::Bounded::Done {
             success: true,
@@ -194,23 +211,26 @@ fn frame_rate(path: &Path) -> Result<f64, String> {
             ..
         } => String::from_utf8_lossy(&stdout).trim().to_string(),
         crate::ffprobe::Bounded::Done { stderr, .. } => {
-            return Err(format!(
+            return Err(DetectError::Permanent(format!(
                 "ffprobe rejected the file: {}",
                 String::from_utf8_lossy(&stderr).trim()
-            ));
+            )));
         }
-        crate::ffprobe::Bounded::TimedOut => return Err("ffprobe timed out".into()),
+        crate::ffprobe::Bounded::TimedOut => {
+            return Err(DetectError::Transient("ffprobe timed out".into()));
+        }
     };
     if out.is_empty() {
-        return Err("no video stream".into());
+        return Err(DetectError::Permanent("no video stream".into()));
     }
     let (num, den) = out.split_once('/').unwrap_or((&out, "1"));
+    let bad = || DetectError::Permanent(format!("unusable frame rate {out:?}"));
     let (num, den): (f64, f64) = (
-        num.parse().map_err(|_| format!("frame rate {out:?}"))?,
-        den.parse().map_err(|_| format!("frame rate {out:?}"))?,
+        num.parse().map_err(|_| bad())?,
+        den.parse().map_err(|_| bad())?,
     );
     if den <= 0.0 || num <= 0.0 {
-        return Err(format!("frame rate {out:?}"));
+        return Err(bad());
     }
     Ok(num / den)
 }
@@ -223,9 +243,15 @@ fn ffmpeg_program() -> OsString {
     }
 }
 
-/// Detect the shots of `path`. `Ok(vec![])` for a file with no video stream is
-/// reported as an `Err`, so the caller can store why.
-pub fn detect(path: &Path, stop: &AtomicBool) -> Result<Vec<Shot>, String> {
+/// Detect the shots of `path`.
+///
+/// A reader thread owns ffmpeg's pipe and hands frames over a channel, so a
+/// decode stalled on a dead network mount cannot hold this call past `stop` or
+/// [`FILE_TIMEOUT`]: the caller gives up, kills ffmpeg and leaves the reader to
+/// end when the pipe closes.
+pub fn detect(path: &Path, stop: &AtomicBool) -> Result<Vec<Shot>, DetectError> {
+    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
+
     let fps = frame_rate(path)?;
     let mut child = Command::new(ffmpeg_program())
         .args([
@@ -244,37 +270,59 @@ pub fn detect(path: &Path, stop: &AtomicBool) -> Result<Vec<Shot>, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| format!("cannot run ffmpeg: {e}"))?;
+        .map_err(|e| DetectError::Transient(format!("cannot run ffmpeg: {e}")))?;
     let mut stdout = child.stdout.take().expect("stdout was piped");
+    let (tx, rx) = sync_channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        loop {
+            let mut buf = vec![0u8; FRAME_BYTES];
+            if stdout.read_exact(&mut buf).is_err() || tx.send(buf).is_err() {
+                return;
+            }
+        }
+    });
     let deadline = Instant::now() + FILE_TIMEOUT;
     let mut seg = Segmenter::new(fps);
-    let mut buf = vec![0u8; FRAME_BYTES];
     let outcome = loop {
         if stop.load(Ordering::Relaxed) {
-            break Err("stopped".to_string());
+            break Err(DetectError::Transient("stopped".into()));
         }
         if Instant::now() >= deadline {
-            break Err(format!("ffmpeg ran past {}s", FILE_TIMEOUT.as_secs()));
+            break Err(DetectError::Transient(format!(
+                "ffmpeg ran past {}s",
+                FILE_TIMEOUT.as_secs()
+            )));
         }
-        match stdout.read_exact(&mut buf) {
-            Ok(()) => seg.push(&buf),
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break Ok(()),
-            Err(e) => break Err(format!("reading ffmpeg: {e}")),
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(frame) => seg.push(&frame),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break Ok(()),
         }
     };
     if outcome.is_err() {
         let _ = child.kill();
     }
+    drop(rx);
+    // A killed ffmpeg on a dead mount may not reap; do not wait on it here.
+    if outcome.is_err() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        return outcome.map(|()| Vec::new());
+    }
     let status = child
         .wait()
-        .map_err(|e| format!("waiting on ffmpeg: {e}"))?;
-    outcome?;
+        .map_err(|e| DetectError::Transient(format!("waiting on ffmpeg: {e}")))?;
     if !status.success() {
-        return Err(format!("ffmpeg exited with {status}"));
+        return Err(DetectError::Permanent(format!(
+            "ffmpeg exited with {status}"
+        )));
     }
     let shots = seg.finish();
     if shots.is_empty() {
-        return Err("the video stream decoded no frames".into());
+        return Err(DetectError::Permanent(
+            "the video stream decoded no frames".into(),
+        ));
     }
     Ok(shots)
 }
@@ -321,7 +369,14 @@ pub fn analyze_pending(catalog: &Catalog, stop: &AtomicBool) -> usize {
         }
         let started = Instant::now();
         let result = detect(Path::new(&path), stop);
-        if matches!(&result, Err(e) if e == "stopped") {
+        if let Err(DetectError::Transient(e)) = &result {
+            tracing::warn!(
+                event = "shots.deferred",
+                entry = %entry_id,
+                path = %path,
+                error = %e,
+                "could not analyze now; leaving the entry pending and ending this pass",
+            );
             break;
         }
         let ms = started.elapsed().as_millis() as u64;
@@ -347,7 +402,7 @@ pub fn analyze_pending(catalog: &Catalog, stop: &AtomicBool) -> usize {
                     ms,
                     "could not list the shots; recorded the failure and will not retry until the file changes",
                 );
-                catalog.set_shots(&entry_id, &path, &[], Some(e))
+                catalog.set_shots(&entry_id, &path, &[], Some(&e.to_string()))
             }
         };
         if let Err(e) = stored {
@@ -561,6 +616,6 @@ mod tests {
             .success();
         assert!(ok);
         let err = detect(&path, &AtomicBool::new(false)).unwrap_err();
-        assert!(err.contains("no video stream"), "{err}");
+        assert_eq!(err, DetectError::Permanent("no video stream".into()));
     }
 }

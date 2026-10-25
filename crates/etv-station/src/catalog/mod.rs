@@ -1366,7 +1366,7 @@ impl Catalog {
             .query_row(
                 "SELECT s.source_path, s.shots, s.error, s.analyzed_at \
                  FROM entry_shots s JOIN entry_sources p ON p.entry_id = s.entry_id \
-                 WHERE p.playback_path = ?1 AND s.error IS NULL LIMIT 1",
+                 WHERE p.playback_path = ?1 AND s.source_path = ?1 AND s.error IS NULL LIMIT 1",
                 params![path],
                 shot_row,
             )
@@ -2557,6 +2557,8 @@ mod tests {
             .unwrap();
         assert_eq!(c.entries_needing_shots().unwrap().len(), 1);
         assert_eq!(c.shots_for_path("/v/a.mkv").unwrap(), None);
+        // The new file has no list of its own yet, and the old list is not served for it.
+        assert_eq!(c.shots_for_path("/v/b.mkv").unwrap(), None);
     }
 
     #[test]
