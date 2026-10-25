@@ -147,6 +147,9 @@ pub struct BumperInput {
     /// The airings ledger `ctx.airings` reads; `None` answers every query
     /// with an empty array.
     pub history: Option<Arc<HistoryDb>>,
+    /// The catalog `ctx.probe` reads a file's stored `shots` from; `None`
+    /// leaves `shots` out of every probe result.
+    pub catalog_path: Option<PathBuf>,
 }
 
 /// A script's timeline plus how it built it.
@@ -218,6 +221,7 @@ pub fn build(script: &Path, input: &BumperInput) -> Result<BuiltTimeline, Bumper
             .unwrap_or_else(|| PathBuf::from(".")),
         granted: input.granted.clone(),
         history: input.history.clone(),
+        catalog_path: input.catalog_path.clone(),
         channel: input.channel.name.clone(),
         budget: crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET),
         tz: input.channel.tz.unwrap_or(time_tz::timezones::db::UTC),
@@ -669,6 +673,7 @@ struct Host {
     dir: PathBuf,
     granted: Vec<String>,
     history: Option<Arc<HistoryDb>>,
+    catalog_path: Option<PathBuf>,
     /// The channel `ctx.airings` queries unless the filter names another.
     channel: String,
     /// What this `build()` call has left for `ctx.http` and `ctx.exec`.
@@ -687,11 +692,19 @@ impl Host {
 
     fn probe(&self, path: &str) -> RhaiResult<Dynamic> {
         self.require("probe")?;
-        let probed = probe_media(Path::new(path)).map_err(|e| format!("ctx.probe(): {e}"))?;
+        let mut probed = probe_media(Path::new(path)).map_err(|e| format!("ctx.probe(): {e}"))?;
+        let shots = match (&probed, &self.catalog_path) {
+            (Some(_), Some(catalog)) => stored_shots(catalog, path),
+            _ => None,
+        };
+        if let (Some(serde_json::Value::Object(map)), Some(shots)) = (&mut probed, &shots) {
+            map.insert("shots".into(), shots.clone());
+        }
         tracing::info!(
             event = "bumper.probe",
             path,
             found = probed.is_some(),
+            shots = shots.as_ref().and_then(|s| s.as_array()).map(Vec::len),
             "bumper script probed a file"
         );
         match probed {
@@ -895,6 +908,23 @@ fn read_in_dir(dir: &Path, path: &str) -> Result<Option<String>, String> {
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| format!("{path:?} is not UTF-8 text"))
+}
+
+/// The shot list the catalog at `catalog` holds for the entry playing `path`,
+/// as the array `ctx.probe(path).shots` returns; `None` when there is none.
+fn stored_shots(catalog: &Path, path: &str) -> Option<serde_json::Value> {
+    let found = crate::catalog::Catalog::open_readonly(catalog)
+        .and_then(|c| c.shots_for_path(path))
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                event = "bumper.probe_shots_failed",
+                path,
+                error = %e,
+                "could not read the stored shots; ctx.probe leaves `shots` out"
+            );
+            None
+        })?;
+    serde_json::to_value(found).ok()
 }
 
 /// `ffprobe` output for `path` as the map `ctx.probe` returns. Only the `file`
@@ -1331,6 +1361,7 @@ mod tests {
             upcoming: Vec::new(),
             config: None,
             history: None,
+            catalog_path: None,
         }
     }
 
@@ -1736,6 +1767,95 @@ fn build(ctx) {{
             panic!("probe duration became {:?}", seg.duration)
         };
         assert!((1500..1520).contains(&ms), "{ms}");
+    }
+
+    #[test]
+    fn probe_carries_the_catalog_shots_of_the_file_it_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("m.mkv");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-f", "lavfi", "-i"])
+            .arg("color=c=red:s=64x48:d=1.5:r=10")
+            .arg(&media)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let db = dir.path().join("catalog.db");
+        {
+            let c = crate::catalog::Catalog::open(&db).unwrap();
+            let id = "imdb:tt1";
+            c.upsert_entry(&crate::catalog::Entry::new(
+                id,
+                "movie",
+                "Red",
+                crate::catalog::Source::LocalFs,
+            ))
+            .unwrap();
+            c.add_source(&crate::catalog::EntrySource {
+                source: crate::catalog::Source::LocalFs,
+                source_id: "fs-1".into(),
+                entry_id: id.into(),
+                playback_path: media.display().to_string(),
+                last_seen: None,
+                missing_since: None,
+                unairable_reason: None,
+            })
+            .unwrap();
+            let shots = [
+                crate::shots::Shot {
+                    start: 0.0,
+                    end: 0.5,
+                    luma: 0.01,
+                    motion: 0.0,
+                    card: true,
+                },
+                crate::shots::Shot {
+                    start: 0.5,
+                    end: 1.5,
+                    luma: 0.3,
+                    motion: 0.12,
+                    card: false,
+                },
+            ];
+            c.set_shots(id, &media.display().to_string(), &shots, None)
+                .unwrap();
+        }
+        let path = script(
+            &dir,
+            &format!(
+                r#"fn hooks() {{ ["bumper"] }}
+fn capabilities() {{ ["probe"] }}
+fn build(ctx) {{
+    let s = ctx.probe("{m}").shots;
+    let t = timeline();
+    t.push(segment().black().fixed_ms(1000)
+        .name(`${{s.len()}}|${{s[0].card}}|${{s[1].card}}|${{s[1].end}}|${{s[1].motion}}`));
+    t
+}}"#,
+                m = media.display()
+            ),
+        );
+        let mut input = granted(&["probe"]);
+        input.catalog_path = Some(db);
+        let built = build(&path, &input).unwrap();
+        assert_eq!(built.timeline.segments[0].name, "2|true|false|1.5|0.12");
+
+        // Without a catalog the key is absent, not an empty list.
+        let path = script(
+            &dir,
+            &format!(
+                r#"fn hooks() {{ ["bumper"] }}
+fn capabilities() {{ ["probe"] }}
+fn build(ctx) {{
+    let t = timeline();
+    t.push(segment().black().fixed_ms(1000).name(`${{"shots" in ctx.probe("{m}")}}`));
+    t
+}}"#,
+                m = media.display()
+            ),
+        );
+        let built = build(&path, &granted(&["probe"])).unwrap();
+        assert_eq!(built.timeline.segments[0].name, "false");
     }
 
     fn ledger_with_a_programme_and_two_bumpers() -> Arc<HistoryDb> {

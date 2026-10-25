@@ -1318,6 +1318,81 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Store the shot list computed from `source_path`, or, with `error`, the
+    /// reason there is none. Replaces any earlier row for the entry.
+    pub fn set_shots(
+        &self,
+        entry_id: &str,
+        source_path: &str,
+        shots: &[crate::shots::Shot],
+        error: Option<&str>,
+    ) -> Result<(), CatalogError> {
+        let json = serde_json::to_string(shots).expect("a shot list serializes");
+        let at = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("now formats as RFC 3339");
+        self.conn.execute(
+            "INSERT INTO entry_shots (entry_id, source_path, shots, error, analyzed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(entry_id) DO UPDATE SET source_path = ?2, shots = ?3, \
+               error = ?4, analyzed_at = ?5",
+            params![entry_id, source_path, json, error, at],
+        )?;
+        Ok(())
+    }
+
+    /// The stored shot row of an entry: the file it was computed from, the
+    /// shots, the failure if there was one, and when. `None` = never analyzed.
+    pub fn shots_for(&self, entry_id: &str) -> Result<Option<ShotRow>, CatalogError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT source_path, shots, error, analyzed_at FROM entry_shots WHERE entry_id = ?1",
+                params![entry_id],
+                shot_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// The shots of the entry whose source plays `path`. `None` when no entry
+    /// plays that path, it was never analyzed, or the analysis failed.
+    pub fn shots_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<Vec<crate::shots::Shot>>, CatalogError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT s.source_path, s.shots, s.error, s.analyzed_at \
+                 FROM entry_shots s JOIN entry_sources p ON p.entry_id = s.entry_id \
+                 WHERE p.playback_path = ?1 AND s.error IS NULL LIMIT 1",
+                params![path],
+                shot_row,
+            )
+            .optional()?;
+        Ok(row.map(|r| r.shots))
+    }
+
+    /// Entries with a live, airable file whose shots were never computed from
+    /// that file, as `(entry_id, playback_path)`, in entry order. A failed
+    /// analysis counts as computed: it waits for the path to change.
+    pub fn entries_needing_shots(&self) -> Result<Vec<(String, String)>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.entry_id, MIN(p.playback_path) FROM entry_sources p \
+             LEFT JOIN entry_shots s ON s.entry_id = p.entry_id \
+             WHERE p.missing_since IS NULL AND p.unairable_reason IS NULL \
+               AND p.playback_path <> '' \
+             GROUP BY p.entry_id \
+             HAVING s.entry_id IS NULL OR s.source_path <> MIN(p.playback_path) \
+             ORDER BY p.entry_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Provenance rows for an entry, ordered by source then id.
     pub fn sources_for(&self, entry_id: &str) -> Result<Vec<EntrySource>, CatalogError> {
         let mut stmt = self.conn.prepare(
@@ -1519,6 +1594,30 @@ impl Catalog {
 /// possibly-drifting copy of this rule.
 pub fn like_escape(raw: &str) -> String {
     raw.replace(['%', '_'], "")
+}
+
+/// A stored shot row ([`Catalog::shots_for`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShotRow {
+    /// The file the shots were computed from.
+    pub source_path: String,
+    pub shots: Vec<crate::shots::Shot>,
+    /// Why there are no shots, when the analysis failed.
+    pub error: Option<String>,
+    pub analyzed_at: String,
+}
+
+fn shot_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShotRow> {
+    let json: String = r.get(1)?;
+    let shots = serde_json::from_str(&json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(ShotRow {
+        source_path: r.get(0)?,
+        shots,
+        error: r.get(2)?,
+        analyzed_at: r.get(3)?,
+    })
 }
 
 /// Run a prepared `entry_sources` query (columns in the canonical `source,
@@ -2411,5 +2510,76 @@ mod tests {
         let sources = c.sources_for("both").unwrap();
         let picked = crate::resolve::pick_playback_source(&sources).unwrap();
         assert_eq!(picked.playback_path, "/plex/both.mkv");
+    }
+    fn playable(c: &Catalog, entry: &str, path: &str) {
+        c.upsert_entry(&Entry::new(entry, "movie", entry, Source::LocalFs))
+            .unwrap();
+        c.add_source(&EntrySource {
+            source: Source::LocalFs,
+            source_id: format!("fs-{entry}"),
+            entry_id: entry.into(),
+            playback_path: path.into(),
+            last_seen: None,
+            missing_since: None,
+            unairable_reason: None,
+        })
+        .unwrap();
+    }
+
+    fn one_shot() -> Vec<crate::shots::Shot> {
+        vec![crate::shots::Shot {
+            start: 0.0,
+            end: 3.0,
+            luma: 0.02,
+            motion: 0.0,
+            card: true,
+        }]
+    }
+
+    #[test]
+    fn an_entry_waits_for_its_shots_until_they_are_stored_for_its_current_file() {
+        let c = cat();
+        playable(&c, "a", "/v/a.mkv");
+        assert_eq!(
+            c.entries_needing_shots().unwrap(),
+            vec![("a".to_string(), "/v/a.mkv".to_string())]
+        );
+
+        c.set_shots("a", "/v/a.mkv", &one_shot(), None).unwrap();
+        assert!(c.entries_needing_shots().unwrap().is_empty());
+        let row = c.shots_for("a").unwrap().unwrap();
+        assert_eq!(row.shots, one_shot());
+        assert_eq!(c.shots_for_path("/v/a.mkv").unwrap(), Some(one_shot()));
+
+        // The file moved: the stored list was about the old one.
+        c.conn
+            .execute("UPDATE entry_sources SET playback_path = '/v/b.mkv'", [])
+            .unwrap();
+        assert_eq!(c.entries_needing_shots().unwrap().len(), 1);
+        assert_eq!(c.shots_for_path("/v/a.mkv").unwrap(), None);
+    }
+
+    #[test]
+    fn a_failed_analysis_is_remembered_and_serves_no_shots() {
+        let c = cat();
+        playable(&c, "a", "/v/a.mkv");
+        c.set_shots("a", "/v/a.mkv", &[], Some("no video stream"))
+            .unwrap();
+        assert!(c.entries_needing_shots().unwrap().is_empty());
+        assert_eq!(c.shots_for_path("/v/a.mkv").unwrap(), None);
+        assert_eq!(
+            c.shots_for("a").unwrap().unwrap().error.as_deref(),
+            Some("no video stream")
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_not_queued_for_analysis() {
+        let c = cat();
+        playable(&c, "a", "/v/a.mkv");
+        c.conn
+            .execute("UPDATE entry_sources SET missing_since = '2026-10-01'", [])
+            .unwrap();
+        assert!(c.entries_needing_shots().unwrap().is_empty());
     }
 }

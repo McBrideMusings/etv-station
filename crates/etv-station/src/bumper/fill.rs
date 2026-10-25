@@ -111,6 +111,8 @@ pub struct FillEnv<'a> {
     /// Directory a bumper's relative overlay script path resolves against.
     pub overlay_root: &'a Path,
     pub history: Option<Arc<HistoryDb>>,
+    /// The catalog `ctx.probe` reads stored shot lists from.
+    pub catalog_path: Option<PathBuf>,
     /// One plan per block index (`ResolvedItem::block`); `None` for a block
     /// that does not align.
     pub plans: Vec<Option<FillPlan>>,
@@ -454,6 +456,7 @@ fn draw_one(
         draw,
         granted: cand.granted.clone(),
         history: env.history.clone(),
+        catalog_path: env.catalog_path.clone(),
     };
     let (built, error) = build_or_black(&cand.script, &input);
     let resolved = match fit(&built.timeline, gap_ms, FILL_FPS) {
@@ -840,6 +843,7 @@ fn build(ctx) {
             tz: tz(),
             overlay_root: root,
             history: None,
+            catalog_path: None,
             plans: vec![Some(plan)],
             item_map: kind,
         };
@@ -1177,6 +1181,7 @@ fn build(ctx) {
             tz: tz(),
             overlay_root: Path::new("."),
             history: None,
+            catalog_path: None,
             plans: vec![None],
             item_map: &plain,
         };

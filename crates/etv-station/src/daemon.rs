@@ -802,6 +802,14 @@ async fn run_generation(
     // (duration probing, catch-up emit) is never lost — unlike `notify_waiters`,
     // which only wakes already-parked waiters.
     let mut stops: Vec<Arc<Notify>> = Vec::new();
+    // The shot-analysis queue: its own catalog handle and its own task, so a
+    // backfill of the whole library never delays a channel's generation.
+    if let Some(info) = catalog {
+        let stop = Arc::new(Notify::new());
+        stops.push(stop.clone());
+        let path = info.path.clone();
+        supervisor_handles.push(tokio::spawn(crate::shots::run_queue(path, stop)));
+    }
     for idx in 0..station.channels.len() {
         if let Some(ctx) = build_overlay_context(&station.channels[idx], &station.station.fonts) {
             let stop = Arc::new(Notify::new());
@@ -2823,6 +2831,7 @@ fn align_fill(
         tz: ctx.tz,
         overlay_root: &overlay_root,
         history: Some(Arc::clone(ctx.history_db)),
+        catalog_path: ctx.catalog.map(|c| c.path.clone()),
         plans,
         item_map: &item_map,
     };

@@ -227,6 +227,22 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE entry_sources ADD COLUMN unairable_reason TEXT;
     "#,
+    // v12 — the shot list of an entry's video: scene boundaries with mean
+    // luma, motion and a card flag, computed from ffmpeg alone (`crate::shots`).
+    // `shots` is a JSON array of `{start, end, luma, motion, card}`. The row
+    // records which file it was computed from (`source_path`), so an entry whose
+    // live file moved is analyzed again; a file that could not be analyzed
+    // stores `error` and an empty list, and is not retried until the path
+    // changes. No row = never analyzed.
+    r#"
+    CREATE TABLE entry_shots (
+        entry_id    TEXT PRIMARY KEY REFERENCES entries(entry_id) ON DELETE CASCADE,
+        source_path TEXT NOT NULL,
+        shots       TEXT NOT NULL,
+        error       TEXT,
+        analyzed_at TEXT NOT NULL
+    );
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.

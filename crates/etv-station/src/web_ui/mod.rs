@@ -285,6 +285,16 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
     {
         return json_reply(api_airing_audit(state, &percent_decode(airing)));
     }
+    if *method == Method::Get
+        && let Some(id) = path
+            .strip_prefix("/api/entries/")
+            .and_then(|rest| rest.strip_suffix("/facts"))
+    {
+        return match crate::shots::entry_facts(&state.catalog, &percent_decode(id)) {
+            Ok(body) => Reply::Json(200, body),
+            Err(error) => Reply::Json(404, json!({ "error": error })),
+        };
+    }
     if let Some(rest) = path.strip_prefix("/api/channels/") {
         let segments: Vec<String> = rest.split('/').map(percent_decode).collect();
         let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
