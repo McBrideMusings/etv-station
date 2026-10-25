@@ -63,8 +63,9 @@ pub use health::HealthSources;
 use health::api_health_channels;
 use lineup::api_lineup;
 use pools::{
-    PoolState, api_draft_discard, api_draft_edit, api_draft_open, api_plex_accounts, api_pools,
-    api_search_item, api_search_keyword, api_search_tag, draft_yaml, scored_channel_count,
+    PoolState, api_audio_fact, api_draft_discard, api_draft_edit, api_draft_open, api_health_audio,
+    api_plex_accounts, api_pools, api_search_item, api_search_keyword, api_search_tag, draft_yaml,
+    scored_channel_count,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
@@ -105,6 +106,7 @@ pub fn serve(options: Options) -> Result<(), String> {
         );
     }
 
+    crate::audio::set_catalog_path(&options.catalog);
     let catalog = Catalog::open_readonly(&options.catalog)
         .map_err(|e| format!("open catalog {}: {e}", options.catalog.display()))?;
     let server = tiny_http::Server::http((options.bind, options.port))
@@ -329,11 +331,17 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
         let (status, body) = api_render(state, &percent_decode(rest));
         return Reply::Json(status, body);
     }
+    if *method == Method::Get
+        && let Some(id) = path.strip_prefix("/api/audio/")
+    {
+        return json_reply(api_audio_fact(state, &percent_decode(id)));
+    }
     let result = match (method, path) {
         (Method::Get, "/") => return Reply::Html(SHELL_HTML),
         (Method::Get, "/assets/hls.min.js") => return Reply::Script(HLS_JS),
         (Method::Get, "/api/health") => Ok(api_health(state)),
         (Method::Get, "/api/health/channels") => api_health_channels(state),
+        (Method::Get, "/api/health/audio") => api_health_audio(state),
         (Method::Get, "/api/lineup") => api_lineup(state),
         (Method::Get, "/api/search/keyword") => api_search_keyword(state, query),
         (Method::Get, "/api/search/tag") => api_search_tag(state, query),
@@ -461,6 +469,41 @@ mod tests {
             Reply::Json(status, body) => (status, body),
             _ => panic!("{path} did not answer JSON"),
         }
+    }
+
+    /// `GET /api/audio/{id}` is what `admin facts` prints, and the Health tab's
+    /// audio line counts analyzed entries of the live total.
+    #[test]
+    fn audio_facts_are_served_per_entry_and_counted_for_health() {
+        use crate::catalog::{Entry, Source};
+        let mut state = example_state();
+        for id in ["a", "b"] {
+            state
+                .catalog
+                .upsert_entry(&Entry::new(id, "movie", id, Source::LocalFs))
+                .unwrap();
+        }
+        state
+            .catalog
+            .set_audio_fact(
+                "a",
+                "/m/a.mp4",
+                "2026-01-01T00:00:00Z",
+                Ok(&json!({"bpm": 120.0})),
+            )
+            .unwrap();
+
+        let (status, body) = get_json(&mut state, "/api/audio/a");
+        assert_eq!((status, body["facts"]["bpm"].clone()), (200, json!(120.0)));
+        let (_, body) = get_json(&mut state, "/api/audio/b");
+        assert_eq!(body["analyzed"], json!(false));
+        assert_eq!(get_json(&mut state, "/api/audio/nope").0, 404);
+
+        let (_, body) = get_json(&mut state, "/api/health/audio");
+        assert_eq!(
+            (body["analyzed"].clone(), body["total"].clone()),
+            (json!(1), json!(2))
+        );
     }
 
     /// The Health endpoint over a diag folder: a software argv fails, a

@@ -227,6 +227,20 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE entry_sources ADD COLUMN unairable_reason TEXT;
     "#,
+    // v12 — audio facts (tempo, beat grid, key, bar energy) per entry, written
+    // by the analyzer queue. `facts` is the analyzer's JSON verbatim; a row
+    // with `error` set records a failed run against `source_path`, so the
+    // queue skips that file until the entry's path changes. No row = not yet
+    // analyzed.
+    r#"
+    CREATE TABLE entry_audio (
+        entry_id    TEXT PRIMARY KEY REFERENCES entries(entry_id) ON DELETE CASCADE,
+        source_path TEXT NOT NULL,
+        analyzed_at TEXT NOT NULL,
+        error       TEXT,
+        facts       TEXT
+    );
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.

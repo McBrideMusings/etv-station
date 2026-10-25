@@ -131,9 +131,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxml2-utils \
         mesa-vulkan-drivers \
         python3 \
+        python3-venv \
         tcpdump \
         tini \
     && rm -rf /var/lib/apt/lists/*
+
+# The audio analyzer (tools/audio-analyze.py): Essentia for tempo, beats and key,
+# librosa for onset strength and RMS. A venv keeps the wheels off the system
+# python, and the installed script's shebang points into it, so
+# ETV_STATION_AUDIO_ANALYZER's default (`audio-analyze` on PATH) needs nothing
+# else. Pinned to the versions tools/audio-analyze-check.py passed against.
+RUN python3 -m venv /opt/audio-venv \
+    && /opt/audio-venv/bin/pip install --no-cache-dir \
+        essentia==2.1b6.dev1389 librosa==1.0.0 numpy==2.5.4
+COPY tools/audio-analyze.py /usr/local/bin/audio-analyze
+RUN sed -i '1s|.*|#!/opt/audio-venv/bin/python|' /usr/local/bin/audio-analyze \
+    && chmod 755 /usr/local/bin/audio-analyze
 
 # The container runs as uid 1000, and a plain non-root process cannot open the
 # packet socket tcpdump needs. A file capability grants that one binary the one

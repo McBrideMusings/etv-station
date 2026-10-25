@@ -88,6 +88,12 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         );
         return Ok(());
     }
+    // The audio-fact queue runs on its own thread against the catalog file, so a
+    // library backfill never delays a generation.
+    if let Some(path) = &station.station.catalog_path {
+        crate::audio::set_catalog_path(path);
+        crate::audio::spawn_queue(PathBuf::from(path), signals.cancel.clone());
+    }
     // What the catalog was opened against — the catalog is opened once and NOT
     // reopened on reload (#96), so a later reload that changes these diverges.
     let opened_catalog_path = station.station.catalog_path.clone();

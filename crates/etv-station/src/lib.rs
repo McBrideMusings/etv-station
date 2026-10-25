@@ -2,6 +2,7 @@ pub mod account;
 pub mod annotate;
 pub mod arcs_import;
 pub mod atomic;
+pub mod audio;
 pub mod audit;
 pub mod audit_report;
 pub mod backfill;

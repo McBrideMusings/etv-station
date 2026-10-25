@@ -35,7 +35,10 @@
 //!   probed. `tags` is the container's metadata (ComfyUI writes `prompt` and
 //!   `workflow` there), keys lower-cased; each stream map has `index`, `kind`,
 //!   `codec`, `lang`, `width`, `height`, `channels` and its own lower-cased
-//!   `tags`.
+//!   `tags`. When the catalog holds audio facts for the file, the map also
+//!   has `audio` (`bpm`, `beat_grid`, `downbeat_phase`, `landing_bar`, `key`,
+//!   `scale`, `camelot`, `key_strength`, `beat_confidence`, `bar_energy`,
+//!   `rms_mean`; see `tools/audio-analyze.py`); it is absent otherwise.
 //! - `read` — `ctx.read(path)` returns a UTF-8 text file from the plugin's own
 //!   folder (up to [`READ_LIMIT_BYTES`]), or `()` when it does not exist. A path
 //!   that resolves outside that folder is an error.
@@ -695,7 +698,13 @@ impl Host {
             "bumper script probed a file"
         );
         match probed {
-            Some(value) => rhai::serde::to_dynamic(value),
+            Some(mut value) => {
+                // `audio` is present only for a file the analyzer has run on.
+                if let Some(audio) = crate::audio::facts_for_path(path) {
+                    value["audio"] = audio;
+                }
+                rhai::serde::to_dynamic(value)
+            }
             None => Ok(Dynamic::UNIT),
         }
     }
@@ -1736,6 +1745,75 @@ fn build(ctx) {{
             panic!("probe duration became {:?}", seg.duration)
         };
         assert!((1500..1520).contains(&ms), "{ms}");
+    }
+
+    /// `ctx.probe(path).audio.bpm` reads the facts the catalog holds for the
+    /// entry that plays from `path`; a probed file with no facts has no `audio`.
+    #[test]
+    fn probe_carries_the_catalogs_audio_facts_when_the_file_was_analyzed() {
+        use crate::catalog::{Catalog, Entry, EntrySource, Source};
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("song.mkv");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=44100:cl=mono",
+            ])
+            .args(["-t", "1"])
+            .arg(&media)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let plain = dir.path().join("plain.mkv");
+        std::fs::copy(&media, &plain).unwrap();
+
+        let catalog_path = dir.path().join("catalog.db");
+        let cat = Catalog::open(&catalog_path).unwrap();
+        cat.upsert_entry(&Entry::new("song", "movie", "Song", Source::LocalFs))
+            .unwrap();
+        cat.add_source(&EntrySource {
+            source: Source::LocalFs,
+            source_id: "song".into(),
+            entry_id: "song".into(),
+            playback_path: media.display().to_string(),
+            last_seen: None,
+            missing_since: None,
+            unairable_reason: None,
+        })
+        .unwrap();
+        cat.set_audio_fact(
+            "song",
+            &media.display().to_string(),
+            "2026-01-01T00:00:00Z",
+            Ok(&serde_json::json!({"bpm": 128.5, "beat_grid": {"beats": 64}})),
+        )
+        .unwrap();
+        crate::audio::set_catalog_path(&catalog_path);
+
+        let path = script(
+            &dir,
+            &format!(
+                r#"fn hooks() {{ ["bumper"] }}
+fn capabilities() {{ ["probe"] }}
+fn build(ctx) {{
+    let a = ctx.probe("{m}");
+    let b = ctx.probe("{p}");
+    if "audio" in b {{ throw "an unanalyzed file must have no audio"; }}
+    let t = timeline();
+    t.push(segment().black().fixed_ms(1000).name(`${{a.audio.bpm}}|${{a.audio.beat_grid.beats}}`));
+    t
+}}"#,
+                m = media.display(),
+                p = plain.display()
+            ),
+        );
+        let built = build(&path, &granted(&["probe"])).unwrap();
+        assert_eq!(built.timeline.segments[0].name, "128.5|64");
     }
 
     fn ledger_with_a_programme_and_two_bumpers() -> Arc<HistoryDb> {

@@ -15,6 +15,7 @@
 //! assert!(cat.entry("imdb:tt0076759").unwrap().is_some());
 //! ```
 
+pub mod audio;
 pub mod error;
 pub mod fields;
 pub mod identity;
