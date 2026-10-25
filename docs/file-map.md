@@ -6,7 +6,7 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 
 | Path | What |
 |---|---|
-| `Cargo.toml` | Workspace manifest. Members: `crates/etv-station`, `crates/etv-query-test`, `crates/etv-overlay`, `vendor/plexdb-reader`. Excludes `vendor/etv-next`. |
+| `Cargo.toml` | Workspace manifest. Members: `crates/etv-station`, `crates/etv-render`, `crates/etv-query-test`, `crates/etv-overlay`, `vendor/plexdb-reader`. Excludes `vendor/etv-next`. |
 | `Cargo.lock` | Workspace lockfile. |
 | `package.json` | VitePress devDep + `docs:dev` / `docs:build` scripts. Docs-only; no runtime JS. |
 | `bun.lock` | Bun lockfile for the docs `package.json`. |
@@ -24,6 +24,8 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | Path | What |
 |---|---|
 | `crates/etv-station/` | The daemon binary crate. |
+| `crates/etv-render/` | Chapter renderer library: plan format (`plan.rs`), Demucs stems (`stems.rs`), audio filter graph (`audio.rs`), video cuts (`video.rs`), job queue and sidecar loop (`queue.rs`), cache eviction (`cache.rs`), dependency detection (`deps.rs`). Fixture plan under `tests/fixtures/`. |
+| `crates/etv-station/src/renderer.rs` | Resolves the `renderer:` paths and implements the `render`, `enqueue` and `render-sidecar` commands. |
 | `crates/etv-query-test/` | Phase A CEL feasibility harness. Queries Plex + FS catalogs with CEL; see `./tools/query.sh`. |
 | `crates/etv-query-test/src/cel_eval.rs` | CEL compile + per-item eval. Case-insensitive; custom helpers: `season_in`, `icontains`, `in_collection`, `has_category`, `shorter_than`, `longer_than`, `keyword_score`. |
 | `crates/etv-query-test/src/plex.rs` | Read-only Plex HTTP client: section/show/collection ingestion, show-collection enrichment, path translation, `type_from_section`. |

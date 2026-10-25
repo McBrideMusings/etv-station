@@ -6,6 +6,29 @@ use serde::{Deserialize, Serialize};
 
 use super::overlay::OverlayDecl;
 
+/// The `renderer:` section of the station config. See `docs/schema.md` § Chapter renderer.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RendererConfig {
+    /// Directory the sidecar watches: one `<id>.plan.json` and `<id>.state.json`
+    /// per job. `ETV_RENDER_QUEUE_DIR` overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_dir: Option<String>,
+    /// Directory for separated stems and scratch files. `ETV_RENDER_CACHE_DIR` overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<String>,
+    /// Gigabytes the rendered chapters and stems may take before the oldest
+    /// aired chapter is evicted. `ETV_RENDER_CACHE_CAP_GB` overrides. Default 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_cap_gb: Option<u64>,
+}
+
+impl RendererConfig {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct StationConfig {
     #[serde(default = "default_tz")]
@@ -115,6 +138,13 @@ pub struct StationConfig {
     /// `catalog_path`'s own override convention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artwork_cache_dir: Option<String>,
+
+    /// Where the chapter renderer's queue and cache live and how large the
+    /// cache may grow (`renderer:` in the station config). Unset leaves the
+    /// renderer unconfigured: `enqueue` refuses, `render-sidecar` exits, and the
+    /// dashboard's Health tab says so. Each key has an `ETV_RENDER_*` override.
+    #[serde(default, skip_serializing_if = "RendererConfig::is_empty")]
+    pub renderer: RendererConfig,
 
     /// How long a freshly ingested catalog is trusted without contacting Plex at
     /// all, in seconds. Two things read it, both meaning the same thing:

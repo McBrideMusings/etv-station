@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/etv-station", "crates/etv-query-test", "crates/etv-overlay", "vendor/plexdb-reader"]
+members = ["crates/etv-station", "crates/etv-render", "crates/etv-query-test", "crates/etv-overlay", "vendor/plexdb-reader"]
 exclude = ["vendor/etv-next"]
 resolver = "3"
 
@@ -11,6 +11,7 @@ ffpipeline = { path = "vendor/etv-next/crates/ffpipeline" }
 ersatztv-playout = { path = "vendor/etv-next/crates/ersatztv-playout" }
 etv-station = { path = "crates/etv-station" }
 etv-overlay = { path = "crates/etv-overlay" }
+etv-render = { path = "crates/etv-render" }
 plexdb-reader = { path = "vendor/plexdb-reader" }
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }

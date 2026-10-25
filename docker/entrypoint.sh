@@ -327,6 +327,31 @@ log "serving on ${ETV_BIND_ADDRESS:-0.0.0.0}:${ETV_PORT:-8409}"
 diag_pids+=($!)
 log "web UI starting on ${ETV_UI_BIND:-0.0.0.0}:${ETV_UI_PORT:-4747}"
 
+# 4c. The chapter renderer's sidecar (`etv-station render-sidecar`): drains the
+# queue of chapter plans one at a time. Same non-fatal shape as the web UI. It
+# exits 78 when the station config and environment name no queue or cache; that
+# is the renderer being off, so the loop ends instead of restarting it forever.
+# nice 19 keeps a Demucs separation from taking CPU the channels' transcodes use.
+(
+    sc_pid=
+    trap 'trap - EXIT; [ -n "$sc_pid" ] && kill -TERM "$sc_pid" 2>/dev/null; exit 0' TERM INT
+    while true; do
+        run_logged nice -n 19 etv-station --config "$ETV_STATION_CONFIG" \
+            --log-format "$ETV_LOG_FORMAT" render-sidecar
+        sc_pid=$!
+        wait "$sc_pid"
+        sc_status=$?
+        if [ "$sc_status" -eq 78 ]; then
+            log "chapter renderer not configured (renderer.queue_dir / cache_dir) — sidecar not running"
+            exit 0
+        fi
+        log "WARNING: render sidecar exited (status $sc_status); restarting in 10s"
+        sleep 10 &
+        wait $!
+    done
+) &
+diag_pids+=($!)
+
 # 5. Soak-test probe loop (#297): a third background process, same non-fatal
 # shape as the diagnostics above — its pid goes into diag_pids so shutdown()
 # reaps it, but it is never assigned to station_pid/etv_pid, so it is never

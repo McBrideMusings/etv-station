@@ -943,6 +943,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "etv-render"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tracing",
+]
+
+[[package]]
 name = "etv-station"
 version = "0.1.0"
 dependencies = [
@@ -953,6 +966,7 @@ dependencies = [
  "ersatztv-core",
  "ersatztv-playout",
  "etv-overlay",
+ "etv-render",
  "ffpipeline",
  "glob",
  "humantime",

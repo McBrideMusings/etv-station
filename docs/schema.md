@@ -3322,6 +3322,51 @@ subtitle:
 still turn them off. It is a setting of the channel, because HLS attaches it to
 the whole session's subtitle rendition and it cannot vary per item.
 
+## Chapter renderer
+
+The image ships a renderer that turns a **chapter plan** into one video file, and a sidecar that drains a queue of plans ahead of air. The station core only holds the plan, the queue and the cache; which songs a plan names, and when it is queued, is a plugin's decision.
+
+### Chapter plan
+
+A JSON document. Unknown keys are refused. `crates/etv-render/tests/fixtures/chapter.plan.json` is a checked-in example.
+
+| Key | Meaning |
+|---|---|
+| `bpm` | Chapter tempo; every audio layer is stretched to it. |
+| `key`, `camelot` | The chapter key (`A minor`) and its Camelot code (`8A`). Audit record only. |
+| `bar_seconds` | Seconds in one bar: `240 / bpm`, within 1 ms, or the plan is refused. |
+| `hooks` | The songs in air order: `entry_id`, `path`, `landing_s` (where the hook's landing bar starts in the file), `native_bpm`, `semitones` (moved to reach the chapter key), `vocal_over_bars` (bars this song's vocal sings over the previous song's instrumental; 0 for the first hook), `full_bars` (bars of vocal and instrumental together after that). |
+| `broll` | Optional video-only sources, `{entry_id, path}`, that cuts may draw from besides the hooks. |
+| `cuts` | The picture, in air order, with no gap: `entry_id` (a hook or B-roll source), `native_start_s`, `out_start_s`, `length_s`, `ratio` (source seconds per chapter second). |
+| `cards` | `{at_s, artist, title, year?}`. The renderer does not draw them; the overlay does. |
+| `output` | Where the rendered file lands. |
+
+The chapter lasts `bar_seconds` times the sum of every hook's `vocal_over_bars` and `full_bars`.
+
+### Rendering
+
+`etv-station render <plan.json>` renders one plan and exits non-zero with the failing layer named. Per hook it separates the region from 4 bars before `landing_s` to 18 bars after into vocals and instrumental with Demucs (two-stem), cached by entry and region under the cache directory. Each audio layer is trimmed, stretched to `bpm` with ffmpeg's `rubberband` filter, shifted by `semitones`, gained to a target RMS, faded and delayed; the layers are mixed and limited. Each cut becomes a 1080p segment from its source at `ratio`, and the segments are concatenated. The encoder is the hardware one named by `ETV_ACCEL` when the image's ffmpeg lists it, else libx264.
+
+### Queue and sidecar
+
+`etv-station enqueue <plan.json> [--air-at <RFC 3339>]` writes the plan into the queue directory and prints its job id at once. The same plan queued twice is one job. `etv-station render-sidecar`, started by the container entrypoint, renders queued plans one at a time. Each job has a state file, `<id>.state.json`, with `status` (`queued`, `running`, `done`, `failed`), the failing layer and last error, and timings. The sidecar exits 78 when no queue or cache is configured, and the entrypoint then leaves it off.
+
+The cache is capped. When rendered chapters and stems pass the cap, chapters whose `--air-at` has passed are removed oldest first; a chapter within 30 minutes of air, or with no air time, is never removed.
+
+### Station config
+
+| Key | Environment override | Meaning |
+|---|---|---|
+| `renderer.queue_dir` | `ETV_RENDER_QUEUE_DIR` | Directory the sidecar watches. |
+| `renderer.cache_dir` | `ETV_RENDER_CACHE_DIR` | Stems and scratch files. |
+| `renderer.cache_cap_gb` | `ETV_RENDER_CACHE_CAP_GB` | Cache cap in gigabytes; default 20. |
+
+The image also reads `ETV_RENDER_PYTHON` (the interpreter with Demucs and PyTorch; `/opt/render-venv/bin/python` in the image), `ETV_RENDER_FFMPEG` and `ETV_RENDER_FFPROBE`.
+
+### Health
+
+`GET /api/health/renders` on the web UI lists jobs by state with each failed job's layer and error, the cache against its cap, and Demucs, PyTorch, librubberband, ffmpeg and the encoder as `detected` or `missing` with the reason. The Health tab shows the same.
+
 ## Sample configs
 
 The committed samples under `examples/` are authored in YAML:
