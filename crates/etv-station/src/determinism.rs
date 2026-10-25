@@ -322,6 +322,7 @@ mod tests {
                 identity_roots: Vec::new(),
                 catalog_path,
                 artwork_cache_dir: None,
+                renderer: Default::default(),
                 catalog_refresh_secs: 0,
                 full_sweep_after_secs: 0,
                 ffmpeg: crate::config::station::default_ffmpeg(),

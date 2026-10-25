@@ -1,0 +1,38 @@
+{
+  "bpm": 120.0,
+  "key": "A minor",
+  "camelot": "8A",
+  "bar_seconds": 2.0,
+  "hooks": [
+    {
+      "entry_id": "fixture-a",
+      "path": "@DIR@/source.mp4",
+      "landing_s": 24.0,
+      "native_bpm": 100.0,
+      "semitones": 0,
+      "vocal_over_bars": 0,
+      "full_bars": 4
+    },
+    {
+      "entry_id": "fixture-b",
+      "path": "@DIR@/source.mp4",
+      "landing_s": 20.0,
+      "native_bpm": 130.0,
+      "semitones": -2,
+      "vocal_over_bars": 2,
+      "full_bars": 4
+    }
+  ],
+  "cuts": [
+    { "entry_id": "fixture-a", "native_start_s": 24.0, "out_start_s": 0.0, "length_s": 3.0, "ratio": 0.8333 },
+    { "entry_id": "fixture-a", "native_start_s": 26.5, "out_start_s": 3.0, "length_s": 5.0, "ratio": 0.8333 },
+    { "entry_id": "fixture-b", "native_start_s": 20.0, "out_start_s": 8.0, "length_s": 4.0, "ratio": 1.0833 },
+    { "entry_id": "fixture-b", "native_start_s": 24.3, "out_start_s": 12.0, "length_s": 5.5, "ratio": 1.0833 },
+    { "entry_id": "fixture-a", "native_start_s": 30.0, "out_start_s": 17.5, "length_s": 2.5, "ratio": 1.0 }
+  ],
+  "cards": [
+    { "at_s": 0.0, "artist": "Fixture A", "title": "First Song", "year": 1999 },
+    { "at_s": 8.0, "artist": "Fixture B", "title": "Second Song" }
+  ],
+  "output": "@DIR@/out/chapter.mp4"
+}

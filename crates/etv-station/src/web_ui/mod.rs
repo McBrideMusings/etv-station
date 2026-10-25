@@ -106,7 +106,6 @@ pub fn serve(options: Options) -> Result<(), String> {
         );
     }
 
-    crate::audio::set_catalog_path(&options.catalog);
     let catalog = Catalog::open_readonly(&options.catalog)
         .map_err(|e| format!("open catalog {}: {e}", options.catalog.display()))?;
     let server = tiny_http::Server::http((options.bind, options.port))
@@ -287,6 +286,16 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
     {
         return json_reply(api_airing_audit(state, &percent_decode(airing)));
     }
+    if *method == Method::Get
+        && let Some(id) = path
+            .strip_prefix("/api/entries/")
+            .and_then(|rest| rest.strip_suffix("/facts"))
+    {
+        return match crate::shots::entry_facts(&state.catalog, &percent_decode(id)) {
+            Ok(body) => Reply::Json(200, body),
+            Err(error) => Reply::Json(404, json!({ "error": error })),
+        };
+    }
     if let Some(rest) = path.strip_prefix("/api/channels/") {
         let segments: Vec<String> = rest.split('/').map(percent_decode).collect();
         let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
@@ -342,6 +351,7 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
         (Method::Get, "/api/health") => Ok(api_health(state)),
         (Method::Get, "/api/health/channels") => api_health_channels(state),
         (Method::Get, "/api/health/audio") => api_health_audio(state),
+        (Method::Get, "/api/health/renders") => health::api_health_renders(state),
         (Method::Get, "/api/lineup") => api_lineup(state),
         (Method::Get, "/api/search/keyword") => api_search_keyword(state, query),
         (Method::Get, "/api/search/tag") => api_search_tag(state, query),
@@ -504,6 +514,46 @@ mod tests {
             (body["analyzed"].clone(), body["total"].clone()),
             (json!(1), json!(2))
         );
+    }
+
+    /// `/api/health/renders` reports a queued plan under `queued`, and names
+    /// the renderer's dependencies whether or not a queue is configured.
+    #[test]
+    fn health_renders_lists_jobs_by_state_and_the_dependencies() {
+        let mut state = example_state();
+        let (status, body) = get_json(&mut state, "/api/health/renders");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["configured"], false);
+        let names: Vec<&str> = body["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.to_lowercase().contains("demucs")),
+            "{names:?}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../etv-render/tests/fixtures/chapter.plan.json");
+        let plan =
+            etv_render::plan::Plan::parse(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+        let queue = etv_render::queue::Queue::new(dir.path().join("queue"));
+        let job = queue
+            .enqueue(&plan, None, time::OffsetDateTime::now_utc())
+            .unwrap();
+        state.options.health.renderer = Some(crate::renderer::RendererPaths {
+            queue_dir: dir.path().join("queue"),
+            cache_dir: dir.path().join("cache"),
+            cache_cap_bytes: 1_000_000,
+        });
+        let (status, body) = get_json(&mut state, "/api/health/renders");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["counts"]["queued"], 1);
+        assert_eq!(body["jobs"]["queued"][0]["id"], job.id);
     }
 
     /// The Health endpoint over a diag folder: a software argv fails, a

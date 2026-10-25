@@ -98,6 +98,7 @@ pub fn preview(req: &PreviewRequest<'_>) -> Result<Preview, String> {
             draw: 0,
             granted,
             history: None,
+            catalog_path: None,
         },
     )
     .map_err(|e| e.to_string())?;

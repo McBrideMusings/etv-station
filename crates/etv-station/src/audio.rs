@@ -38,22 +38,12 @@ const BATCH: usize = 50;
 /// How long the queue sleeps when it has nothing to do or no analyzer.
 const IDLE: Duration = Duration::from_secs(60);
 
-static CATALOG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-
-/// Record the catalog file `ctx.probe(path).audio` reads from. The daemon and
-/// the dashboard each call it once, with the file they opened their catalog at;
-/// a later call is ignored, matching a catalog that is opened once and not
-/// reopened on reload.
-pub fn set_catalog_path(path: impl Into<PathBuf>) {
-    let _ = CATALOG_PATH.set(path.into());
-}
-
-/// The stored audio facts for the entry that plays from `playback_path`, or
-/// `None` when no catalog path is set, the file has not been analyzed, or the
-/// catalog cannot be read (logged).
-pub fn facts_for_path(playback_path: &str) -> Option<serde_json::Value> {
-    let path = CATALOG_PATH.get()?;
-    let read = Catalog::open_readonly(path).and_then(|c| c.audio_facts_for_path(playback_path));
+/// The stored audio facts for the entry that plays from `playback_path`, read
+/// from the catalog file at `catalog`; `None` when the file has not been
+/// analyzed or the catalog cannot be read (logged). `ctx.probe` returns it
+/// under `audio`.
+pub fn facts_for_path(catalog: &Path, playback_path: &str) -> Option<serde_json::Value> {
+    let read = Catalog::open_readonly(catalog).and_then(|c| c.audio_facts_for_path(playback_path));
     match read {
         Ok(facts) => facts,
         Err(e) => {

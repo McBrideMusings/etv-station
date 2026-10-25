@@ -600,9 +600,10 @@ async function loadHealth() {
   const tick = () => { if ($('hstate')) $('hstate').innerHTML = `<span class="spinner"></span>Reading channel health… (${Math.round((Date.now() - began) / 1000)}s)`; };
   tick();
   const timer = setInterval(tick, 1000);
-  let build = {}, data, audio = null;
+  let build = {}, data, renders = null, audio = null;
   try {
-    const [h, c, a] = await Promise.all([fetch('/api/health'), fetch('/api/health/channels'), fetch('/api/health/audio')]);
+    const [h, c, rr, a] = await Promise.all([fetch('/api/health'), fetch('/api/health/channels'), fetch('/api/health/renders'), fetch('/api/health/audio')]);
+    renders = await rr.json().catch(() => null);
     build = await h.json().catch(() => ({}));
     audio = await a.json().catch(() => null);
     data = await c.json().catch(() => ({}));
@@ -618,7 +619,7 @@ async function loadHealth() {
   if (data.error) {
     $('report').innerHTML = head + `<div class="error">${esc(data.error)}</div>`;
   } else {
-    $('report').innerHTML = head + drawAudioHealth(audio) + drawHealth(data);
+    $('report').innerHTML = head + drawAudioHealth(audio) + drawHealth(data) + drawRenders(renders);
   }
   $('healthReload').addEventListener('click', loadHealth);
 }
@@ -659,6 +660,19 @@ function drawHealth(d) {
   const diag = d.diag && !d.diag.readable
     ? `<div class="notice">The diag folder ${esc(d.diag.dir || '(unset)')} cannot be read, so no channel has an argv log or stall history here (ETV_DIAG_DIR).</div>` : '';
   return `${upstream}${diag}${expected}<table class="health"><thead><tr><th class="num">Channel</th><th>Name</th><th>Encoder</th><th>Failures</th><th>Last stall</th><th class="num">Argv log age</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function drawRenders(r) {
+  if (!r || r.error) return `<h3>Chapter renderer</h3><div class="error">${esc(r && r.error ? r.error : 'no answer from /api/health/renders')}</div>`;
+  const deps = (r.dependencies || []).map((d) =>
+    `<tr><td>${esc(d.name)}</td><td class="${d.status === 'missing' ? 'v-fail' : ''}">${esc(d.status)}</td><td>${esc(d.detail)}</td></tr>`).join('');
+  const depTable = `<table class="health"><thead><tr><th>Dependency</th><th>Status</th><th>Detail</th></tr></thead><tbody>${deps}</tbody></table>`;
+  if (!r.configured) return `<h3>Chapter renderer</h3><p class="muted">${esc(r.reason)}</p>${depTable}`;
+  const jobs = Object.values(r.jobs || {}).flat().map((j) =>
+    `<tr><td>${esc(j.id)}</td><td class="${j.status === 'failed' ? 'v-fail' : ''}">${esc(j.status)}</td><td>${esc(j.failed_layer || '')}</td><td>${esc(j.last_error || '')}</td></tr>`).join('');
+  const counts = Object.entries(r.counts || {}).map(([k, v]) => `${esc(k)} ${esc(v)}`).join(' · ');
+  return `<h3>Chapter renderer</h3><p class="muted">${counts} · cache ${esc(r.cache_bytes)} of ${esc(r.cache_cap_bytes)} bytes</p>${depTable}
+    <table class="health"><thead><tr><th>Job</th><th>State</th><th>Failed layer</th><th>Last error</th></tr></thead><tbody>${jobs}</tbody></table>`;
 }
 
 let shown = null;   // the channel and projection the report holds, so a sub-tab switch redraws without refetching

@@ -32,6 +32,7 @@ pub mod pattern;
 pub mod plugin_http;
 pub mod profile;
 pub mod reconcile;
+pub mod renderer;
 pub mod reset;
 pub mod resolve;
 pub mod resume;
@@ -41,6 +42,7 @@ pub mod rule;
 pub mod scan;
 pub mod score;
 pub mod sequence;
+pub mod shots;
 pub mod simulate;
 pub mod suggest;
 #[cfg(test)]

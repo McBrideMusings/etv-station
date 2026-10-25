@@ -264,12 +264,40 @@ enum Command {
     /// One seed set per run — infer each distinct group separately.
     SuggestCategory(SuggestCategoryArgs),
 
+    /// Print the facts the catalog holds about one entry as JSON: today its
+    /// shot list (scene boundaries with luma, motion and a card flag).
+    Facts(FactsArgs),
+
     /// Write a show's arc ranges (#163) from anibridge/anibridge-mappings (#171).
     ///
     /// The source has season boundaries and no names, so each arc is named
     /// `Season N` as a placeholder for a person to replace before committing.
     /// Overlaps and gaps in the source are written as published and reported.
     ImportArcs(ImportArcsArgs),
+
+    /// Render one chapter plan to its output file now, and exit non-zero with
+    /// the failing layer named if it cannot. Needs the renderer's cache
+    /// directory (`renderer.cache_dir` or `ETV_RENDER_CACHE_DIR`).
+    Render {
+        /// The chapter plan (JSON); the format is in docs/schema.md.
+        plan: PathBuf,
+    },
+
+    /// Put a chapter plan on the renderer's queue and print its job id at once.
+    /// The same plan queued twice is one job. Needs `renderer.queue_dir` or
+    /// `ETV_RENDER_QUEUE_DIR`.
+    Enqueue {
+        /// The chapter plan (JSON); the format is in docs/schema.md.
+        plan: PathBuf,
+        /// When the chapter airs (RFC 3339). Cache eviction orders by it and
+        /// never removes a chapter within 30 minutes of it.
+        #[arg(long, value_name = "TIME")]
+        air_at: Option<String>,
+    },
+
+    /// Watch the renderer's queue and render plans one at a time until killed.
+    /// The container entrypoint runs this beside the daemon.
+    RenderSidecar,
 }
 
 #[derive(clap::Args, Debug)]
@@ -308,6 +336,16 @@ struct SuggestCategoryArgs {
     /// Candidates kept per tag namespace.
     #[arg(long, value_name = "N", default_value_t = 15)]
     top: usize,
+
+    /// Catalog database to read, instead of the station config's `catalog_path`.
+    #[arg(long, value_name = "PATH")]
+    catalog: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug)]
+struct FactsArgs {
+    /// The catalog `entry_id` to print.
+    entry: String,
 
     /// Catalog database to read, instead of the station config's `catalog_path`.
     #[arg(long, value_name = "PATH")]
@@ -374,12 +412,38 @@ fn main() -> ExitCode {
         return bumper_preview(cli.config.as_deref(), args);
     }
 
+    if let Some(Command::Facts(args)) = &cli.command {
+        return facts(cli.config.as_deref(), args);
+    }
+
     if let Some(Command::SuggestCategory(args)) = &cli.command {
         return suggest_category(cli.config.as_deref(), args);
     }
 
     if let Some(Command::ImportArcs(args)) = &cli.command {
         return import_arcs(args);
+    }
+
+    // The renderer's commands read the `renderer:` section when `--config` is
+    // given and the environment when it is not, so a plugin's `ctx.exec` can
+    // call `enqueue` without knowing where the station config lives.
+    match &cli.command {
+        Some(Command::Render { plan }) => {
+            init_tracing(cli.log_format);
+            return etv_station::renderer::cli::render(cli.config.as_deref(), plan);
+        }
+        Some(Command::Enqueue { plan, air_at }) => {
+            return etv_station::renderer::cli::enqueue(
+                cli.config.as_deref(),
+                plan,
+                air_at.as_deref(),
+            );
+        }
+        Some(Command::RenderSidecar) => {
+            init_tracing(cli.log_format);
+            return etv_station::renderer::cli::sidecar(cli.config.as_deref());
+        }
+        _ => {}
     }
 
     // First, and before `--config` is even resolved: this is the one mode that
@@ -791,7 +855,13 @@ fn serve_ui(
         plugins_dir,
         bind,
         port,
-        health: etv_station::web_ui::HealthSources::from_env(),
+        health: {
+            let mut health = etv_station::web_ui::HealthSources::from_env();
+            // Unconfigured stays None: the Health tab then says what is missing.
+            health.renderer =
+                etv_station::renderer::RendererPaths::from_env(&station.station.renderer).ok();
+            health
+        },
     };
     match etv_station::web_ui::serve(options) {
         Ok(()) => ExitCode::SUCCESS,
@@ -1627,6 +1697,33 @@ fn open_preview_catalog(config_path: &Path) -> Result<Catalog, String> {
         )
     })?;
     Catalog::open_readonly(&path).map_err(|e| format!("opening catalog {path}: {e}"))
+}
+
+fn facts(config_path: Option<&Path>, args: &FactsArgs) -> ExitCode {
+    let fail = |msg: String| {
+        eprintln!("facts: {msg}");
+        ExitCode::from(1)
+    };
+    let catalog = match (&args.catalog, config_path) {
+        (Some(path), _) => Catalog::open_readonly(path)
+            .map_err(|e| format!("opening catalog {}: {e}", path.display())),
+        (None, Some(config)) => open_preview_catalog(config),
+        (None, None) => Err("pass --catalog or --config".to_string()),
+    };
+    let catalog = match catalog {
+        Ok(c) => c,
+        Err(e) => return fail(e),
+    };
+    match etv_station::shots::entry_facts(&catalog, &args.entry) {
+        Ok(facts) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&facts).expect("facts are JSON")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(e),
+    }
 }
 
 fn suggest_category(config_path: Option<&Path>, args: &SuggestCategoryArgs) -> ExitCode {

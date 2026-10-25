@@ -148,6 +148,18 @@ COPY tools/audio-analyze.py /usr/local/bin/audio-analyze
 RUN sed -i '1s|.*|#!/opt/audio-venv/bin/python|' /usr/local/bin/audio-analyze \
     && chmod 755 /usr/local/bin/audio-analyze
 
+# The chapter renderer's stem separation: Demucs on CPU PyTorch, in its own
+# virtualenv so the system python3 the diagnostics use is untouched.
+# ETV_RENDER_PYTHON points the renderer at it; the Health tab reports Demucs and
+# PyTorch as detected or missing. Tempo changes use ffmpeg's rubberband filter,
+# which needs an ffmpeg built with librubberband — the Health tab reports that
+# too, because the base image's ffmpeg build decides it, not this file.
+RUN python3 -m venv /opt/render-venv \
+    && /opt/render-venv/bin/pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu torch torchaudio \
+    && /opt/render-venv/bin/pip install --no-cache-dir demucs soundfile
+ENV ETV_RENDER_PYTHON=/opt/render-venv/bin/python
+
 # The container runs as uid 1000, and a plain non-root process cannot open the
 # packet socket tcpdump needs. A file capability grants that one binary the one
 # capability, which is narrower than either running the whole container as root
@@ -200,14 +212,16 @@ COPY --chmod=755 tools/ffmpeg-probe.sh /usr/local/bin/ffmpeg-probe.sh
 # uid the container was told to run as, which on this deploy is not writable
 # ("Failed to create /root/.cache for shader cache"). Every ffmpeg spawn then
 # recompiles. It is on /data so it survives a container recreate.
-RUN mkdir -p /config /data /data/cache \
-    && chown etv:etv /config /data /data/cache
+RUN mkdir -p /config /data /data/cache /data/render \
+    && chown etv:etv /config /data /data/cache /data/render
 
 ENV XDG_CACHE_HOME=/data/cache \
     ETV_STATION_CONFIG=/config/station.yaml \
     ETV_NEXT_DIR=/config/etv-next \
     ETV_STATION_OUTPUT_BASE=/data/playout \
     ETV_STATION_CATALOG=/data/catalog.db \
+    ETV_RENDER_QUEUE_DIR=/data/render/queue \
+    ETV_RENDER_CACHE_DIR=/data/render/cache \
     ETV_STATION_ARTWORK_CACHE=/data/artwork \
     ETV_HLS_OUTPUT=/data/hls \
     ETV_BIND_ADDRESS=0.0.0.0 \
