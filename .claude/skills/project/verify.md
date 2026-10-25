@@ -1157,3 +1157,7 @@ exits 1 with "no armed reburst check".
 
 Run it through the swarm lock in a worker (`swarm heavy -- tools/verify-reburst.sh`): like
 `dev-run.sh` it refuses beside another dev stack. The log is `tmp/verify-reburst.log`.
+
+## Verifying the shot list
+
+Run `cargo test -p etv-station --lib shots::` (needs ffmpeg on PATH; four synthetic-frame tests and three real-file tests). Then, against a running daemon, run `tools/facts.sh <entry_id>` and look for a `shots.shots` array whose first shot has `card: true` on a file with a black lead-in. The log events are `shots.analyzed`, `shots.failed` and `shots.deferred`.

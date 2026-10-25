@@ -42,6 +42,10 @@ Read from the **bottom** of the log file (last 80 lines). The user typically qui
 - Don't ask the user to paste logs — just read the file
 - Don't shell out to tail/view logs — use the Read tool directly on the file
 
+## Shot-list events
+
+The shot-list queue (`crates/etv-station/src/shots.rs`) logs `shots.analyzed`, `shots.failed`, `shots.deferred`, `shots.pass_done`, `shots.open_failed`, `shots.pending_failed` and `shots.store_failed`. `bumper.probe` logs `shots=<count>`.
+
 ## Production: the Unraid container
 
 Never ask pierce to paste a prod log; read it over SSH. `UNRAID_HOST` and `UNRAID_USER` (default `root`) are in `.env`. Every read below is read-only and goes ahead unasked.
