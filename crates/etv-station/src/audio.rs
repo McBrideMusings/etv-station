@@ -29,6 +29,10 @@ pub const ANALYZER_ENV: &str = "ETV_STATION_AUDIO_ANALYZER";
 pub const DEFAULT_ANALYZER: &str = "audio-analyze";
 /// A track the analyzer cannot finish in this long is recorded as failed.
 const ANALYZE_TIMEOUT: Duration = Duration::from_secs(600);
+/// Entries with a longer catalog runtime are not analyzed: the analyzer decodes
+/// the whole track to memory (about 10 MB a minute), which a feature film would
+/// push past a gigabyte.
+const MAX_DURATION_MS: i64 = 30 * 60 * 1000;
 /// Entries fetched from the catalog per queue pass.
 const BATCH: usize = 50;
 /// How long the queue sleeps when it has nothing to do or no analyzer.
@@ -94,12 +98,26 @@ pub fn analyzer_status() -> serde_json::Value {
 
 /// Run the analyzer on `file`: its stdout parsed as JSON. A nonzero exit is an
 /// error carrying the last line the analyzer wrote to stderr.
-pub fn analyze_file(program: &str, file: &str) -> Result<serde_json::Value, String> {
-    let out = crate::hooks::exec_call(
+pub fn analyze_file(
+    program: &str,
+    file: &str,
+    cancel: &Cancel,
+) -> Result<serde_json::Value, Failure> {
+    let out = crate::hooks::exec_run(
         program,
         vec![Dynamic::from(file.to_string())],
         ANALYZE_TIMEOUT,
-    )?;
+        cancel.flag(),
+    )
+    .map_err(|e| {
+        // A timeout is the file's fault (it is recorded); a spawn failure or a
+        // cancel is the host's (it is retried).
+        if e.contains("killed after") {
+            Failure::File(e)
+        } else {
+            Failure::Host(e)
+        }
+    })?;
     let code = out.get("code").and_then(|c| c.as_int().ok()).unwrap_or(-1);
     let text = |key: &str| {
         out.get(key)
@@ -109,13 +127,23 @@ pub fn analyze_file(program: &str, file: &str) -> Result<serde_json::Value, Stri
     if code != 0 {
         let stderr = text("stderr");
         let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
-        return Err(format!(
+        return Err(Failure::File(format!(
             "{program} exited {code}: {}",
             last.unwrap_or("no message")
-        ));
+        )));
     }
     serde_json::from_str(text("stdout").trim())
-        .map_err(|e| format!("{program} printed invalid JSON: {e}"))
+        .map_err(|e| Failure::File(format!("{program} printed invalid JSON: {e}")))
+}
+
+/// Why an analysis produced no facts.
+#[derive(Debug)]
+pub enum Failure {
+    /// The analyzer ran and rejected or outlasted this file. Recorded, and not
+    /// retried until the entry's path changes.
+    File(String),
+    /// The host could not run it (spawn failure, shutdown). Nothing is recorded.
+    Host(String),
 }
 
 /// What one pass over the pending entries did.
@@ -128,14 +156,29 @@ pub struct PassReport {
 /// Analyze up to [`BATCH`] pending entries, storing each outcome. Stops early
 /// when `cancel` fires.
 pub fn run_pass(catalog: &Catalog, program: &str, cancel: &Cancel) -> Result<PassReport, String> {
-    let pending = catalog.audio_pending(BATCH).map_err(|e| e.to_string())?;
+    let pending = catalog
+        .audio_pending(BATCH, MAX_DURATION_MS)
+        .map_err(|e| e.to_string())?;
     let mut report = PassReport::default();
     for (entry_id, path) in pending {
         if cancel.is_cancelled() {
             break;
         }
+        // A file that cannot be opened is a stale mount or a moved file, not a
+        // bad track: leave it unrecorded and end the pass so the queue waits.
+        if !Path::new(&path).exists() {
+            tracing::warn!(event = "audio.file_unreachable", entry_id = %entry_id, path = %path, "audio file not reachable; pass ends, entry stays pending");
+            break;
+        }
         let started = std::time::Instant::now();
-        let outcome = analyze_file(program, &path);
+        let outcome = match analyze_file(program, &path, cancel) {
+            Ok(facts) => Ok(facts),
+            Err(Failure::File(e)) => Err(e),
+            Err(Failure::Host(e)) => {
+                tracing::warn!(event = "audio.host_error", entry_id = %entry_id, path = %path, error = %e, "analyzer could not run; pass ends, entry stays pending");
+                break;
+            }
+        };
         let at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .unwrap_or_default();
@@ -269,7 +312,12 @@ mod tests {
     fn a_pass_stores_the_analyzers_json_and_a_failure_is_recorded_once() {
         let dir = tempfile::tempdir().unwrap();
         let ok = fake_analyze_ok(dir.path());
-        let cat = catalog_with_one("/m/a.mp4");
+        let a = dir.path().join("a.mp4");
+        let b = dir.path().join("b.mp4");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        let (a, b) = (a.display().to_string(), b.display().to_string());
+        let cat = catalog_with_one(&a);
         let report = run_pass(&cat, &ok, &Cancel::default()).unwrap();
         assert_eq!(
             report,
@@ -278,11 +326,11 @@ mod tests {
                 failed: 0
             }
         );
-        let facts = cat.audio_facts_for_path("/m/a.mp4").unwrap().unwrap();
+        let facts = cat.audio_facts_for_path(&a).unwrap().unwrap();
         assert_eq!(facts["bpm"], 120.0);
-        assert_eq!(facts["args"], "/m/a.mp4");
+        assert_eq!(facts["args"], a.as_str());
 
-        let cat = catalog_with_one("/m/b.mp4");
+        let cat = catalog_with_one(&b);
         let bad = fake_analyzer(dir.path(), "echo 'cannot decode' >&2; exit 1");
         let report = run_pass(&cat, &bad, &Cancel::default()).unwrap();
         assert_eq!(
@@ -299,6 +347,18 @@ mod tests {
             PassReport::default(),
             "a failed file is not retried"
         );
+    }
+
+    #[test]
+    fn an_unreachable_file_is_left_pending_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = fake_analyze_ok(dir.path());
+        let cat = catalog_with_one("/nonexistent/stale-mount.mp4");
+        assert_eq!(
+            run_pass(&cat, &ok, &Cancel::default()).unwrap(),
+            PassReport::default()
+        );
+        assert_eq!(cat.audio_pending(10, i64::MAX).unwrap().len(), 1);
     }
 
     fn fake_analyze_ok(dir: &Path) -> String {

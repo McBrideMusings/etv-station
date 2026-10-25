@@ -40,6 +40,7 @@ const PENDING_SQL: &str = "\
        AND s.missing_since IS NULL AND s.unairable_reason IS NULL \
       LEFT JOIN entry_audio a ON a.entry_id = e.entry_id \
      WHERE e.missing_since IS NULL \
+       AND (e.duration_ms IS NULL OR e.duration_ms <= ?2) \
      GROUP BY e.entry_id \
     HAVING MIN(a.source_path) IS NULL OR MIN(a.source_path) <> MIN(s.playback_path) \
      ORDER BY e.entry_id \
@@ -95,7 +96,8 @@ impl Catalog {
             .query_row(
                 "SELECT a.facts FROM entry_audio a \
                    JOIN entry_sources s ON s.entry_id = a.entry_id \
-                  WHERE s.playback_path = ?1 AND a.facts IS NOT NULL LIMIT 1",
+                  WHERE s.playback_path = ?1 AND a.source_path = s.playback_path \
+                    AND a.facts IS NOT NULL LIMIT 1",
                 params![playback_path],
                 |r| r.get(0),
             )
@@ -111,10 +113,18 @@ impl Catalog {
     }
 
     /// Up to `limit` live entries still to analyze, as `(entry_id, path)`: no
-    /// row yet, or a row recorded against a different path.
-    pub fn audio_pending(&self, limit: usize) -> Result<Vec<(String, String)>, CatalogError> {
+    /// row yet, or a row recorded against a different path. An entry whose
+    /// catalog runtime exceeds `max_duration_ms` is left out (the analyzer holds
+    /// the whole decoded track in memory).
+    pub fn audio_pending(
+        &self,
+        limit: usize,
+        max_duration_ms: i64,
+    ) -> Result<Vec<(String, String)>, CatalogError> {
         let mut stmt = self.conn.prepare(PENDING_SQL)?;
-        let rows = stmt.query_map(params![limit as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let rows = stmt.query_map(params![limit as i64, max_duration_ms], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -187,7 +197,7 @@ mod tests {
     #[test]
     fn a_stored_fact_is_read_back_by_entry_and_by_path_and_counted() {
         let cat = catalog_with(&[("a", "/m/a.mp4"), ("b", "/m/b.mp4")]);
-        assert_eq!(cat.audio_pending(10).unwrap().len(), 2);
+        assert_eq!(cat.audio_pending(10, i64::MAX).unwrap().len(), 2);
         let facts = json!({"bpm": 120.0, "key": "C"});
         cat.set_audio_fact("a", "/m/a.mp4", "2026-01-01T00:00:00Z", Ok(&facts))
             .unwrap();
@@ -198,7 +208,7 @@ mod tests {
         assert_eq!(cat.audio_facts_for_path("/m/b.mp4").unwrap(), None);
         assert_eq!(cat.audio_fact("a").unwrap().unwrap().facts, Some(facts));
         assert_eq!(
-            cat.audio_pending(10).unwrap(),
+            cat.audio_pending(10, i64::MAX).unwrap(),
             vec![("b".to_string(), "/m/b.mp4".to_string())]
         );
         assert_eq!(
@@ -212,11 +222,21 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_longer_than_the_ceiling_is_not_pending() {
+        let cat = catalog_with(&[("a", "/m/a.mp4")]);
+        cat.conn
+            .execute("UPDATE entries SET duration_ms = 7200000", [])
+            .unwrap();
+        assert!(cat.audio_pending(10, 1_800_000).unwrap().is_empty());
+        assert_eq!(cat.audio_pending(10, 7_200_000).unwrap().len(), 1);
+    }
+
+    #[test]
     fn a_failed_file_is_not_retried_until_its_path_changes() {
         let cat = catalog_with(&[("a", "/m/a.mp4")]);
         cat.set_audio_fact("a", "/m/a.mp4", "2026-01-01T00:00:00Z", Err("no audio"))
             .unwrap();
-        assert!(cat.audio_pending(10).unwrap().is_empty());
+        assert!(cat.audio_pending(10, i64::MAX).unwrap().is_empty());
         assert_eq!(cat.audio_facts_for_path("/m/a.mp4").unwrap(), None);
         assert_eq!(cat.audio_counts().unwrap().failed, 1);
 
@@ -226,7 +246,7 @@ mod tests {
             .unwrap();
         cat.add_source(&source("a", "a2", "/m/moved.mp4")).unwrap();
         assert_eq!(
-            cat.audio_pending(10).unwrap(),
+            cat.audio_pending(10, i64::MAX).unwrap(),
             vec![("a".to_string(), "/m/moved.mp4".to_string())]
         );
     }

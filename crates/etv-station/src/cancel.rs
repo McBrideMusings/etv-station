@@ -22,6 +22,11 @@ impl Cancel {
         self.notify.notify_waiters();
     }
 
+    /// The flag itself, for blocking code that takes an `&AtomicBool`.
+    pub fn flag(&self) -> &AtomicBool {
+        &self.flag
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
     }

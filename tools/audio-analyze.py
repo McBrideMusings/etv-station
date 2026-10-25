@@ -26,8 +26,8 @@ Output keys (all always present; a value the file cannot give is null):
   bar_energy        mean RMS^2 of each bar, bar 0 first
   rms_mean          mean RMS over the file
 
-Nothing is thresholded: a short steady run or low confidence is reported as-is
-so the caller applies its own floor. Exit 0 with the JSON, 1 with a message on
+No confidence or steady-run floor is applied: a short steady run or low
+confidence is reported as-is so the caller applies its own. Exit 0 with the JSON, 1 with a message on
 stderr when the file cannot be decoded or a library is missing.
 """
 import json

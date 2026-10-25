@@ -421,7 +421,7 @@ pub(crate) fn exec_call(program: &str, args: Array, timeout: Duration) -> Result
 }
 
 /// `exec_call` that also stops when `cancel` is set.
-fn exec_run(
+pub(crate) fn exec_run(
     program: &str,
     args: Array,
     timeout: Duration,
