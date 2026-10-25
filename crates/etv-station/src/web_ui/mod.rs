@@ -334,6 +334,7 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
         (Method::Get, "/assets/hls.min.js") => return Reply::Script(HLS_JS),
         (Method::Get, "/api/health") => Ok(api_health(state)),
         (Method::Get, "/api/health/channels") => api_health_channels(state),
+        (Method::Get, "/api/health/renders") => health::api_health_renders(state),
         (Method::Get, "/api/lineup") => api_lineup(state),
         (Method::Get, "/api/search/keyword") => api_search_keyword(state, query),
         (Method::Get, "/api/search/tag") => api_search_tag(state, query),
@@ -461,6 +462,46 @@ mod tests {
             Reply::Json(status, body) => (status, body),
             _ => panic!("{path} did not answer JSON"),
         }
+    }
+
+    /// `/api/health/renders` reports a queued plan under `queued`, and names
+    /// the renderer's dependencies whether or not a queue is configured.
+    #[test]
+    fn health_renders_lists_jobs_by_state_and_the_dependencies() {
+        let mut state = example_state();
+        let (status, body) = get_json(&mut state, "/api/health/renders");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["configured"], false);
+        let names: Vec<&str> = body["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.to_lowercase().contains("demucs")),
+            "{names:?}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../etv-render/tests/fixtures/chapter.plan.json");
+        let plan =
+            etv_render::plan::Plan::parse(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+        let queue = etv_render::queue::Queue::new(dir.path().join("queue"));
+        let job = queue
+            .enqueue(&plan, None, time::OffsetDateTime::now_utc())
+            .unwrap();
+        state.options.health.renderer = Some(crate::renderer::RendererPaths {
+            queue_dir: dir.path().join("queue"),
+            cache_dir: dir.path().join("cache"),
+            cache_cap_bytes: 1_000_000,
+        });
+        let (status, body) = get_json(&mut state, "/api/health/renders");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["configured"], true);
+        assert_eq!(body["counts"]["queued"], 1);
+        assert_eq!(body["jobs"]["queued"][0]["id"], job.id);
     }
 
     /// The Health endpoint over a diag folder: a software argv fails, a

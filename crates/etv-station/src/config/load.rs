@@ -1544,6 +1544,7 @@ mod tests {
             identity_roots: vec![],
             catalog_path: None,
             artwork_cache_dir: None,
+            renderer: Default::default(),
             catalog_refresh_secs: 900,
             full_sweep_after_secs: 86_400,
             device_id: None,

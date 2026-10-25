@@ -50,6 +50,33 @@ pub struct HealthSources {
     pub vaapi_device: Option<String>,
     /// The last read of ETV-next's failure state, refreshed off the request thread.
     pub upstream: Arc<UpstreamReading>,
+    /// Where the chapter renderer's queue and cache are, when it is configured.
+    pub renderer: Option<crate::renderer::RendererPaths>,
+    /// The renderer's dependencies as last detected.
+    pub render_deps: Arc<RenderDeps>,
+}
+
+/// How long a detection of the renderer's programs is served before it is
+/// redone: it starts ffmpeg and Python, which a dashboard refresh should not.
+const RENDER_DEPS_FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Default)]
+pub struct RenderDeps {
+    slot: Mutex<Option<(std::time::Instant, Vec<etv_render::deps::Dependency>)>>,
+}
+
+impl RenderDeps {
+    fn get(&self, settings: &etv_render::Settings) -> Vec<etv_render::deps::Dependency> {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, deps)) = &*slot
+            && at.elapsed() < RENDER_DEPS_FRESH_FOR
+        {
+            return deps.clone();
+        }
+        let deps = etv_render::deps::detect(settings);
+        *slot = Some((std::time::Instant::now(), deps.clone()));
+        deps
+    }
 }
 
 /// How long a reading of ETV-next is served before a refresh starts.
@@ -138,6 +165,8 @@ impl HealthSources {
             accel: var("ETV_ACCEL"),
             vaapi_device: var("ETV_VAAPI_DEVICE"),
             upstream: Arc::default(),
+            renderer: None,
+            render_deps: Arc::default(),
         }
     }
 
@@ -324,6 +353,54 @@ fn read_failures(base: &str) -> Result<HashMap<i64, Value>, String> {
             Some((number, r.clone()))
         })
         .collect())
+}
+
+/// `GET /api/health/renders`: the chapter renderer's jobs by state, its cache
+/// against its cap, and whether Demucs, PyTorch and librubberband are there.
+///
+/// Reads the queue's state files and runs the detection in
+/// [`etv_render::deps`]; it writes nothing. A renderer with no queue configured
+/// still reports its dependencies, so the Health tab can say what a setup lacks.
+pub(super) fn api_health_renders(state: &AppState) -> Result<(u16, Value), String> {
+    let sources = &state.options.health;
+    let env_settings = |cache: std::path::PathBuf| etv_render::Settings::from_env(cache);
+    let Some(paths) = &sources.renderer else {
+        let deps = sources
+            .render_deps
+            .get(&env_settings(std::path::PathBuf::new()));
+        return Ok((
+            200,
+            json!({
+                "configured": false,
+                "reason": "the station config has no renderer.queue_dir and renderer.cache_dir, and ETV_RENDER_QUEUE_DIR / ETV_RENDER_CACHE_DIR are unset",
+                "dependencies": deps,
+            }),
+        ));
+    };
+    let settings = paths.settings();
+    let queue = paths.queue();
+    let jobs = queue.list();
+    let mut by_state = serde_json::Map::new();
+    let mut counts = serde_json::Map::new();
+    for status in etv_render::queue::Status::ALL {
+        let group: Vec<&etv_render::queue::JobState> =
+            jobs.iter().filter(|j| j.status == status).collect();
+        counts.insert(status.as_str().into(), json!(group.len()));
+        by_state.insert(status.as_str().into(), json!(group));
+    }
+    Ok((
+        200,
+        json!({
+            "configured": true,
+            "queue_dir": paths.queue_dir,
+            "cache_dir": paths.cache_dir,
+            "cache_cap_bytes": paths.cache_cap_bytes,
+            "cache_bytes": etv_render::cache::used_bytes(&queue, &settings),
+            "counts": counts,
+            "jobs": by_state,
+            "dependencies": sources.render_deps.get(&settings),
+        }),
+    ))
 }
 
 pub(super) fn api_health_channels(state: &AppState) -> Result<(u16, Value), String> {

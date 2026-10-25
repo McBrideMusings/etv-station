@@ -270,6 +270,30 @@ enum Command {
     /// `Season N` as a placeholder for a person to replace before committing.
     /// Overlaps and gaps in the source are written as published and reported.
     ImportArcs(ImportArcsArgs),
+
+    /// Render one chapter plan to its output file now, and exit non-zero with
+    /// the failing layer named if it cannot. Needs the renderer's cache
+    /// directory (`renderer.cache_dir` or `ETV_RENDER_CACHE_DIR`).
+    Render {
+        /// The chapter plan (JSON); the format is in docs/schema.md.
+        plan: PathBuf,
+    },
+
+    /// Put a chapter plan on the renderer's queue and print its job id at once.
+    /// The same plan queued twice is one job. Needs `renderer.queue_dir` or
+    /// `ETV_RENDER_QUEUE_DIR`.
+    Enqueue {
+        /// The chapter plan (JSON); the format is in docs/schema.md.
+        plan: PathBuf,
+        /// When the chapter airs (RFC 3339). Cache eviction orders by it and
+        /// never removes a chapter within 30 minutes of it.
+        #[arg(long, value_name = "TIME")]
+        air_at: Option<String>,
+    },
+
+    /// Watch the renderer's queue and render plans one at a time until killed.
+    /// The container entrypoint runs this beside the daemon.
+    RenderSidecar,
 }
 
 #[derive(clap::Args, Debug)]
@@ -380,6 +404,28 @@ fn main() -> ExitCode {
 
     if let Some(Command::ImportArcs(args)) = &cli.command {
         return import_arcs(args);
+    }
+
+    // The renderer's commands read the `renderer:` section when `--config` is
+    // given and the environment when it is not, so a plugin's `ctx.exec` can
+    // call `enqueue` without knowing where the station config lives.
+    match &cli.command {
+        Some(Command::Render { plan }) => {
+            init_tracing(cli.log_format);
+            return etv_station::renderer::cli::render(cli.config.as_deref(), plan);
+        }
+        Some(Command::Enqueue { plan, air_at }) => {
+            return etv_station::renderer::cli::enqueue(
+                cli.config.as_deref(),
+                plan,
+                air_at.as_deref(),
+            );
+        }
+        Some(Command::RenderSidecar) => {
+            init_tracing(cli.log_format);
+            return etv_station::renderer::cli::sidecar(cli.config.as_deref());
+        }
+        _ => {}
     }
 
     // First, and before `--config` is even resolved: this is the one mode that
@@ -791,7 +837,13 @@ fn serve_ui(
         plugins_dir,
         bind,
         port,
-        health: etv_station::web_ui::HealthSources::from_env(),
+        health: {
+            let mut health = etv_station::web_ui::HealthSources::from_env();
+            // Unconfigured stays None: the Health tab then says what is missing.
+            health.renderer =
+                etv_station::renderer::RendererPaths::from_env(&station.station.renderer).ok();
+            health
+        },
     };
     match etv_station::web_ui::serve(options) {
         Ok(()) => ExitCode::SUCCESS,

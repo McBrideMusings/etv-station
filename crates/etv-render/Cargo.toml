@@ -1,0 +1,16 @@
+[package]
+name = "etv-render"
+version = "0.1.0"
+edition = "2024"
+description = "Chapter renderer: turns a chapter plan into a video file, and drains a queue of plans ahead of air"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
