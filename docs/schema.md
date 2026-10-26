@@ -889,7 +889,8 @@ bumper rows leave with the schedule they belonged to.
 A bumper script reads the ledger with `ctx.airings(filter)`, which needs no
 capability grant. It returns an array of maps `#{ channel, entry_id, show_id,
 start_ms, kind, source, in_ms, out_ms, produced_by, error_card }`, past and
-scheduled rows alike. Filter keys, all optional: `channel` (default the
+scheduled rows alike, plus the bumper rows earlier gaps of the same generation
+pass have laid but not yet recorded. Filter keys, all optional: `channel` (default the
 bumper's own; `"*"` for every channel), `kind`, `entry_id`, `show_id`,
 `source`, `produced_by`, `from_ms` and `to_ms` (epoch milliseconds bounding the
 start; inclusive, exclusive), `order` (`"asc"` default, or `"desc"`) and
