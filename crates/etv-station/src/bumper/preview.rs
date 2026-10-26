@@ -98,6 +98,7 @@ pub fn preview(req: &PreviewRequest<'_>) -> Result<Preview, String> {
             draw: 0,
             granted,
             history: None,
+            pass: Vec::new(),
             catalog_path: None,
         },
     )
