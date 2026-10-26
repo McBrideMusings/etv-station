@@ -7,8 +7,17 @@
 //   dir:             folder for plans, renders and the stand-in (required)
 //   floor:           lowest `beat_confidence` a song may have, default 2.5
 //   steady_beats:    fewest beats in a song's steady run, default 32
-//   ranker:          how the cluster is picked; only "rule" (the cluster with the
-//                    most candidates) exists
+//   ranker:          how the cluster and hooks are picked: "rule" (the cluster with
+//                    the most candidates, hooks drawn at random) or "model"
+//   brief:           what the chapter should be, sent to the model (ranker "model")
+//   model_url:       OpenAI-compatible chat-completions endpoint (ranker "model")
+//   model:           model name sent in the request (ranker "model")
+//   model_headers:   extra request headers, e.g. Authorization, default {}
+//   model_clusters:  clusters offered to the model, default 6
+//   model_songs:     songs listed per cluster, default 40
+//                    A model pick that names an unoffered cluster or song, repeats a
+//                    song, or has too few or too many hooks for the gap, and any
+//                    http or JSON failure, falls back to the rule.
 //   hooks_min/max:   hooks per chapter, default 3 and 5
 //   tempo_band_pct:  a cluster's tempo window around its seed, +/- percent, default 4
 //   max_shift:       most semitones a hook may move, default 3
@@ -37,7 +46,7 @@
 // 8-bar boundaries of the chapter. Every hook but the first begins with
 // `vocal_over_bars` bars of its vocal over the previous song's instrumental.
 fn hooks() { ["bumper"] }
-fn capabilities() { ["probe", "catalog_read", "exec"] }
+fn capabilities() { ["probe", "catalog_read", "exec", "http"] }
 
 // Bars after the landing bar that the renderer separates from a song.
 fn region_bars() { 18 }
@@ -143,20 +152,24 @@ fn hook_energy(item) {
     if count == 0 { 0.0 } else { sum / count }
 }
 
-// The picked cluster: the seed with the most members, a tie broken by the rng.
-fn pick_cluster(ctx, cands, cfg) {
-    let band = num(conf(cfg, "tempo_band_pct", 4.0));
+// The cluster seeds one build tries: every candidate, or an evenly strided
+// `seeds` of them from a start the rng picks.
+fn tried_seeds(ctx, cands, cfg) {
     let seeds = cands;
     seeds.sort(|a, b| if a.entry_id < b.entry_id { -1 } else if a.entry_id > b.entry_id { 1 } else { 0 });
     let limit = conf(cfg, "seeds", 60);
+    if seeds.len() <= limit { return seeds; }
     let tried = [];
-    if seeds.len() <= limit {
-        tried = seeds;
-    } else {
-        let stride = seeds.len() / limit;
-        let start = ctx.rng.int(0, stride - 1);
-        for i in 0..limit { tried.push(seeds[start + i * stride]); }
-    }
+    let stride = seeds.len() / limit;
+    let start = ctx.rng.int(0, stride - 1);
+    for i in 0..limit { tried.push(seeds[start + i * stride]); }
+    tried
+}
+
+// The picked cluster: the seed with the most members, a tie broken by the rng.
+fn pick_cluster(ctx, cands, cfg) {
+    let band = num(conf(cfg, "tempo_band_pct", 4.0));
+    let tried = tried_seeds(ctx, cands, cfg);
     let best = [];
     let ties = [];
     for seed in tried {
@@ -170,6 +183,134 @@ fn pick_cluster(ctx, cands, cfg) {
     }
     if ties.len() == 0 { return (); }
     ties.random(ctx.rng)
+}
+
+// The clusters a model is offered: the `model_clusters` largest distinct ones
+// around the tried seeds, each with at most `model_songs` of its songs listed.
+fn offered_clusters(ctx, cands, cfg) {
+    let band = num(conf(cfg, "tempo_band_pct", 4.0));
+    let seen = #{};
+    let found = [];
+    for seed in tried_seeds(ctx, cands, cfg) {
+        let members = cluster_of(seed, cands, band);
+        let ids = [];
+        for m in members { ids.push(m.entry_id); }
+        ids.sort();
+        let key = "";
+        for id in ids { key += id + "|"; }
+        if seen.contains(key) { continue; }
+        seen[key] = true;
+        found.push(#{ seed: seed, members: members });
+    }
+    found.sort(|a, b| {
+        if a.members.len() != b.members.len() { return b.members.len() - a.members.len(); }
+        if a.seed.entry_id < b.seed.entry_id { -1 } else if a.seed.entry_id > b.seed.entry_id { 1 } else { 0 }
+    });
+    found.truncate(conf(cfg, "model_clusters", 6));
+    let cap = conf(cfg, "model_songs", 40);
+    let offered = [];
+    for i in 0..found.len() {
+        let listed = [];
+        let left = [];
+        for m in found[i].members { left.push(m); }
+        while listed.len() < cap && left.len() > 0 {
+            listed.push(left.remove(ctx.rng.int(0, left.len() - 1)));
+        }
+        offered.push(#{ id: "c" + i, seed: found[i].seed, members: found[i].members, listed: listed });
+    }
+    offered
+}
+
+fn model_prompt(cfg, offered, gap_s) {
+    let text = "Brief: " + conf(cfg, "brief", "a good mix") + "\n\nClusters (songs in one cluster share a tempo and key):\n";
+    for c in offered {
+        let bpms = [];
+        for m in c.members { bpms.push(num(m.audio.bpm)); }
+        let fit = shape(240.0 / median(bpms), gap_s, cfg, c.members.len());
+        let takes = if fit == () { "does not fit the gap, do not pick it" } else { "the gap takes " + conf(cfg, "hooks_min", 3) + " to " + fit.hooks + " hooks" };
+        text += "\n" + c.id + " (" + c.members.len() + " songs; " + takes + "):\n";
+        for m in c.listed {
+            let a = m.audio;
+            text += "- " + m.entry_id + " | " + (m.title ?? "") + " | " + (m[conf(cfg, "artist_field", "show")] ?? m.show ?? "") + " | " + (m.year ?? "") + " | "
+                + a.bpm + " bpm | " + a.camelot + " | energy " + hook_energy(m) + "\n";
+        }
+    }
+    text
+}
+
+// The JSON object in a chat-completion reply's text.
+fn reply_object(raw) {
+    let text = parse_json(raw).choices[0].message.content;
+    let start = text.index_of("{");
+    let end = text.len() - 1;
+    while end > 0 && text.sub_string(end, 1) != "}" { end -= 1; }
+    if start < 0 || end <= start { throw "no JSON object in the reply"; }
+    parse_json(text.sub_string(start, end - start + 1))
+}
+
+// What the model picked, held to the rule ranker's limits: one offered cluster,
+// distinct songs from its list, between hooks_min and as many as the gap fits.
+// Throws the reason when the pick breaks one.
+fn check_model_pick(reply, offered, cfg, gap_s) {
+    let cluster = ();
+    for c in offered { if c.id == reply.cluster { cluster = c; } }
+    if cluster == () { throw "cluster " + reply.cluster + " was not offered"; }
+    if type_of(reply.hooks) != "array" { throw "hooks is not a list"; }
+    let by_id = #{};
+    for m in cluster.listed { by_id[m.entry_id] = m; }
+    let drawn = [];
+    let used = #{};
+    for id in reply.hooks {
+        if type_of(id) != "string" || !by_id.contains(id) { throw "hook " + id + " is not in " + cluster.id; }
+        if used.contains(id) { throw "hook " + id + " is named twice"; }
+        used[id] = true;
+        drawn.push(by_id[id]);
+    }
+    let bpms = [];
+    for m in cluster.members { bpms.push(num(m.audio.bpm)); }
+    let fitted = shape(240.0 / median(bpms), gap_s, cfg, cluster.members.len());
+    if fitted == () { throw "cluster " + cluster.id + " does not fit the gap"; }
+    if drawn.len() < conf(cfg, "hooks_min", 3) || drawn.len() > fitted.hooks {
+        throw drawn.len() + " hooks, the gap takes " + conf(cfg, "hooks_min", 3) + " to " + fitted.hooks;
+    }
+    #{ seed: cluster.seed, members: cluster.members, drawn: drawn, fitted: #{ bars: fitted.bars, hooks: drawn.len() } }
+}
+
+// The model's chapter, or () after logging why the rule must pick instead.
+fn model_rank(ctx, cfg, cands) {
+    if cfg.model_url == () || cfg.model == () {
+        throw "megamix: config.model_url and config.model are required when ranker is \"model\"";
+    }
+    let offered = offered_clusters(ctx, cands, cfg);
+    if offered.len() == 0 { return (); }
+    let gap_s = ctx.gap_ms / 1000.0;
+    let min_hooks = conf(cfg, "hooks_min", 3);
+    let max_hooks = conf(cfg, "hooks_max", 5);
+    let system = "You plan one chapter of a music-video megamix. Reply with one JSON object and nothing else: "
+        + "{\"cluster\": \"<cluster id>\", \"hooks\": [\"<entry id>\", ...]} naming one cluster and between "
+        + min_hooks + " and " + max_hooks + " of its listed songs (never more than the cluster's own limit) in the order they play, fitting the brief.";
+    let headers = #{ "Content-Type": "application/json" };
+    let extra = conf(cfg, "model_headers", #{});
+    for k in extra.keys() { headers[k] = extra[k]; }
+    let body = to_json(#{
+        model: cfg.model,
+        temperature: 0,
+        messages: [
+            #{ role: "system", content: system },
+            #{ role: "user", content: model_prompt(cfg, offered, gap_s) },
+        ],
+    });
+    try {
+        let raw = ctx.http(cfg.model_url, "POST", body, headers);
+        let picked = check_model_pick(reply_object(raw), offered, cfg, gap_s);
+        let ids = "";
+        for d in picked.drawn { ids += d.entry_id + " "; }
+        log("megamix: model_ranked hooks=" + ids);
+        return picked;
+    } catch (e) {
+        log("megamix: model_rejected, the rule picks: " + e);
+    }
+    ()
 }
 
 fn hex(n) { n.to_hex() }
@@ -364,8 +505,9 @@ fn build(ctx) {
     let cfg = ctx.config;
     if cfg.expr == () { throw "megamix: config.expr (the pool's CEL) is required"; }
     if cfg.dir == () { throw "megamix: config.dir (where plans and renders go) is required"; }
-    if conf(cfg, "ranker", "rule") != "rule" {
-        throw "megamix: config.ranker must be \"rule\", got " + cfg.ranker;
+    let ranker = conf(cfg, "ranker", "rule");
+    if ranker != "rule" && ranker != "model" {
+        throw "megamix: config.ranker must be \"rule\" or \"model\", got " + ranker;
     }
 
     let recent = recent_entries(ctx, conf(cfg, "tail", 12));
@@ -378,30 +520,44 @@ fn build(ctx) {
     }
     log("megamix: pool=" + pool.len() + " candidates=" + cands.len());
 
-    let picked = pick_cluster(ctx, cands, cfg);
-    if picked == () { return idle(ctx, "no candidates"); }
-    let members = picked.members;
-    let seed = picked.seed;
+    let ranked = ();
+    if ranker == "model" && cands.len() > 0 { ranked = model_rank(ctx, cfg, cands); }
+    let members = ();
+    let seed = ();
+    let fitted = ();
+    let drawn = [];
+    if ranked != () {
+        members = ranked.members;
+        seed = ranked.seed;
+        fitted = ranked.fitted;
+        drawn = ranked.drawn;
+    } else {
+        let picked = pick_cluster(ctx, cands, cfg);
+        if picked == () { return idle(ctx, "no candidates"); }
+        members = picked.members;
+        seed = picked.seed;
+    }
 
     let bpms = [];
     for m in members { bpms.push(num(m.audio.bpm)); }
     let chapter_bpm = median(bpms);
     let bar_s = 240.0 / chapter_bpm;
-    let fitted = shape(bar_s, ctx.gap_ms / 1000.0, cfg, members.len());
-    if fitted == () { return idle(ctx, "cluster of " + members.len() + " does not fit a gap of " + ctx.gap_ms + "ms"); }
+    if ranked == () {
+        fitted = shape(bar_s, ctx.gap_ms / 1000.0, cfg, members.len());
+        if fitted == () { return idle(ctx, "cluster of " + members.len() + " does not fit a gap of " + ctx.gap_ms + "ms"); }
 
-    // The hooks are drawn at random from the cluster, then laid out by rising energy.
-    let drawn = [];
-    let pool_left = members;
-    while drawn.len() < fitted.hooks {
-        let i = ctx.rng.int(0, pool_left.len() - 1);
-        drawn.push(pool_left.remove(i));
+        // The hooks are drawn at random from the cluster, then laid out by rising energy.
+        let pool_left = members;
+        while drawn.len() < fitted.hooks {
+            let i = ctx.rng.int(0, pool_left.len() - 1);
+            drawn.push(pool_left.remove(i));
+        }
+        drawn.sort(|a, b| {
+            let x = hook_energy(a);
+            let y = hook_energy(b);
+            if x < y { -1 } else if x > y { 1 } else { 0 }
+        });
     }
-    drawn.sort(|a, b| {
-        let x = hook_energy(a);
-        let y = hook_energy(b);
-        if x < y { -1 } else if x > y { 1 } else { 0 }
-    });
 
     let ids = "";
     for d in drawn { ids += d.entry_id + "|"; }

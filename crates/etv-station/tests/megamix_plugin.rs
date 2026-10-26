@@ -159,7 +159,12 @@ impl Fixture {
             },
             air_date: "2027-01-15".into(),
             draw: 0,
-            granted: vec!["probe".into(), "catalog_read".into(), "exec".into()],
+            granted: vec![
+                "probe".into(),
+                "catalog_read".into(),
+                "exec".into(),
+                "http".into(),
+            ],
             history: None,
             pass: Vec::new(),
             catalog_path: Some(catalog_file(self.dir.path())),
@@ -353,4 +358,140 @@ fn a_build_with_the_renderer_absent_still_emits_a_timeline() {
     );
     assert!(matches!(segment.source, SegmentSource::Pending { .. }));
     assert_eq!(f.plans().len(), 1, "the plan is still written");
+}
+
+/// Serves one OpenAI-style chat completion whose message text is `content`,
+/// returning the url and a handle that yields the request it received.
+fn model_server(content: &str) -> (String, std::thread::JoinHandle<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let reply = json!({ "choices": [{ "message": { "role": "assistant", "content": content } }] })
+        .to_string();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            got.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&got).to_string();
+            if let Some(split) = text.find("\r\n\r\n") {
+                let length = text[..split]
+                    .to_lowercase()
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length: ")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if got.len() >= split + 4 + length {
+                    break;
+                }
+            }
+            if n == 0 {
+                break;
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        String::from_utf8_lossy(&got).to_string()
+    });
+    (url, handle)
+}
+
+fn model_input(f: &Fixture, url: &str) -> BumperInput {
+    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    let cfg = input.config.as_mut().unwrap();
+    cfg["ranker"] = json!("model");
+    cfg["model_url"] = json!(url);
+    cfg["model"] = json!("ranker-1");
+    cfg["brief"] = json!("slow-burn eighties, nothing sad");
+    cfg["model_headers"] = json!({ "Authorization": "Bearer test-key" });
+    input
+}
+
+fn hooks_of(name: &str) -> Vec<String> {
+    name.split('|').skip(1).map(String::from).collect()
+}
+
+#[test]
+fn a_model_pick_sets_the_chapters_hooks_in_its_order() {
+    let f = Fixture::new();
+    let (url, request) = model_server(
+        "Here you go:\n{\"cluster\": \"c0\", \"hooks\": [\"mv-d\", \"mv-a\", \"mv-b\"]}\n",
+    );
+    let built = build(&plugin_path(), &model_input(&f, &url)).unwrap();
+    let sent = request.join().unwrap();
+
+    assert_eq!(
+        hooks_of(&built.timeline.segments[0].name),
+        ["mv-d", "mv-a", "mv-b"]
+    );
+    let plan = Plan::parse(&std::fs::read_to_string(&f.plans()[0]).unwrap()).unwrap();
+    let ids: Vec<&str> = plan.hooks.iter().map(|h| h.entry_id.as_str()).collect();
+    assert_eq!(ids, ["mv-d", "mv-a", "mv-b"]);
+    assert!(sent.contains("slow-burn eighties, nothing sad"), "{sent}");
+    assert!(
+        sent.to_lowercase()
+            .contains("authorization: bearer test-key"),
+        "{sent}"
+    );
+    assert!(sent.contains("ranker-1"), "{sent}");
+    assert!(
+        sent.contains("mv-e"),
+        "the cluster's facts are in the prompt: {sent}"
+    );
+}
+
+#[test]
+fn a_rejected_model_pick_falls_back_to_the_rule() {
+    // Each reply breaks one rule: an unfit song, a repeat, too few hooks, an
+    // unoffered cluster, text with no JSON.
+    for reply in [
+        "{\"cluster\": \"c0\", \"hooks\": [\"mv-a\", \"mv-b\", \"mv-weak\"]}",
+        "{\"cluster\": \"c0\", \"hooks\": [\"mv-a\", \"mv-b\", \"mv-a\"]}",
+        "{\"cluster\": \"c0\", \"hooks\": [\"mv-a\", \"mv-b\"]}",
+        "{\"cluster\": \"c9\", \"hooks\": [\"mv-a\", \"mv-b\", \"mv-c\"]}",
+        "I would open with mv-a.",
+    ] {
+        let f = Fixture::new();
+        let (url, request) = model_server(reply);
+        let built = build(&plugin_path(), &model_input(&f, &url)).unwrap();
+        request.join().unwrap();
+        let hooks = hooks_of(&built.timeline.segments[0].name);
+        assert!((3..=5).contains(&hooks.len()), "{reply}: {hooks:?}");
+        assert!(
+            !hooks.iter().any(|h| h == "mv-weak" || h == "mv-unsteady"),
+            "{reply}: {hooks:?}"
+        );
+        let rule = build(
+            &plugin_path(),
+            &f.input("/nonexistent/etv-station", 600_000),
+        )
+        .unwrap();
+        assert_eq!(
+            built.timeline.segments[0].name, rule.timeline.segments[0].name,
+            "{reply}: the fallback is the rule's chapter"
+        );
+    }
+}
+
+#[test]
+fn an_unreachable_model_falls_back_to_the_rule() {
+    let f = Fixture::new();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/v1/chat/completions",
+        closed.local_addr().unwrap()
+    );
+    drop(closed);
+    let built = build(&plugin_path(), &model_input(&f, &url)).unwrap();
+    assert!((3..=5).contains(&hooks_of(&built.timeline.segments[0].name).len()));
 }
