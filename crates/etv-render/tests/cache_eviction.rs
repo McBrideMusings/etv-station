@@ -144,7 +144,7 @@ fn stems_no_live_job_refers_to_go_before_any_chapter() {
 fn enqueue_returns_at_once_and_the_same_plan_is_one_job() {
     let (_guard, dir) = temp();
     let queue = Queue::new(dir.join("queue"));
-    let plan = fixture_plan(&dir);
+    let plan = etv_render::Document::from(fixture_plan(&dir));
     let now = OffsetDateTime::now_utc();
 
     let first = queue.enqueue(&plan, None, now).unwrap();

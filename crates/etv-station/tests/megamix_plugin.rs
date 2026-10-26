@@ -15,8 +15,10 @@ use etv_render::Plan;
 use etv_station::bumper::hook::{BumperInput, ChannelInfo, build};
 use etv_station::bumper::timeline::SegmentSource;
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
+use etv_station::history::{AiringKind, PlayRecord};
 use rhai::Map;
 use serde_json::json;
+use time::OffsetDateTime;
 
 const PLUGIN: &str = "../../examples/plugins/bumpers/megamix.rhai";
 
@@ -159,6 +161,7 @@ impl Fixture {
             draw: 0,
             granted: vec!["probe".into(), "catalog_read".into(), "exec".into()],
             history: None,
+            pass: Vec::new(),
             catalog_path: Some(catalog_file(self.dir.path())),
         }
     }
@@ -301,6 +304,36 @@ fn a_chapter_plan_passes_the_floor_semitone_camelot_and_bar_rules() {
             .unwrap()
             .len(),
         plan.hooks.len()
+    );
+}
+
+#[test]
+fn a_chapter_laid_earlier_in_the_pass_keeps_its_songs_out_of_the_next() {
+    let f = Fixture::new();
+    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    input.config.as_mut().unwrap()["hooks_min"] = json!(2);
+    input.config.as_mut().unwrap()["hooks_max"] = json!(2);
+
+    let first = build(&plugin_path(), &input).unwrap();
+    let first_name = first.timeline.segments[0].name.clone();
+    // The same inputs draw the same songs, so only the pass's rows can differ.
+    let again = build(&plugin_path(), &input).unwrap();
+    assert_eq!(again.timeline.segments[0].name, first_name);
+
+    input.pass = vec![PlayRecord {
+        entry_id: first_name.clone(),
+        start: OffsetDateTime::from_unix_timestamp(1_799_999_000).unwrap(),
+        kind: AiringKind::Bumper,
+        ..Default::default()
+    }];
+    let second = build(&plugin_path(), &input).unwrap();
+    let songs = |name: &str| -> Vec<String> { name.split('|').skip(1).map(String::from).collect() };
+    let used = songs(&first_name);
+    let next = songs(&second.timeline.segments[0].name);
+    assert_eq!(next.len(), 2, "{next:?}");
+    assert!(
+        next.iter().all(|s| !used.contains(s)),
+        "{next:?} reuses a song from {used:?}"
     );
 }
 

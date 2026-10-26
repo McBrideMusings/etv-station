@@ -367,6 +367,7 @@ fn fill_gap(
                     upcoming: &upcoming,
                 },
                 &air_date,
+                records,
             );
             let good = drawn.error.is_none() && (!last_draw || can_reach(&drawn.timeline, draw_ms));
             if chosen.is_none() || good {
@@ -444,6 +445,7 @@ fn draw_one(
     draw: u32,
     around: &Around<'_>,
     air_date: &str,
+    pass: &[PlayRecord],
 ) -> Drawn {
     let input = BumperInput {
         gap_ms,
@@ -456,6 +458,7 @@ fn draw_one(
         draw,
         granted: cand.granted.clone(),
         history: env.history.clone(),
+        pass: pass.to_vec(),
         catalog_path: env.catalog_path.clone(),
     };
     let (built, error) = build_or_black(&cand.script, &input);

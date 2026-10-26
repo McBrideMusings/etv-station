@@ -75,9 +75,10 @@
 //! `ctx.airings(filter)` reads the airings ledger (`history.db`) and needs no
 //! grant: it is in-process and read-only. It returns an array of maps
 //! `#{ channel, entry_id, show_id, start_ms, kind, source, in_ms, out_ms,
-//! produced_by, error_card }`, past and scheduled rows alike. The filter keys
-//! are listed on [`airing_filter`]; with no `kind` it returns programmes and
-//! bumper segments together.
+//! produced_by, error_card }`, past and scheduled rows alike, plus the bumper
+//! rows earlier gaps of the same generation pass have laid on this channel but
+//! not yet recorded. The filter keys are listed on [`airing_filter`]; with no
+//! `kind` it returns programmes and bumper segments together.
 //!
 //! The builder (`timeline()`, `segment()`, `clip(..)`) constructs the same
 //! [`Timeline`] structs a later declarative format would deserialize into.
@@ -96,7 +97,7 @@ use rhai::{Array, Dynamic, EvalAltResult, Map, Scope};
 use time::OffsetDateTime;
 
 use crate::ffprobe::PROBE_TIMEOUT;
-use crate::history::{AiringFilter, AiringKind, HistoryDb, LedgerRow};
+use crate::history::{AiringFilter, AiringKind, HistoryDb, LedgerRow, PlayRecord};
 
 use super::timeline::{
     AudioSource, BedSource, Duration, OverlayVars, Segment, SegmentAudio, SegmentSource, Timeline,
@@ -158,6 +159,10 @@ pub struct BumperInput {
     /// The airings ledger `ctx.airings` reads; `None` answers every query
     /// with an empty array.
     pub history: Option<Arc<HistoryDb>>,
+    /// Bumper rows this generation pass has already laid for the channel but
+    /// not yet recorded in the ledger; `ctx.airings` answers with them
+    /// beside the ledger's own rows.
+    pub pass: Vec<PlayRecord>,
     /// The catalog `ctx.probe` reads a file's stored `shots` from; `None`
     /// leaves `shots` out of every probe result.
     pub catalog_path: Option<PathBuf>,
@@ -232,6 +237,7 @@ pub fn build(script: &Path, input: &BumperInput) -> Result<BuiltTimeline, Bumper
             .unwrap_or_else(|| PathBuf::from(".")),
         granted: input.granted.clone(),
         history: input.history.clone(),
+        pass: input.pass.clone(),
         catalog_path: input.catalog_path.clone(),
         channel: input.channel.name.clone(),
         budget: crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET),
@@ -684,6 +690,7 @@ struct Host {
     dir: PathBuf,
     granted: Vec<String>,
     history: Option<Arc<HistoryDb>>,
+    pass: Vec<PlayRecord>,
     catalog_path: Option<PathBuf>,
     /// The channel `ctx.airings` queries unless the filter names another.
     channel: String,
@@ -807,12 +814,29 @@ impl Host {
     /// `ctx.airings(filter)`: ledger rows, past and scheduled, as maps.
     fn airings(&self, filter: Map) -> RhaiResult<Dynamic> {
         let parsed = airing_filter(&filter, &self.channel)?;
-        let rows = match &self.history {
+        let mut rows = match &self.history {
             Some(db) => db
                 .airings(&parsed)
                 .map_err(|e| format!("ctx.airings(): {e}"))?,
             None => Vec::new(),
         };
+        let planned: Vec<LedgerRow> = self
+            .pass
+            .iter()
+            .filter(|r| pass_row_matches(r, &self.channel, &parsed))
+            .map(|r| LedgerRow {
+                channel: self.channel.clone(),
+                record: r.clone(),
+            })
+            .collect();
+        if !planned.is_empty() {
+            rows.extend(planned);
+            rows.sort_by_key(|r| r.record.start);
+            if parsed.newest_first {
+                rows.reverse();
+            }
+            rows.truncate(parsed.limit);
+        }
         tracing::info!(
             event = "bumper.airings",
             channel = %self.channel,
@@ -944,6 +968,25 @@ fn airing_filter(filter: &Map, own_channel: &str) -> RhaiResult<AiringFilter> {
         }
     }
     Ok(out)
+}
+
+/// Whether a row laid earlier in this pass on `channel` satisfies `f`, as the
+/// ledger query would have judged it.
+fn pass_row_matches(r: &PlayRecord, channel: &str, f: &AiringFilter) -> bool {
+    f.channel.as_deref().is_none_or(|c| c == channel)
+        && f.kind.is_none_or(|k| k == r.kind)
+        && f.entry_id.as_ref().is_none_or(|v| *v == r.entry_id)
+        && f.show_id
+            .as_ref()
+            .is_none_or(|v| r.show_id.as_ref() == Some(v))
+        && f.source
+            .as_ref()
+            .is_none_or(|v| r.source.as_ref() == Some(v))
+        && f.produced_by
+            .as_ref()
+            .is_none_or(|v| r.produced_by.as_ref() == Some(v))
+        && f.from.is_none_or(|t| r.start >= t)
+        && f.to.is_none_or(|t| r.start < t)
 }
 
 fn airing_map(row: LedgerRow) -> Map {
@@ -1454,6 +1497,7 @@ mod tests {
             upcoming: Vec::new(),
             config: None,
             history: None,
+            pass: Vec::new(),
             catalog_path: None,
         }
     }

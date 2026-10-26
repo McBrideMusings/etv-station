@@ -24,10 +24,14 @@ Concise repo navigation. See [PRD §Architecture → Repository layout](/PRD#rep
 | Path | What |
 |---|---|
 | `crates/etv-station/` | The daemon binary crate. |
-| `crates/etv-render/` | Chapter renderer library: plan format (`plan.rs`), Demucs stems (`stems.rs`), audio filter graph (`audio.rs`), video cuts (`video.rs`), job queue and sidecar loop (`queue.rs`), cache eviction (`cache.rs`), dependency detection (`deps.rs`). Fixture plan under `tests/fixtures/`. |
+| `crates/etv-render/` | Chapter and set renderer library: chapter plan format (`plan.rs`), set plan and layout (`set.rs`, `set_render.rs`), plan-file kinds (`document.rs`), Demucs stems (`stems.rs`), audio filter graph (`audio.rs`), video cuts (`video.rs`), job queue and sidecar loop (`queue.rs`), cache eviction (`cache.rs`), dependency detection (`deps.rs`). Fixture plan under `tests/fixtures/`. |
 | `crates/etv-station/src/renderer.rs` | Resolves the `renderer:` paths and implements the `render`, `enqueue` and `render-sidecar` commands. |
 | `crates/etv-station/src/web_ui/chapters.rs` | `GET /api/channels/{ch}/chapters`: joins the channel's `chapter:<job>\|<entry>...` bumper rows on the airings ledger to the renderer's queue (job state, plan) and the notes beside the render, in air order, with a state per chapter. Writes nothing. |
+| `examples/plugins/bumpers/whole_song.rhai` | The whole-song bumper: walks a set of whole music videos, picks a seam recipe per pair (bass swap, echo out, drop mix), writes the set plan and queues it. Config keys in `docs/schema.md` § Whole-song plugin. |
+| `crates/etv-station/tests/whole_song_plugin.rs` | Runs `whole_song.rhai` against a fixture catalog with stub `enqueue` and `ffmpeg` programs. |
+| `crates/etv-render/src/set.rs`, `set_render.rs`, `document.rs` | The set plan, its layout and filter graph, its renderer, and the plan-file enum that tells a set plan from a chapter plan. |
 | `examples/plugins/bumpers/megamix.rhai` | The megamix bumper: reads audio facts through `ctx.catalog`, clusters by tempo and Camelot distance, picks 3 to 5 hooks, writes the chapter plan and seam notes, queues the render with `ctx.exec`, and emits a pending segment over a stand-in. Config keys in `docs/schema.md` § Megamix plugin. |
+| `examples/channels/songs-test.yaml` | A music-video channel whose 12-minute grid is filled with whole-song sets (`whole_song.rhai`); it uses the station config of the megamix channel. |
 | `examples/channels/megamix-test.yaml`, `examples/station-megamix.yaml` | A music-video channel whose 12-minute grid is filled with megamix chapters, and the station config that names the renderer's queue for it. |
 | `crates/etv-station/tests/megamix_plugin.rs` | Runs `megamix.rhai` against a fixture catalog with stub `enqueue` and `ffmpeg` programs. |
 | `crates/etv-query-test/` | Phase A CEL feasibility harness. Queries Plex + FS catalogs with CEL; see `./tools/query.sh`. |

@@ -29,11 +29,9 @@
 //
 // The segment is named `chapter:<job>|<entry>|<entry>...`: `GET
 // /api/channels/<n>/chapters` joins the job id to the renderer's queue, and this
-// script reads the entries back from the airings ledger to keep a song out of the
-// next `tail` chapters.
-//
-// Songs in a chapter built earlier in the same generation pass are not yet on
-// the ledger, so `tail` protects across passes only.
+// script reads the entries back from `ctx.airings` to keep a song out of the
+// next `tail` chapters; that includes chapters laid earlier in the same
+// generation pass, before they reach the ledger.
 //
 // A hook is 16 bars, or 8 when 16 bars would pass 40 seconds. Hooks start on
 // 8-bar boundaries of the chapter. Every hook but the first begins with

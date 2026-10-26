@@ -564,7 +564,7 @@ mod tests {
             etv_render::plan::Plan::parse(&std::fs::read_to_string(fixture).unwrap()).unwrap();
         let queue = etv_render::queue::Queue::new(dir.path().join("queue"));
         let job = queue
-            .enqueue(&plan, None, time::OffsetDateTime::now_utc())
+            .enqueue(&plan.into(), None, time::OffsetDateTime::now_utc())
             .unwrap();
         state.options.health.renderer = Some(crate::renderer::RendererPaths {
             queue_dir: dir.path().join("queue"),
@@ -1191,7 +1191,7 @@ mod tests {
         let queue = etv_render::queue::Queue::new(root.join("queue"));
         let air_at = time::OffsetDateTime::now_utc() + time::Duration::minutes(40);
         let job = queue
-            .enqueue(&plan, Some(air_at), time::OffsetDateTime::now_utc())
+            .enqueue(&plan.into(), Some(air_at), time::OffsetDateTime::now_utc())
             .unwrap();
         f.state.options.health.renderer = Some(crate::renderer::RendererPaths {
             queue_dir: root.join("queue"),

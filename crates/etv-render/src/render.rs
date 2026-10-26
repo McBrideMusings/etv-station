@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio;
 use crate::deps;
+use crate::document::Document;
 use crate::error::RenderError;
 use crate::plan::Plan;
 use crate::settings::Settings;
@@ -38,20 +39,7 @@ pub fn render(plan: &Plan, settings: &Settings) -> Result<Rendered, RenderError>
     plan.validate()
         .map_err(|e| RenderError::new("plan", e.to_string()))?;
     check_files(plan)?;
-    let filters = deps::ffmpeg_filters_text(settings)
-        .map_err(|e| RenderError::new("dependency ffmpeg", e))?;
-    if !deps::has_rubberband_filter(&filters) {
-        return Err(RenderError::new(
-            "dependency librubberband",
-            format!(
-                "librubberband is missing: {} was built without the rubberband filter",
-                settings.ffmpeg
-            ),
-        ));
-    }
-    let encoders =
-        deps::ffmpeg_encoders(settings).map_err(|e| RenderError::new("dependency ffmpeg", e))?;
-    let encoder = deps::pick_encoder(settings, &encoders);
+    let encoder = require_tools(settings)?;
     tracing::info!(
         event = "render.start",
         output = %plan.output.display(),
@@ -62,14 +50,7 @@ pub fn render(plan: &Plan, settings: &Settings) -> Result<Rendered, RenderError>
         "rendering a chapter"
     );
 
-    let work = settings.cache_dir.join("work").join(format!(
-        "{}-{}",
-        std::process::id(),
-        started.elapsed().as_nanos()
-    ));
-    fs::create_dir_all(&work).map_err(|e| {
-        RenderError::new("work dir", format!("cannot create {}: {e}", work.display()))
-    })?;
+    let work = make_work_dir(settings, started)?;
     let result = render_in(plan, settings, &encoder, &work, started);
     let _ = fs::remove_dir_all(&work);
     result
@@ -108,7 +89,7 @@ fn render_in(
         })?;
     }
     let part = plan.output.with_extension("part");
-    let muxed = video::mux(plan, settings, encoder, &list, &mix, &part);
+    let muxed = video::mux(plan.duration_s(), settings, encoder, &list, &mix, &part);
     if let Err(e) = muxed {
         let _ = fs::remove_file(&part);
         return Err(e);
@@ -138,6 +119,49 @@ fn render_in(
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     Ok(Rendered { timings, stems })
+}
+
+/// The encoder to finish with, after checking that this ffmpeg can render at
+/// all: it needs the `rubberband` filter to stretch audio.
+pub(crate) fn require_tools(settings: &Settings) -> Result<deps::Encoder, RenderError> {
+    let filters = deps::ffmpeg_filters_text(settings)
+        .map_err(|e| RenderError::new("dependency ffmpeg", e))?;
+    if !deps::has_rubberband_filter(&filters) {
+        return Err(RenderError::new(
+            "dependency librubberband",
+            format!(
+                "librubberband is missing: {} was built without the rubberband filter",
+                settings.ffmpeg
+            ),
+        ));
+    }
+    let encoders =
+        deps::ffmpeg_encoders(settings).map_err(|e| RenderError::new("dependency ffmpeg", e))?;
+    Ok(deps::pick_encoder(settings, &encoders))
+}
+
+/// A scratch directory under the cache for one render; the caller removes it.
+pub(crate) fn make_work_dir(
+    settings: &Settings,
+    started: Instant,
+) -> Result<std::path::PathBuf, RenderError> {
+    let work = settings.cache_dir.join("work").join(format!(
+        "{}-{}",
+        std::process::id(),
+        started.elapsed().as_nanos()
+    ));
+    fs::create_dir_all(&work).map_err(|e| {
+        RenderError::new("work dir", format!("cannot create {}: {e}", work.display()))
+    })?;
+    Ok(work)
+}
+
+/// Render any plan file's document in the foreground.
+pub fn render_document(doc: &Document, settings: &Settings) -> Result<Rendered, RenderError> {
+    match doc {
+        Document::Chapter(plan) => render(plan, settings),
+        Document::Set(plan) => crate::set_render::render(plan, settings),
+    }
 }
 
 /// Every media file the plan names must exist before any work starts, so the

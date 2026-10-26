@@ -132,7 +132,7 @@ pub mod cli {
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    use etv_render::Plan;
+    use etv_render::Document;
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
 
@@ -154,10 +154,10 @@ pub mod cli {
         RendererPaths::from_env(&section)
     }
 
-    fn read_plan(path: &Path) -> Result<Plan, String> {
+    fn read_plan(path: &Path) -> Result<Document, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        Plan::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+        Document::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     /// `render <plan.json>`: render one plan now, in this process.
@@ -165,9 +165,9 @@ pub mod cli {
         let run = || -> Result<(), String> {
             let paths = paths(config_path)?;
             let plan = read_plan(plan_path)?;
-            let rendered =
-                etv_render::render::render(&plan, &paths.settings()).map_err(|e| e.to_string())?;
-            println!("{}", plan.output.display());
+            let rendered = etv_render::render::render_document(&plan, &paths.settings())
+                .map_err(|e| e.to_string())?;
+            println!("{}", plan.output().display());
             eprintln!("rendered in {:.1}s", rendered.timings.total_s);
             Ok(())
         };
