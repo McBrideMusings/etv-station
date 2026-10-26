@@ -325,3 +325,58 @@ fn a_song_under_the_confidence_floor_is_never_played() {
         "s-weak is under the floor"
     );
 }
+
+#[test]
+fn a_song_entered_by_a_bass_swap_rides_back_to_its_own_tempo() {
+    let f = Fixture::new();
+    let built = build(&plugin_path(), &f.input(&four_songs(), "landing", 600_000)).unwrap();
+    let plan = f.plan();
+
+    assert!(plan.tracks.len() >= 2, "{} songs", plan.tracks.len());
+    assert_eq!(plan.tracks[0].ride_bars, 0);
+    // Every swapped song that is not the last has room for the ride; the last
+    // may have lost it to the end of the gap.
+    let last = plan.tracks.len() - 1;
+    for (i, track) in plan
+        .tracks
+        .iter()
+        .enumerate()
+        .skip(1)
+        .take(last.saturating_sub(1))
+    {
+        if (track.ratio - 1.0).abs() > 1e-6 {
+            assert_eq!(track.ride_bars, 16, "{} (track {i})", track.entry_id);
+        }
+    }
+    assert!(
+        plan.tracks.iter().skip(1).any(|t| t.ride_bars == 16),
+        "tempos 118 to 122 differ, so at least one swap rides"
+    );
+    // The slot the plugin airs is the length the renderer lays the ride out to.
+    let etv_station::bumper::timeline::Duration::Fixed(aired_ms) =
+        built.timeline.segments[0].duration
+    else {
+        panic!("expected a fixed slot");
+    };
+    assert!(
+        (aired_ms as f64 - plan.duration_s() * 1000.0).abs() < 2.0,
+        "the slot is {aired_ms} ms, the plan lasts {} s",
+        plan.duration_s()
+    );
+}
+
+#[test]
+fn ride_bars_zero_keeps_the_swaps_tempo_for_the_whole_song() {
+    let f = Fixture::new();
+    let mut input = f.input(&four_songs(), "landing", 600_000);
+    input.config.as_mut().unwrap()["ride_bars"] = json!(0);
+    build(&plugin_path(), &input).unwrap();
+    let plan = f.plan();
+    assert!(plan.tracks.iter().all(|t| t.ride_bars == 0));
+    assert!(
+        plan.tracks
+            .iter()
+            .skip(1)
+            .any(|t| (t.ratio - 1.0).abs() > 1e-6)
+    );
+}

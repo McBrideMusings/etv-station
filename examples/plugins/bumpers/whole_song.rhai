@@ -13,6 +13,9 @@
 //   tempo_gap_pct:   a gap wider than this between the running tempo and the next
 //                    song's, in percent, falls back to echo_out, default 8
 //   drop_step_db:    an arrival this many dB louder than the exit is a drop_mix, default 3
+//   ride_bars:       bars over which a song that entered by a bass swap at the outgoing
+//                    song's tempo steps back to its own, default 16; 0 keeps the swap's
+//                    tempo for the rest of the song
 //   artist_field:    item field holding the artist for the card, default "show"
 //   card_script:     overlay script that draws the card copy, relative to the
 //                    channel config's directory; unset carries no overlay
@@ -26,7 +29,10 @@
 // when the arrival is a step up in energy; otherwise bass_swap, 2 bars with a
 // sweep when the arrival is near the song's peak, 4 bars without. A song that
 // enters at its start has no lead-in for a bass swap, so that seam is a drop_mix
-// on a step up and an echo_out otherwise.
+// on a step up and an echo_out otherwise. After a bass swap the incoming song plays
+// at the outgoing song's tempo and rides back to its own over `ride_bars` bars, so
+// the next seam starts from the song's native tempo; a song with no room for the
+// ride before its seam or the end of the set keeps the swap's tempo instead.
 //
 // Beside each render it writes <stem>.plan.json and <stem>.audit.txt (one line
 // per seam). The segment is named `chapter:<job>|<entry>|...` so `GET
@@ -42,6 +48,49 @@ fn min_last_s() { 6.0 }
 fn end_margin_s() { 0.5 }
 
 fn num(v) { v * 1.0 }
+
+// Config `ride_bars` as a whole number of bars the renderer accepts (0 to 64).
+fn ride_bars_of(cfg) {
+    let n = conf(cfg, "ride_bars", 16).to_int();
+    if n < 0 { 0 } else if n > 64 { 64 } else { n }
+}
+
+// A song's bar in the file, as the renderer counts it (240 / bpm).
+fn file_bar(item) { 240.0 / num(item.audio.bpm) }
+
+// The ratio of each bar of a track's tempo ride: a straight line from the entry
+// ratio to 1.0, the last bar native (crates/etv-render/src/set.rs Track::ride_ratios).
+fn ride_ratios(tr) {
+    let out = [];
+    for i in 1..=tr.ride { out.push(tr.ratio + (1.0 - tr.ratio) * i / tr.ride); }
+    out
+}
+
+fn ride_src(tr) { tr.ride * file_bar(tr.item) }
+
+fn ride_out(tr) {
+    let total = 0.0;
+    if tr.ride > 0 { for r in ride_ratios(tr) { total += file_bar(tr.item) / r; } }
+    total
+}
+
+// The ratio a track plays at once its ride is over.
+fn exit_ratio(tr) { if tr.ride > 0 { 1.0 } else { tr.ratio } }
+
+// Set seconds taken to play `src_s` seconds of the file from where the song enters.
+fn play_out(tr, src_s) {
+    if tr.ride > 0 { ride_out(tr) + (src_s - ride_src(tr)) } else { src_s / tr.ratio }
+}
+
+// Where the set stops in a last song that has `play` set seconds. A gap that ends
+// before the ride has finished and left a closing fade drops the ride.
+fn finish(tr, play) {
+    if tr.ride > 0 && play >= ride_out(tr) + 3.0 {
+        #{ end_s: tr.enter + ride_src(tr) + (play - ride_out(tr)), ride: tr.ride }
+    } else {
+        #{ end_s: tr.enter + play * tr.ratio, ride: 0 }
+    }
+}
 
 fn conf(cfg, key, fallback) {
     let v = cfg[key];
@@ -294,7 +343,7 @@ fn build(ctx) {
     // Walk the set song by song, tracking where it is on the timeline exactly as
     // the renderer lays it out (crates/etv-render/src/set.rs).
     let songs = [first];
-    let tracks = [#{ item: first, enter: entry_of(first, cfg), ratio: 1.0, at: 0.0 }];
+    let tracks = [#{ item: first, enter: entry_of(first, cfg), ratio: 1.0, ride: 0, at: 0.0 }];
     let seams = [];
     let notes = [];
     let t = 0.0;
@@ -302,33 +351,50 @@ fn build(ctx) {
     while end_s == () {
         let cur = tracks[tracks.len() - 1];
         let a = cur.item;
-        let room = (num(a.duration_ms) / 1000.0 - end_margin_s() - cur.enter) / cur.ratio;
+        let a_bar = bar_seconds(a);
+        // The ride needs the file to last past it and a seam out beyond it.
+        if cur.ride > 0 {
+            let file_room = num(a.duration_ms) / 1000.0 - end_margin_s() - cur.enter;
+            if file_room < ride_src(cur) + 3.0 * file_bar(a)
+                || phrase_out(a, cur.enter + (cur.ride + min_body_bars()) * a_bar, 5.0 * a_bar) == () {
+                cur.ride = 0;
+                tracks[tracks.len() - 1].ride = 0;
+            }
+        }
+        let ra = exit_ratio(cur);
+        let room = play_out(cur, num(a.duration_ms) / 1000.0 - end_margin_s() - cur.enter);
         if t + room >= gap_s || cands.len() == 0 {
             let play = if t + room >= gap_s { gap_s - t } else { room };
-            end_s = cur.enter + play * cur.ratio;
+            let fin = finish(cur, play);
+            end_s = fin.end_s;
+            tracks[tracks.len() - 1].ride = fin.ride;
             break;
         }
-        let b = next_song(ctx, cands, num(a.audio.bpm) * cur.ratio);
+        let b = next_song(ctx, cands, num(a.audio.bpm) * ra);
         let b_enter = entry_of(b, cfg);
-        let pick = choose(a, cur.ratio, b, b_enter, cfg);
-        let a_bar = bar_seconds(a);
+        let pick = choose(a, ra, b, b_enter, cfg);
         let room_bars = if pick.recipe == "bass_swap" { pick.bars + 1 } else if pick.recipe == "echo_out" { 2 } else { 4 };
-        let po = phrase_out(a, cur.enter + min_body_bars() * a_bar, room_bars * a_bar);
+        let po = phrase_out(a, cur.enter + ride_src(cur) + min_body_bars() * a_bar, room_bars * a_bar);
         if po == () {
             // This song cannot be left from here; end the set on it.
-            end_s = cur.enter + room * cur.ratio;
+            let fin = finish(cur, room);
+            end_s = fin.end_s;
+            tracks[tracks.len() - 1].ride = fin.ride;
             break;
         }
         let out_s = bar_time(a, po);
-        let bl = a_bar / cur.ratio;
-        let body = (out_s - cur.enter) / cur.ratio;
+        let bl = a_bar / ra;
+        let body = play_out(cur, out_s - cur.enter);
         let half = pick.bars / 2.0 * bl;
         let landed = t + body + (if pick.recipe == "bass_swap" { half } else { 0.0 });
         if landed > gap_s - min_last_s() {
-            end_s = cur.enter + room * cur.ratio;
+            let fin = finish(cur, room);
+            end_s = fin.end_s;
+            tracks[tracks.len() - 1].ride = fin.ride;
             break;
         }
-        let b_ratio = if pick.recipe == "bass_swap" { num(a.audio.bpm) * cur.ratio / num(b.audio.bpm) } else { 1.0 };
+        let b_ratio = if pick.recipe == "bass_swap" { num(a.audio.bpm) * ra / num(b.audio.bpm) } else { 1.0 };
+        let b_ride = if pick.recipe == "bass_swap" && (b_ratio - 1.0).abs() > 0.000001 { ride_bars_of(cfg) } else { 0 };
         seams.push(#{ recipe: pick.recipe, out_s: out_s });
         if pick.recipe == "bass_swap" {
             seams[seams.len() - 1].bars = pick.bars;
@@ -340,11 +406,11 @@ fn build(ctx) {
             + b_enter + "s, tempo gap " + pick.gap_pct + "%, energy step " + pick.step_db + " dB, running " + pick.running_bpm + " bpm\n");
         songs.push(b);
         cands = without(cands, b.entry_id);
-        tracks.push(#{ item: b, enter: b_enter, ratio: b_ratio, at: t + body });
+        tracks.push(#{ item: b, enter: b_enter, ratio: b_ratio, ride: b_ride, at: t + body });
         t = landed;
     }
     let last = tracks[tracks.len() - 1];
-    let set_s = t + (end_s - last.enter) / last.ratio;
+    let set_s = t + play_out(last, end_s - last.enter);
 
     let ids = "";
     for s in songs { ids += s.entry_id + "|"; }
@@ -360,7 +426,9 @@ fn build(ctx) {
     let fields = conf(cfg, "artist_field", "show");
     for tr in tracks {
         let it = tr.item;
-        plan.tracks.push(#{ entry_id: it.entry_id, path: it.path, native_bpm: num(it.audio.bpm), enter_s: tr.enter, ratio: tr.ratio });
+        let track = #{ entry_id: it.entry_id, path: it.path, native_bpm: num(it.audio.bpm), enter_s: tr.enter, ratio: tr.ratio };
+        if tr.ride > 0 { track.ride_bars = tr.ride; }
+        plan.tracks.push(track);
         let card = #{
             at_s: tr.at,
             artist: (it[fields] ?? it.show ?? it.studio ?? "").to_string(),

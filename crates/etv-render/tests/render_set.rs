@@ -42,6 +42,7 @@ fn plan(dir: &Path, recipe: Recipe, bars: u32, b_enter: f64) -> SetPlan {
         native_bpm: 120.0,
         enter_s,
         ratio: 1.0,
+        ride_bars: 0,
     };
     SetPlan {
         kind: SetKind::Set,
@@ -126,4 +127,21 @@ fn a_queued_set_renders_through_the_sidecar_path() {
     let done = process_next(&queue, &settings, u64::MAX, OffsetDateTime::now_utc).unwrap();
     assert_eq!(done.status, Status::Done, "{:?}", done.last_error);
     assert!(plan.output.exists());
+}
+
+#[test]
+fn a_song_riding_back_to_its_own_tempo_renders_to_the_planned_length() {
+    let (_guard, dir) = temp();
+    let mut plan = plan(&dir, Recipe::BassSwap, 2, 8.0);
+    plan.tracks[1].native_bpm = 108.0;
+    plan.tracks[1].ratio = 120.0 / 108.0;
+    plan.tracks[1].ride_bars = 2;
+    let planned = plan.duration_s();
+    etv_render::set_render::render(&plan, &settings(&dir)).unwrap();
+    let length = duration_s(&plan.output);
+    assert!(
+        (length - planned).abs() < 0.1,
+        "rendered {length}s, planned {planned}s"
+    );
+    assert_eq!(has_audio_and_video(&plan.output), (true, true));
 }

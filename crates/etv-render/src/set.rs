@@ -35,6 +35,8 @@ const SHORT_FADE_S: f64 = 0.02;
 const LAST_FADE_S: f64 = 2.0;
 /// How far a bass swap's incoming tempo may sit from the running tempo.
 const RATIO_TOLERANCE: f64 = 0.002;
+/// The longest tempo ride a track may ask for.
+const MAX_RIDE_BARS: u32 = 64;
 
 /// The `kind` a set plan carries; a plan without a `kind` is a chapter plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,8 +73,14 @@ pub struct Track {
     /// Where in the file the song enters the set, in seconds: its start, or its
     /// landing bar.
     pub enter_s: f64,
-    /// Source seconds played per set second; 1.0 is the song's own tempo.
+    /// Source seconds played per set second when the song enters; 1.0 is the
+    /// song's own tempo.
     pub ratio: f64,
+    /// Bars of the song's own grid, counted from `enter_s`, over which a song
+    /// that enters at another tempo steps back to its own, one tempo per bar;
+    /// 0 keeps `ratio` for as long as the song plays.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ride_bars: u32,
 }
 
 impl Track {
@@ -81,9 +89,52 @@ impl Track {
         240.0 / self.native_bpm
     }
 
-    /// Seconds in one bar as the set plays it.
+    /// Whether the song's tempo rides back to native after it enters.
+    fn rides(&self) -> bool {
+        self.ride_bars > 0 && (self.ratio - 1.0).abs() > 1e-9
+    }
+
+    /// The ratio the song plays at once its ride is over.
+    fn exit_ratio(&self) -> f64 {
+        if self.rides() { 1.0 } else { self.ratio }
+    }
+
+    /// Seconds in one bar as the set plays it when the song leaves.
     fn bar_s(&self) -> f64 {
-        self.source_bar_s() / self.ratio
+        self.source_bar_s() / self.exit_ratio()
+    }
+
+    /// The ratio of each bar of the ride: bar 1 is one step from `ratio` towards
+    /// 1.0 and the last bar is native.
+    fn ride_ratios(&self) -> Vec<f64> {
+        if !self.rides() {
+            return Vec::new();
+        }
+        let n = f64::from(self.ride_bars);
+        (1..=self.ride_bars)
+            .map(|i| self.ratio + (1.0 - self.ratio) * f64::from(i) / n)
+            .collect()
+    }
+
+    /// Seconds of the file the ride covers.
+    fn ride_src_s(&self) -> f64 {
+        if self.rides() {
+            f64::from(self.ride_bars) * self.source_bar_s()
+        } else {
+            0.0
+        }
+    }
+
+    /// Set seconds the ride lasts.
+    fn ride_out_s(&self) -> f64 {
+        let bar = self.source_bar_s();
+        self.ride_ratios().iter().map(|r| bar / r).sum()
+    }
+
+    /// Set seconds taken to play `src_s` seconds of the file from `enter_s`;
+    /// `src_s` reaches past the ride.
+    fn play_out_s(&self, src_s: f64) -> f64 {
+        self.ride_out_s() + (src_s - self.ride_src_s()) / self.exit_ratio()
     }
 }
 
@@ -140,14 +191,36 @@ pub struct AudioLayer {
     /// Seconds it lasts in the set, after stretching.
     pub out_len: f64,
     pub ratio: f64,
+    /// When the layer opens with a tempo ride: the bar's length in the file and
+    /// the ratio of each bar, ending at 1.0, which the layer then keeps.
+    pub ride: Option<Ride>,
     /// ffmpeg audio filters applied after the stretch, fades included.
     pub filters: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ride {
+    pub bar_src_s: f64,
+    pub ratios: Vec<f64>,
+}
+
+impl Ride {
+    fn out_s(&self) -> f64 {
+        self.ratios.iter().map(|r| self.bar_src_s / r).sum()
+    }
+
+    fn src_s(&self) -> f64 {
+        self.bar_src_s * self.ratios.len() as f64
+    }
 }
 
 impl AudioLayer {
     /// Seconds of the file the excerpt reads.
     pub fn src_len(&self) -> f64 {
-        self.out_len * self.ratio
+        match &self.ride {
+            Some(ride) => ride.src_s() + (self.out_len - ride.out_s()),
+            None => self.out_len * self.ratio,
+        }
     }
 }
 
@@ -179,6 +252,46 @@ fn fade_in(start: f64, len: f64) -> String {
 
 fn fade_out(start: f64, len: f64) -> String {
     format!("afade=t=out:st={:.4}:d={len:.4}", start.max(0.0))
+}
+
+fn ride_of(track: &Track) -> Option<Ride> {
+    track.rides().then(|| Ride {
+        bar_src_s: track.source_bar_s(),
+        ratios: track.ride_ratios(),
+    })
+}
+
+/// The picture of `track` from where it enters to `src_to` in its file, laid
+/// from set second `t`: one segment, or, after a bass swap, one segment per bar
+/// of the tempo ride and one for the rest. Each ride bar's `ratio` is the bar's
+/// source length over its set length, so picture and sound meet at every bar.
+fn played_picture(
+    track: &Track,
+    index: usize,
+    t: f64,
+    src_to: f64,
+    name: &str,
+) -> Vec<VideoSegment> {
+    let seg = |src_start: f64, out_start: f64, out_len: f64, ratio: f64| VideoSegment {
+        name: name.to_string(),
+        track: index,
+        src_start,
+        out_start,
+        out_len,
+        ratio,
+    };
+    let mut out = Vec::new();
+    let mut at = t;
+    let mut src = track.enter_s;
+    let bar = track.source_bar_s();
+    for r in track.ride_ratios() {
+        out.push(seg(src, at, bar / r, r));
+        at += bar / r;
+        src += bar;
+    }
+    let ratio = track.exit_ratio();
+    out.push(seg(src, at, (src_to - src) / ratio, ratio));
+    out
 }
 
 impl SetPlan {
@@ -215,6 +328,17 @@ impl SetPlan {
         let mut ids = BTreeSet::new();
         for (i, t) in self.tracks.iter().enumerate() {
             let at = format!("tracks[{i}] ({})", t.entry_id);
+            if t.ride_bars > MAX_RIDE_BARS {
+                return bad(format!(
+                    "{at}: ride_bars {} is over the {MAX_RIDE_BARS} bar limit",
+                    t.ride_bars
+                ));
+            }
+            if t.ride_bars > 0 && (i == 0 || self.seams[i - 1].recipe != Recipe::BassSwap) {
+                return bad(format!(
+                    "{at}: ride_bars belongs to a song that enters by a bass_swap"
+                ));
+            }
             if !ids.insert(t.entry_id.as_str()) {
                 return bad(format!("{at}: entry_id appears twice in tracks"));
             }
@@ -232,10 +356,18 @@ impl SetPlan {
             let a = &self.tracks[k];
             let b = &self.tracks[k + 1];
             let at = format!("seams[{k}] ({} -> {})", a.entry_id, b.entry_id);
-            if !seam.out_s.is_finite() || seam.out_s < a.enter_s + a.source_bar_s() {
+            let plays_from = a.enter_s + a.ride_src_s();
+            if !seam.out_s.is_finite() || seam.out_s < plays_from + a.source_bar_s() {
                 return bad(format!(
-                    "{at}: out_s {} leaves less than one bar of {} after it enters at {}s",
-                    seam.out_s, a.entry_id, a.enter_s
+                    "{at}: out_s {} leaves less than one bar of {} after it enters at {}s{}",
+                    seam.out_s,
+                    a.entry_id,
+                    a.enter_s,
+                    if a.rides() {
+                        format!(" and its {}-bar tempo ride", a.ride_bars)
+                    } else {
+                        String::new()
+                    }
                 ));
             }
             match seam.recipe {
@@ -254,7 +386,7 @@ impl SetPlan {
                             b.entry_id, b.enter_s
                         ));
                     }
-                    let running = a.native_bpm * a.ratio;
+                    let running = a.native_bpm * a.exit_ratio();
                     let wanted = running / b.native_bpm;
                     if (b.ratio - wanted).abs() > RATIO_TOLERANCE {
                         return bad(format!(
@@ -264,7 +396,7 @@ impl SetPlan {
                     }
                 }
                 Recipe::EchoOut => {
-                    if seam.out_s < a.enter_s + 2.0 * a.source_bar_s() {
+                    if seam.out_s < plays_from + 2.0 * a.source_bar_s() {
                         return bad(format!(
                             "{at}: an echo_out needs a bar of {} before out_s and the bar's echo after it",
                             a.entry_id
@@ -278,10 +410,18 @@ impl SetPlan {
             }
         }
         let last = self.tracks.last().expect("checked non-empty");
-        if !self.end_s.is_finite() || self.end_s < last.enter_s + LAST_FADE_S * last.ratio {
+        let last_from = last.enter_s + last.ride_src_s();
+        if !self.end_s.is_finite() || self.end_s < last_from + LAST_FADE_S * last.exit_ratio() {
             return bad(format!(
-                "end_s {} leaves less than the {LAST_FADE_S}s closing fade after {} enters at {}s",
-                self.end_s, last.entry_id, last.enter_s
+                "end_s {} leaves less than the {LAST_FADE_S}s closing fade after {} enters at {}s{}",
+                self.end_s,
+                last.entry_id,
+                last.enter_s,
+                if last.rides() {
+                    format!(" and its {}-bar tempo ride", last.ride_bars)
+                } else {
+                    String::new()
+                }
             ));
         }
         if self.output.as_os_str().is_empty() {
@@ -309,12 +449,13 @@ impl SetPlan {
         for (k, seam) in self.seams.iter().enumerate() {
             let a = &self.tracks[k];
             let b = &self.tracks[k + 1];
-            let ra = a.ratio;
+            let ra = a.exit_ratio();
             let pos = a.enter_s;
             let bl = a.bar_s();
             let p = seam.out_s;
-            let body = (p - pos) / ra;
+            let body = a.play_out_s(p - pos);
             let tp = t + body;
+            let ride = ride_of(a);
             let name = |what: &str| format!("seam {} ({}) {what}", k + 1, a.entry_id);
             let name_b = |what: &str| format!("seam {} ({}) {what}", k + 1, b.entry_id);
             let vseg = |track: usize, src_start: f64, out_start: f64, out_len: f64, ratio: f64| {
@@ -327,7 +468,13 @@ impl SetPlan {
                     ratio,
                 }
             };
-            video.push(vseg(k, pos, t, body, ra));
+            video.extend(played_picture(
+                a,
+                k,
+                t,
+                p,
+                &format!("seam {} picture", k + 1),
+            ));
             match seam.recipe {
                 Recipe::BassSwap => {
                     let half = f64::from(seam.bars) / 2.0 * bl;
@@ -340,7 +487,8 @@ impl SetPlan {
                         src_start: pos,
                         out_start: t,
                         out_len: through,
-                        ratio: ra,
+                        ratio: a.ratio,
+                        ride,
                         filters: vec![fade_out(through - SHORT_FADE_S, SHORT_FADE_S)],
                     });
                     let band = if seam.sweep {
@@ -355,6 +503,7 @@ impl SetPlan {
                         out_start: swap,
                         out_len: half,
                         ratio: ra,
+                        ride: None,
                         filters: vec![
                             band,
                             fade_in(0.0, SHORT_FADE_S),
@@ -369,6 +518,7 @@ impl SetPlan {
                         out_start: tp,
                         out_len: half,
                         ratio: rb,
+                        ride: None,
                         filters: vec![
                             format!("highpass=f={BASS_CROSSOVER_HZ}"),
                             fade_in(0.0, bl.min(half)),
@@ -406,7 +556,8 @@ impl SetPlan {
                         src_start: pos,
                         out_start: t,
                         out_len: bar_before,
-                        ratio: ra,
+                        ratio: a.ratio,
+                        ride,
                         filters: vec![fade_out(bar_before - SHORT_FADE_S, SHORT_FADE_S)],
                     });
                     let delay_ms = (bl / 4.0 * 0.75 * 1000.0) as i64;
@@ -417,6 +568,7 @@ impl SetPlan {
                         out_start: tp - bl,
                         out_len: 3.0 * bl,
                         ratio: ra,
+                        ride: None,
                         filters: vec![
                             format!("aecho=0.8:0.7:{delay_ms}:0.55"),
                             fade_in(0.0, SHORT_FADE_S),
@@ -432,7 +584,8 @@ impl SetPlan {
                         src_start: pos,
                         out_start: t,
                         out_len: body,
-                        ratio: ra,
+                        ratio: a.ratio,
+                        ride,
                         filters: vec![fade_out(body - CUT_FADE_S, CUT_FADE_S)],
                     });
                     t = tp;
@@ -442,7 +595,7 @@ impl SetPlan {
         }
         let last_at = self.tracks.len() - 1;
         let last = &self.tracks[last_at];
-        let n = (self.end_s - last.enter_s) / last.ratio;
+        let n = last.play_out_s(self.end_s - last.enter_s);
         audio.push(AudioLayer {
             name: format!("last song ({})", last.entry_id),
             track: last_at,
@@ -450,16 +603,16 @@ impl SetPlan {
             out_start: t,
             out_len: n,
             ratio: last.ratio,
+            ride: ride_of(last),
             filters: vec![fade_out(n - LAST_FADE_S, LAST_FADE_S)],
         });
-        video.push(VideoSegment {
-            name: "last song picture".into(),
-            track: last_at,
-            src_start: last.enter_s,
-            out_start: t,
-            out_len: n,
-            ratio: last.ratio,
-        });
+        video.extend(played_picture(
+            last,
+            last_at,
+            t,
+            self.end_s,
+            "last song picture",
+        ));
         video.sort_by(|x, y| x.out_start.total_cmp(&y.out_start));
         Layout {
             audio,
@@ -480,7 +633,26 @@ pub fn filter_graph(layout: &Layout, sample_rate: u32) -> String {
         let mut chain = format!(
             "[{i}:a]asetpts=PTS-STARTPTS,aresample={sample_rate},aformat=channel_layouts=stereo"
         );
-        if (l.ratio - 1.0).abs() > 1e-9 {
+        if let Some(ride) = &l.ride {
+            // The tempo steps once a bar, on the input's clock: the file's own
+            // seconds, since the stretch comes after.
+            let steps: Vec<String> = ride
+                .ratios
+                .iter()
+                .enumerate()
+                .skip(1)
+                .map(|(bar, r)| {
+                    format!(
+                        "{:.4} rubberband@ride{i} tempo {r:.6}",
+                        bar as f64 * ride.bar_src_s
+                    )
+                })
+                .collect();
+            if !steps.is_empty() {
+                chain.push_str(&format!(",asendcmd=c='{}'", steps.join(";")));
+            }
+            chain.push_str(&format!(",rubberband@ride{i}=tempo={:.6}", ride.ratios[0]));
+        } else if (l.ratio - 1.0).abs() > 1e-9 {
             chain.push_str(&format!(",rubberband=tempo={:.6}", l.ratio));
         }
         for f in &l.filters {
@@ -511,6 +683,7 @@ mod tests {
             native_bpm: bpm,
             enter_s,
             ratio,
+            ride_bars: 0,
         }
     }
 
@@ -648,6 +821,159 @@ mod tests {
         stretched.tracks[0].ratio = 1.1;
         let g = filter_graph(&stretched.layout(), 44_100);
         assert!(g.contains("rubberband=tempo=1.100000"));
+    }
+
+    /// Song b is 108 bpm (2.222 s bars) playing at a's 120 bpm after a bass swap,
+    /// then riding back to 108 over 4 bars.
+    fn riding() -> SetPlan {
+        let mut p = plan(Recipe::BassSwap, 2);
+        p.tracks[1] = track("b", 108.0, 32.0, 120.0 / 108.0);
+        p.tracks[1].ride_bars = 4;
+        p
+    }
+
+    #[test]
+    fn a_ride_steps_the_tempo_back_to_native_once_a_bar() {
+        let p = riding();
+        p.validate().unwrap();
+        let ratios = p.tracks[1].ride_ratios();
+        assert_eq!(ratios.len(), 4);
+        let r0 = 120.0 / 108.0;
+        for (i, r) in ratios.iter().enumerate() {
+            assert_close(*r, r0 + (1.0 - r0) * (i + 1) as f64 / 4.0);
+        }
+        assert_close(ratios[3], 1.0);
+        assert_close(p.tracks[1].exit_ratio(), 1.0);
+    }
+
+    #[test]
+    fn a_rides_last_song_reads_the_file_the_picture_and_sound_agree_on() {
+        let p = riding();
+        let l = p.layout();
+        let last = l.audio.last().unwrap();
+        let ride = last
+            .ride
+            .as_ref()
+            .expect("the last song opens with the ride");
+        let bar = 240.0 / 108.0;
+        let ride_out: f64 = ride.ratios.iter().map(|r| bar / r).sum();
+        // end_s 80 s minus the 32 s entry, 4 bars of which ride.
+        assert_close(last.out_len, ride_out + (48.0 - 4.0 * bar));
+        assert_close(last.src_len(), 48.0);
+        assert_close(l.duration_s, 82.0 + last.out_len);
+        // One picture segment per ride bar, each ending where the next begins,
+        // then one for the rest at native tempo.
+        let pics: Vec<&VideoSegment> = l
+            .video
+            .iter()
+            .filter(|v| v.track == 1 && v.name == "last song picture")
+            .collect();
+        assert_eq!(pics.len(), 5);
+        for (seg, r) in pics.iter().zip(&ride.ratios) {
+            assert_close(seg.ratio, *r);
+            assert_close(seg.out_len * seg.ratio, bar);
+        }
+        assert_close(pics[4].ratio, 1.0);
+        let mut end = 0.0;
+        for v in &l.video {
+            assert_close(v.out_start, end);
+            end = v.out_start + v.out_len;
+        }
+        assert_close(end, l.duration_s);
+    }
+
+    #[test]
+    fn the_filter_graph_sends_one_tempo_per_bar_to_the_stretch() {
+        let g = filter_graph(&riding().layout(), 44_100);
+        let bar = 240.0 / 108.0;
+        assert!(g.contains("rubberband@ride3=tempo=1.083333"), "{g}");
+        assert!(
+            g.contains(&format!(
+                "asendcmd=c='{:.4} rubberband@ride3 tempo 1.055556;",
+                bar
+            )),
+            "{g}"
+        );
+        assert!(
+            g.contains(&format!(
+                "{:.4} rubberband@ride3 tempo 1.000000'",
+                3.0 * bar
+            )),
+            "{g}"
+        );
+    }
+
+    #[test]
+    fn two_rides_in_one_set_each_command_their_own_stretch() {
+        let mut p = riding();
+        p.tracks.push(track("c", 100.0, 32.0, 1.08));
+        p.seams.push(seam(Recipe::BassSwap, 32.0 + 20.0, 2, false));
+        p.tracks[2].ride_bars = 4;
+        p.end_s = 32.0 + 40.0;
+        p.validate().unwrap();
+        let g = filter_graph(&p.layout(), 44_100);
+        assert!(
+            g.contains("rubberband@ride3=") && g.contains("rubberband@ride6="),
+            "{g}"
+        );
+        assert!(
+            !g.contains("rubberband@ride tempo") && !g.contains("rubberband@ride="),
+            "{g}"
+        );
+    }
+
+    #[test]
+    fn a_ride_that_does_not_finish_before_the_seam_out_is_refused() {
+        let mut p = riding();
+        p.tracks.push(track("c", 108.0, 32.0, 1.0));
+        p.seams.push(seam(Recipe::DropMix, 32.0 + 8.0, 0, false));
+        p.end_s = 80.0;
+        let err = p.validate().unwrap_err().to_string();
+        assert!(err.contains("tempo ride"), "{err}");
+        p.seams[1].out_s = 32.0 + 12.0;
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn a_ride_that_does_not_finish_before_the_closing_fade_is_refused() {
+        let mut p = riding();
+        p.end_s = 32.0 + 9.0;
+        assert!(p.validate().unwrap_err().to_string().contains("tempo ride"));
+    }
+
+    #[test]
+    fn a_ride_belongs_to_a_song_entered_by_a_bass_swap() {
+        let mut p = riding();
+        p.seams[0] = seam(Recipe::DropMix, 96.0, 0, false);
+        p.tracks[1].ratio = 1.0;
+        assert!(p.validate().unwrap_err().to_string().contains("ride_bars"));
+        let mut q = riding();
+        q.tracks[0].ride_bars = 4;
+        assert!(q.validate().unwrap_err().to_string().contains("ride_bars"));
+    }
+
+    #[test]
+    fn the_next_bass_swap_after_a_ride_locks_to_the_native_tempo() {
+        let mut p = riding();
+        // b has ridden back to 108 bpm by its seam out, so c must run at 108 / 100.
+        p.tracks.push(track("c", 100.0, 32.0, 1.08));
+        p.seams.push(seam(Recipe::BassSwap, 32.0 + 20.0, 2, false));
+        p.validate().unwrap();
+        p.tracks[2].ratio = 1.2;
+        assert!(
+            p.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("ratio must be")
+        );
+    }
+
+    #[test]
+    fn a_track_without_a_ride_serialises_without_the_key() {
+        let json = serde_json::to_string(&plan(Recipe::DropMix, 0)).unwrap();
+        assert!(!json.contains("ride_bars"), "{json}");
+        let json = serde_json::to_string(&riding()).unwrap();
+        assert!(json.contains("\"ride_bars\":4"), "{json}");
     }
 
     fn rejects(edit: impl FnOnce(&mut SetPlan), needle: &str) {
