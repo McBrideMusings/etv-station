@@ -1420,6 +1420,8 @@ draws nothing.
 ] }
 ```
 
+**Previewing an item.** Channels › Graphics renders a still of a cascade script at time `at`. A script that reads the playing item sits beside a `<script stem>.states.json`, an array of `{name, item_elapsed?, item_remaining?, title?, metadata?}` fixture items; the tab lists each name as a Still button, and `POST /api/channels/{ch}/graphics/render` takes `state` with a still to render against that item (`--item-elapsed`, `--item-remaining`, `--title`, `--metadata` of `etv-overlay render-still`). `examples/overlays/hook_card.states.json` is one.
+
 **Text layers.** A `text` layer draws one block of text. `\n` in `content` breaks
 a line, and the block is as wide as its widest line:
 
@@ -3338,7 +3340,7 @@ A JSON document. Unknown keys are refused. `crates/etv-render/tests/fixtures/cha
 | `hooks` | The songs in air order: `entry_id`, `path`, `landing_s` (where the hook's landing bar starts in the file), `native_bpm`, `semitones` (moved to reach the chapter key), `vocal_over_bars` (bars this song's vocal sings over the previous song's instrumental; 0 for the first hook), `full_bars` (bars of vocal and instrumental together after that). |
 | `broll` | Optional video-only sources, `{entry_id, path}`, that cuts may draw from besides the hooks. |
 | `cuts` | The picture, in air order, with no gap: `entry_id` (a hook or B-roll source), `native_start_s`, `out_start_s`, `length_s`, `ratio` (source seconds per chapter second). |
-| `cards` | `{at_s, artist, title, year?}`. The renderer does not draw them; the overlay does. |
+| `cards` | `{at_s, artist, title, year?}`. The renderer does not draw them; the overlay does (`examples/overlays/hook_card.rhai` draws artist and title for one bar from each `at_s`; it ignores `year`). |
 | `output` | Where the rendered file lands. |
 
 The chapter lasts `bar_seconds` times the sum of every hook's `vocal_over_bars` and `full_bars`.
@@ -3379,7 +3381,7 @@ The image also reads `ETV_RENDER_PYTHON` (the interpreter with Demucs and PyTorc
 2. Clusters form around each seed (at most `seeds` of them): entries within `tempo_band_pct` percent of the seed's tempo and at Camelot distance 1 or less from its key. The `rule` ranker picks the cluster with the most candidates, a tie going to the channel's seeded rng. The chapter tempo is the cluster's median, its key the seed's.
 3. The hooks are drawn from the cluster, ordered by rising energy over the four bars from each song's landing bar, and each is moved by the semitone shift within `max_shift` that lands closest to the chapter key. A hook is 16 bars (8 when 16 bars would pass 40 seconds), starts on an 8-bar boundary of the chapter, and from the second hook on opens with `vocal_over_bars` bars of its vocal over the previous instrumental. Picture cuts are four bars long, alternating a hook's own video with another hook's.
 4. The plan (§ Chapter plan) is written to `<dir>/<stem>.plan.json` with `<stem>.audit.txt` (one seam line per hook) beside it, and queued with `<enqueue> <enqueue_args> enqueue <plan> --air-at <t>`, where `t` is the gap's start. `ctx.exec` returns at once, since `enqueue` only files the plan.
-5. The timeline is one `pending(<dir>/<stem>.mp4, <dir>/stand-in.mp4)` segment, looped, named `chapter:<job>|<entry>|<entry>...`. The stand-in is a ten-second black clip with a brown-noise bed that the script makes with `ffmpeg` once. With no `enqueue` program, the plan is still written and the segment is named `chapter:unqueued-<stem>|...`. With no stand-in, the segment is black. When `card_script` is set the segment carries `overlay(card_script, #{ cards })`, `cards` being `{at_s, artist, title, year}` per hook, so the overlay reads the card copy from the item's metadata.
+5. The timeline is one `pending(<dir>/<stem>.mp4, <dir>/stand-in.mp4)` segment, looped, named `chapter:<job>|<entry>|<entry>...`. The stand-in is a ten-second black clip with a brown-noise bed that the script makes with `ffmpeg` once. With no `enqueue` program, the plan is still written and the segment is named `chapter:unqueued-<stem>|...`. With no stand-in, the segment is black. When `card_script` is set the segment carries `overlay(card_script, #{ cards })`, `cards` being `{at_s, artist, title, year}` per hook and `bar_s` the length of one bar, so the overlay reads the card copy from the item's metadata.
 
 Config keys: `expr` and `dir` (required); `floor` (default 2.5), `steady_beats` (32), `ranker` (only `rule`), `hooks_min` (3), `hooks_max` (5), `tempo_band_pct` (4), `max_shift` (3), `vocal_over_bars` (2), `tail` (12), `seeds` (60), `artist_field` (`show`), `card_script`, `enqueue` (`etv-station`), `enqueue_args` (`[]`), `ffmpeg` (`ffmpeg`). `examples/channels/megamix-test.yaml` fills a 12-minute grid with chapters after each music video.
 

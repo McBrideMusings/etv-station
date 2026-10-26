@@ -106,6 +106,8 @@ struct Job {
     at_secs: f64,
     clip_secs: f64,
     gap: String,
+    /// The named state of the script's sidecar a still is rendered in.
+    state: Option<Value>,
     footage: Option<Footage>,
     bumper: Option<BumperJob>,
     fonts: Vec<PathBuf>,
@@ -320,6 +322,27 @@ fn bumper_scripts(lc: &config::LoadedChannel) -> Vec<(PathBuf, config::FillEntry
     out
 }
 
+/// The states a script's sidecar `<stem>.states.json` names: an array of
+/// `{ name, item_elapsed?, item_remaining?, title?, metadata? }`, each a fixture
+/// item the script is previewed against. A missing sidecar is no states; one that
+/// does not parse is an error naming the file.
+fn script_states(script: &Path) -> Result<Vec<Value>, String> {
+    let sidecar = script.with_extension("states.json");
+    let text = match std::fs::read_to_string(&sidecar) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read {}: {e}", sidecar.display())),
+    };
+    let states: Vec<Value> = serde_json::from_str(&text)
+        .map_err(|e| format!("{} is not a JSON array of states: {e}", sidecar.display()))?;
+    for state in &states {
+        if state.get("name").and_then(Value::as_str).is_none() {
+            return Err(format!("{}: every state needs a name", sidecar.display()));
+        }
+    }
+    Ok(states)
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -343,16 +366,27 @@ pub(super) fn api_channel_graphics(state: &AppState, key: &str) -> Result<(u16, 
         )),
         Lookup::Loaded(station, index) => {
             let lc = &station.channels[index];
-            let overlays: Vec<Value> = overlay_scripts(lc)
-                .iter()
-                .map(|o| {
-                    json!({
-                        "script": o.script.display().to_string(),
-                        "name": file_name(&o.script),
-                        "graphic": o.name,
-                    })
-                })
-                .collect();
+            let mut overlays: Vec<Value> = Vec::new();
+            for o in overlay_scripts(lc) {
+                let (states, states_error) = match script_states(&o.script) {
+                    Ok(list) => (
+                        list.iter()
+                            .filter_map(|s| {
+                                s.get("name").and_then(Value::as_str).map(str::to_string)
+                            })
+                            .collect(),
+                        None,
+                    ),
+                    Err(e) => (Vec::new(), Some(e)),
+                };
+                overlays.push(json!({
+                    "script": o.script.display().to_string(),
+                    "name": file_name(&o.script),
+                    "graphic": o.name,
+                    "states": states,
+                    "states_error": states_error,
+                }));
+            }
             let bumpers: Vec<Value> = bumper_scripts(lc)
                 .iter()
                 .map(|(script, entry)| {
@@ -424,6 +458,7 @@ pub(super) fn api_graphics_render(
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_GAP)
         .to_string();
+    let state_name = req.get("state").and_then(Value::as_str).map(str::to_string);
     let gap_ms = crate::bumper::preview::parse_gap(&gap)?;
     if gap_ms > MAX_GAP_MS {
         return Err(format!("gap {gap:?} is over {} seconds", MAX_GAP_MS / 1000));
@@ -441,6 +476,7 @@ pub(super) fn api_graphics_render(
     let mut spec = lc.overlays.base.clone();
     let mut bumper = None;
     let mut script_inputs = vec![script.clone()];
+    let mut fixture = None;
     match kind {
         Kind::Still | Kind::Clip => {
             if !overlay_scripts(lc).iter().any(|o| o.script == script) {
@@ -453,6 +489,21 @@ pub(super) fn api_graphics_render(
             if let Some(spec) = spec.as_mut() {
                 spec.graphics
                     .retain(|g| g.script.is_none() || g.script.as_ref() == Some(&script));
+            }
+            if state_name.is_some() && kind != Kind::Still {
+                return Err("state applies to a still only".into());
+            }
+            if let Some(name) = &state_name {
+                fixture = script_states(&script)?
+                    .into_iter()
+                    .find(|s| s.get("name").and_then(Value::as_str) == Some(name));
+                if fixture.is_none() {
+                    return Err(format!(
+                        "{} has no state {name:?}; GET /api/channels/{key}/graphics lists them",
+                        script.display()
+                    ));
+                }
+                script_inputs.push(script.with_extension("states.json"));
             }
             script_inputs.extend(
                 lc.overlays
@@ -528,6 +579,7 @@ pub(super) fn api_graphics_render(
             clip_secs,
             gap,
             spec_yaml,
+            fixture,
         ])
         .to_string(),
     );
@@ -576,6 +628,7 @@ pub(super) fn api_graphics_render(
         at_secs,
         clip_secs,
         gap,
+        state: fixture,
         footage,
         bumper,
         fonts: station.station.fonts.clone(),
@@ -972,6 +1025,23 @@ fn render_in(work: &Path, dir: &Path, job: &Job, log: &mut String) -> Result<(),
             args.extend(os(&["--output"]));
             args.push(out.clone().into());
             args.extend(os(&["--time", &job.at_secs.to_string()]));
+            if let Some(state) = &job.state {
+                for key in ["item_elapsed", "item_remaining"] {
+                    if let Some(secs) = state.get(key).and_then(Value::as_f64) {
+                        args.extend(os(&[
+                            &format!("--{}", key.replace('_', "-")),
+                            &secs.to_string(),
+                        ]));
+                    }
+                }
+                if let Some(title) = state.get("title").and_then(Value::as_str) {
+                    args.extend(os(&["--title", title]));
+                }
+                if let Some(metadata) = state.get("metadata") {
+                    args.extend(os(&["--metadata", &metadata.to_string()]));
+                }
+                log.push_str(&format!("state: {state}\n"));
+            }
             run_step(log, overlay.as_os_str(), &args, None, STEP_SLACK)?;
         }
         Kind::Clip => {

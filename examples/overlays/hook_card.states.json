@@ -1,0 +1,8 @@
+[
+  { "name": "hidden", "item_elapsed": 20.0,
+    "metadata": { "vars": { "bar_s": 2.0, "cards": [ { "at_s": 0.0, "artist": "Ariana Grande", "title": "Into You" } ] } } },
+  { "name": "card", "item_elapsed": 0.5,
+    "metadata": { "vars": { "bar_s": 2.0, "cards": [ { "at_s": 0.0, "artist": "Ariana Grande", "title": "Into You" } ] } } },
+  { "name": "card-long-title", "item_elapsed": 0.5,
+    "metadata": { "vars": { "bar_s": 2.0, "cards": [ { "at_s": 0.0, "artist": "Ariana Grande", "title": "Thank U, Next (Live from the Sweetener Sessions)" } ] } } }
+]

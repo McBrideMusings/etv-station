@@ -746,6 +746,7 @@ function drawGraphics(d) {
       <div class="gname"><b>${esc(o.name)}</b><div class="muted gpath">${esc(o.script)}</div></div>
       <label class="muted">at <input type="number" class="gat" min="0" max="3600" step="0.5" value="0"> s</label>
       <button type="button" data-kind="still">Still</button>
+      ${(o.states || []).map((st) => `<button type="button" data-kind="still" data-state="${esc(st)}">${esc(st)}</button>`).join('')}
       <button type="button" data-kind="clip">Clip</button></div>`).join('');
   const bumperRows = d.bumpers.map((b) => {
     const range = [b.min_gap && `min ${b.min_gap}`, b.max_gap && `max ${b.max_gap}`].filter(Boolean).join(', ');
@@ -765,8 +766,9 @@ function drawGraphics(d) {
       const row = btn.closest('.grow');
       const body = { kind: btn.dataset.kind, script: row.dataset.script };
       if (body.kind === 'still') body.at = Number(row.querySelector('.gat').value) || 0;
+      if (btn.dataset.state) body.state = btn.dataset.state;
       if (body.kind === 'bumper') body.gap = row.querySelector('.ggap').value.trim();
-      requestRender(d.channel, body, row.querySelector('b').textContent);
+      requestRender(d.channel, body, row.querySelector('b').textContent + (body.state ? ` · ${body.state}` : ''));
     });
   }
 }

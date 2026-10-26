@@ -436,7 +436,7 @@ fn build(ctx) {
     }
     seg = seg.fixed_ms(chapter_ms).name(names);
     if cfg.card_script != () {
-        seg = seg.overlay(cfg.card_script, #{ cards: plan.cards });
+        seg = seg.overlay(cfg.card_script, #{ cards: plan.cards, bar_s: plan.bar_seconds });
     }
     t.push(seg);
     t

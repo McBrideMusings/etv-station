@@ -1010,6 +1010,39 @@ mod tests {
     }
 
     #[test]
+    fn a_script_state_is_listed_and_a_bad_sidecar_spoils_only_its_own_row() {
+        let mut f = graphics_fixture();
+        let dir = f.dir.path().join("channels/a");
+        let script = dir.join("card.rhai").display().to_string();
+        std::fs::write(
+            dir.join("card.states.json"),
+            r#"[{"name": "card", "item_elapsed": 1.0}]"#,
+        )
+        .unwrap();
+        let (_, body) = get_json(&mut f.state, "/api/channels/a/graphics");
+        assert_eq!(body["overlays"][0]["states"], json!(["card"]), "{body}");
+
+        let (status, body) = post_render(
+            &mut f.state,
+            json!({"kind": "still", "script": script, "state": "nope"}),
+        );
+        assert_eq!(status, 400, "{body}");
+        let (status, body) = post_render(
+            &mut f.state,
+            json!({"kind": "clip", "script": script, "state": "card"}),
+        );
+        assert_eq!(status, 400, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("still only"));
+
+        std::fs::write(dir.join("card.states.json"), "{").unwrap();
+        let (status, body) = get_json(&mut f.state, "/api/channels/a/graphics");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["overlays"][0]["states"], json!([]));
+        assert!(body["overlays"][0]["states_error"].is_string(), "{body}");
+        assert_eq!(body["bumpers"][0]["name"], "bumper.rhai");
+    }
+
+    #[test]
     fn a_channel_naming_no_scripts_lists_none() {
         let mut f = fixture();
         let (status, body) = get_json(&mut f.state, "/api/channels/a/graphics");
