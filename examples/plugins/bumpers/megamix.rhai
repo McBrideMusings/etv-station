@@ -248,7 +248,13 @@ fn broll_shots(ctx, cfg, others, want, need_s) {
         log("megamix: broll search=skipped reason=" + e);
         return [];
     }
-    let found = parse_json(reply).shots;
+    let found = ();
+    try {
+        found = parse_json(reply).shots;
+    } catch (e) {
+        log("megamix: broll search=skipped reason=unreadable reply: " + e);
+        return [];
+    }
     if found == () { found = []; }
     // The drawn shots first, then the rest in rank order.
     let ordered = [];
@@ -485,7 +491,6 @@ fn build(ctx) {
 
     let ids = "";
     for d in drawn { ids += d.entry_id + "|"; }
-    let stem = "ch" + ctx.channel.number + "-" + hex(fnv(ids + chapter_bpm));
     let hooked = #{};
     for d in drawn { hooked[d.entry_id] = true; }
     let others = [];
@@ -493,6 +498,9 @@ fn build(ctx) {
     // Every hook's odd four-bar cuts take a shot: 2 per 16-bar hook, 1 per 8-bar hook.
     let want = drawn.len() * (fitted.bars / 4 / 2);
     let shots = broll_shots(ctx, cfg, others, want, 4 * bar_s);
+    // The shots are part of the stem, so a different picture is a different render.
+    for s in shots { ids += s.entry_id + "@" + s.in_s + "|"; }
+    let stem = "ch" + ctx.channel.number + "-" + hex(fnv(ids + chapter_bpm));
     let plan = plan_for(ctx, cfg, drawn, chapter_bpm, seed, fitted, stem, shots);
     let plan_path = cfg.dir + "/" + stem + ".plan.json";
     write_file(ctx, plan_path, to_json(plan));
