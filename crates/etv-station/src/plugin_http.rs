@@ -228,6 +228,14 @@ pub fn parse_json(text: &str) -> Result<Dynamic, Box<EvalAltResult>> {
     rhai::serde::to_dynamic(value)
 }
 
+/// `to_json(value)`: maps, arrays and plain values as JSON text; `()` becomes
+/// `null`. The inverse of [`parse_json`].
+pub fn to_json(value: Dynamic) -> Result<String, Box<EvalAltResult>> {
+    let value: serde_json::Value =
+        rhai::serde::from_dynamic(&value).map_err(|e| format!("to_json(): {e}"))?;
+    Ok(value.to_string())
+}
+
 /// The host part of `url`, without scheme, credentials, path or query.
 pub fn host_of(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);

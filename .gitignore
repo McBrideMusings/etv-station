@@ -38,6 +38,7 @@ examples/channels/*
 !examples/channels/align-test.yaml
 !examples/channels/up-next-test.yaml
 !examples/channels/text-card-test.yaml
+!examples/channels/megamix-test.yaml
 examples/blocks/
 examples/overlays/marquee_overlay.toml
 examples/overlays/showcase_overlay.toml

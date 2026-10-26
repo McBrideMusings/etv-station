@@ -240,7 +240,7 @@ fn ffmpeg_on_path() -> Option<PathBuf> {
 }
 
 /// A channel looked up in the lineup.
-enum Lookup {
+pub(super) enum Lookup {
     Loaded(Box<config::Station>, usize),
     Missing(String),
     Dropped {
@@ -249,7 +249,7 @@ enum Lookup {
     },
 }
 
-fn find_channel(state: &AppState, key: &str) -> Result<Lookup, String> {
+pub(super) fn find_channel(state: &AppState, key: &str) -> Result<Lookup, String> {
     let path = &state.options.station;
     let station =
         config::load_for_inspection(path).map_err(|e| format!("load {}: {e}", path.display()))?;

@@ -35,6 +35,7 @@
 
 mod airing;
 mod channel;
+mod chapters;
 mod graphics;
 mod health;
 mod lineup;
@@ -318,6 +319,9 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
             }
             (Method::Delete, [key, "drafts", id]) => {
                 return json_reply(api_draft_discard(state, key, id));
+            }
+            (Method::Get, [key, "chapters"]) => {
+                return json_reply(chapters::api_channel_chapters(state, key));
             }
             (Method::Get, [key, "graphics"]) => {
                 return json_reply(api_channel_graphics(state, key));
@@ -1120,5 +1124,61 @@ mod tests {
         let mut f = fixture();
         let (status, body) = review(&mut f.state, "project=5d");
         assert_eq!(status, 400, "{body}");
+    }
+
+    /// A queued chapter shows up in `/api/channels/{ch}/chapters` with its plan,
+    /// and a chapter whose plugin never reached the renderer says so.
+    #[test]
+    fn chapters_list_the_queued_chapter_with_its_plan() {
+        use crate::history::{AiringKind, HistoryDb, PlayRecord};
+        let mut f = fixture();
+        let root = f.dir.path();
+        let fixture_plan = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../etv-render/tests/fixtures/chapter.plan.json");
+        let plan =
+            etv_render::plan::Plan::parse(&std::fs::read_to_string(fixture_plan).unwrap()).unwrap();
+        let queue = etv_render::queue::Queue::new(root.join("queue"));
+        let air_at = time::OffsetDateTime::now_utc() + time::Duration::minutes(40);
+        let job = queue
+            .enqueue(&plan, Some(air_at), time::OffsetDateTime::now_utc())
+            .unwrap();
+        f.state.options.health.renderer = Some(crate::renderer::RendererPaths {
+            queue_dir: root.join("queue"),
+            cache_dir: root.join("cache"),
+            cache_cap_bytes: 1_000_000,
+        });
+        let history = HistoryDb::open(root.join("out/history.db")).unwrap();
+        let row = |name: String, start: time::OffsetDateTime| PlayRecord {
+            entry_id: name,
+            start,
+            played_at: time::OffsetDateTime::now_utc(),
+            kind: AiringKind::Bumper,
+            ..Default::default()
+        };
+        history
+            .record(
+                "a",
+                &[
+                    row(format!("chapter:{}|fixture-a|fixture-b", job.id), air_at),
+                    row(
+                        "chapter:unqueued-ch1-ab12|fixture-a".into(),
+                        air_at + time::Duration::minutes(5),
+                    ),
+                    row("megamix-idle".into(), air_at + time::Duration::minutes(9)),
+                ],
+            )
+            .unwrap();
+
+        let (status, body) = get_json(&mut f.state, "/api/channels/a/chapters");
+        assert_eq!(status, 200, "{body}");
+        let chapters = body["chapters"].as_array().unwrap();
+        assert_eq!(chapters.len(), 2, "{body}");
+        assert_eq!(chapters[0]["state"], "queued");
+        assert_eq!(chapters[0]["hooks"], json!(["fixture-a", "fixture-b"]));
+        assert_eq!(chapters[0]["plan"]["bpm"], json!(120.0));
+        assert_eq!(chapters[0]["plan"]["hooks"][1]["entry_id"], "fixture-b");
+        assert_eq!(chapters[1]["state"], "unqueued");
+        assert_eq!(chapters[1]["plan"], Value::Null);
+        assert_eq!(get_json(&mut f.state, "/api/channels/nope/chapters").0, 404);
     }
 }

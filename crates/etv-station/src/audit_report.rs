@@ -53,6 +53,24 @@ impl From<PlayoutItem> for ReportItem {
     }
 }
 
+/// The lines a plugin left beside a render it has not yet seen land, in
+/// `<render stem>.audit.txt` (`chapter.mp4` -> `chapter.audit.txt`): one line
+/// each, blank lines dropped. Empty when the file is absent or unreadable — a
+/// plugin that writes none has nothing to explain.
+pub fn render_notes(render: &Path) -> Vec<String> {
+    std::fs::read_to_string(render.with_extension("audit.txt"))
+        .map(|text| {
+            text.lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Metadata key [`upcoming`] puts a pending item's [`render_notes`] under.
+const RENDER_NOTES_KEY: &str = "render_notes";
+
 /// Read `output_folder`'s chunk files, discard chunks that have already
 /// finished, flatten and sort the survivors by start, and return the first
 /// `next` items from `now` forward.
@@ -87,7 +105,7 @@ pub async fn upcoming(
             if item.finish <= now {
                 continue;
             }
-            items.push(item.into());
+            items.push(report_item(item));
         }
     }
 
@@ -98,6 +116,41 @@ pub async fn upcoming(
 
     items.truncate(next);
     Ok(items)
+}
+
+/// The file a bumper item airs a plugin's render from: the real file of a
+/// pending segment that has not been swapped yet, else the local file of a
+/// bumper item (a swap, or a `render()` segment, left it there).
+fn render_of(item: &PlayoutItem) -> Option<std::path::PathBuf> {
+    let metadata = item.metadata.as_ref()?;
+    if let Some(path) = metadata
+        .get(crate::bumper::emit::PENDING_KEY)
+        .and_then(|p| p.get("path"))
+        .and_then(|p| p.as_str())
+    {
+        return Some(path.into());
+    }
+    if metadata.get("bumper").and_then(|b| b.as_bool()) != Some(true) {
+        return None;
+    }
+    match item.source.as_ref()? {
+        ersatztv_playout::playout::PlayoutItemSource::Local { path, .. } => Some(path.into()),
+        _ => None,
+    }
+}
+
+/// `item` as a report item, carrying the notes found beside its render.
+fn report_item(item: PlayoutItem) -> ReportItem {
+    let notes = render_of(&item)
+        .map(|render| render_notes(&render))
+        .unwrap_or_default();
+    let mut report: ReportItem = item.into();
+    if let (false, Some(serde_json::Value::Object(map))) =
+        (notes.is_empty(), report.metadata.as_mut())
+    {
+        map.insert(RENDER_NOTES_KEY.into(), serde_json::json!(notes));
+    }
+    report
 }
 
 /// The item that starts within the whole second `second` (`second` through
@@ -179,6 +232,14 @@ pub fn render(channel: &str, generated_at: OffsetDateTime, items: &[ReportItem])
         let title = item.title.as_deref().unwrap_or(item.id.as_str());
         out.push_str(&format!("{} — {title}\n", clock(item.start)));
         render_audit_trail(&mut out, item.metadata.as_ref());
+        let notes = item
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get(RENDER_NOTES_KEY))
+            .and_then(|n| n.as_array());
+        for note in notes.into_iter().flatten().filter_map(|n| n.as_str()) {
+            out.push_str(&format!("    render: {note}\n"));
+        }
     }
     out
 }
@@ -340,7 +401,7 @@ fn clock(t: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ersatztv_playout::playout::{Playout, PlayoutItem, ProgramMetadata};
+    use ersatztv_playout::playout::{Playout, PlayoutItem, PlayoutItemSource, ProgramMetadata};
     use time::Duration;
     use time::macros::datetime;
 
@@ -759,6 +820,55 @@ mod tests {
         let straddler_count = items.iter().filter(|i| i.id == "straddler").count();
         assert_eq!(straddler_count, 1, "boundary item must not be duplicated");
         assert_eq!(items.len(), 2, "before + straddler, deduped");
+    }
+
+    /// The notes a plugin left beside a chapter's render print under the item,
+    /// whether the chapter is still pending or its render has been swapped in.
+    #[test]
+    fn a_chapter_prints_the_seam_notes_found_beside_its_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let render_file = dir.path().join("ch1-ab.mp4");
+        std::fs::write(
+            dir.path().join("ch1-ab.audit.txt"),
+            "seam 1 at bar 0: Song A (a) lands source bar 24, 0 semitones\n\nseam 2 at bar 16: Song B (b) lands source bar 16, +2 semitones\n",
+        )
+        .unwrap();
+        let item = |source: Option<PlayoutItemSource>, metadata: serde_json::Value| PlayoutItem {
+            id: "bumper:1".into(),
+            start: datetime!(2026-04-20 12:00 UTC),
+            finish: datetime!(2026-04-20 12:02 UTC),
+            source,
+            tracks: None,
+            watermark: None,
+            program: None,
+            metadata: Some(metadata),
+            overlay: None,
+            normalize_loudness: None,
+        };
+        let pending = item(
+            None,
+            serde_json::json!({ "bumper": true, "pending": { "path": render_file, "loop": true } }),
+        );
+        let swapped = item(
+            Some(PlayoutItemSource::Local {
+                path: render_file.display().to_string(),
+                in_point_ms: None,
+                out_point_ms: None,
+                probe_hint: None,
+            }),
+            serde_json::json!({ "bumper": true }),
+        );
+        for chapter in [pending, swapped] {
+            let text = render(
+                "megamix",
+                datetime!(2026-04-20 11:00 UTC),
+                &[report_item(chapter)],
+            );
+            assert!(
+                text.contains("    render: seam 1 at bar 0: Song A (a) lands source bar 24, 0 semitones\n    render: seam 2 at bar 16: Song B (b) lands source bar 16, +2 semitones\n"),
+                "{text}"
+            );
+        }
     }
 
     fn hand_built_item() -> ReportItem {

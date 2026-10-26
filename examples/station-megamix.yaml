@@ -1,0 +1,38 @@
+# station-align.yaml's twin for the megamix bumper. Run it from the repo root
+# with a catalog that holds analyzed music videos:
+#   ETV_STATION_AUDIO_ANALYZER=tools/audio-analyze.py \
+#     ./target/debug/etv-station --config examples/station-megamix.yaml
+# or `STATION_CONFIG=examples/station-megamix.yaml ./tools/dev-run.sh`.
+tz: "America/Chicago"
+
+output_base: examples/output
+
+channels:
+  - channels/megamix-test.yaml
+
+catalog_path: tmp/catalog.db
+
+catalog_refresh_secs: 86400
+
+renderer:
+  queue_dir: tmp/render-queue
+  cache_dir: tmp/render-cache
+  cache_cap_gb: 5
+
+normalization:
+  audio:
+    format: aac
+    bitrate_kbps: 192
+    buffer_kbps: 384
+    channels: 2
+    sample_rate_hz: 48000
+    normalize_loudness: false
+  video:
+    format: h264
+    bit_depth: 8
+    width: 1920
+    height: 1080
+    bitrate_kbps: 6000
+    buffer_kbps: 12000
+  subtitle:
+    mode: convert

@@ -1,0 +1,35 @@
+number: 57
+name: megamix-test
+# A music-video channel that fills every gap up to the next 12-minute line with
+# megamix chapters (megamix.rhai). Each music video airs whole, then three or four
+# chapters of 3 to 5 hooks play back to back until the line. A chapter airs its
+# stand-in until the renderer's file lands, so the channel never goes dark.
+# Needs a catalog with audio facts (`ETV_STATION_AUDIO_ANALYZER`) for the pool's
+# videos, and the renderer named in station-megamix.yaml. Run it with
+# `STATION_CONFIG=examples/station-megamix.yaml ./tools/dev-run.sh`.
+display_name: "Megamix Test Channel"
+window_days: 1
+chunk_hours: 1
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - mode: "all"
+      align: 12m
+      pools:
+        - name: videos
+          expr: 'item.library == "Music Videos"'
+          order: random
+          advance: resume
+      pattern:
+        - pool: videos
+          take: 1
+      fill:
+        - script: ../plugins/bumpers/megamix.rhai
+          capabilities: [probe, catalog_read, exec]
+          config:
+            expr: 'item.library == "Music Videos"'
+            dir: tmp/chapters
+            enqueue: target/debug/etv-station
+            enqueue_args: ["--config", "examples/station-megamix.yaml"]

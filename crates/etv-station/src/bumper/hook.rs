@@ -26,7 +26,7 @@
 //! ```
 //!
 //! `ctx` carries no filesystem or network handle: `build` can only see what
-//! the host put in it. Four capability-gated calls reach outside it, each
+//! the host put in it. Five capability-gated calls reach outside it, each
 //! declared in `capabilities()` and granted by the channel
 //! ([`BUMPER_CAPABILITIES`]):
 //!
@@ -42,6 +42,11 @@
 //! - `read` — `ctx.read(path)` returns a UTF-8 text file from the plugin's own
 //!   folder (up to [`READ_LIMIT_BYTES`]), or `()` when it does not exist. A path
 //!   that resolves outside that folder is an error.
+//! - `catalog_read` — `ctx.catalog(expr)` returns the live catalog entries a CEL
+//!   expression matches (the language a pool's `expr` uses) as item maps, the
+//!   ones `ctx.sets` carries, each with `path` (the file it plays from) and
+//!   `audio` (its stored audio facts, `()` when not analyzed), up to
+//!   [`CATALOG_LIMIT`] of them. It reads the catalog and nothing else.
 //! - `http` — `ctx.http(url, method, body)` makes one HTTP call through
 //!   [`crate::plugin_http::call`] and returns the response body as text.
 //!   `{{PLEX_URL}}` and `{{PLEX_TOKEN}}` in the URL are filled from the
@@ -87,7 +92,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rhai::{Dynamic, EvalAltResult, Map, Scope};
+use rhai::{Array, Dynamic, EvalAltResult, Map, Scope};
 use time::OffsetDateTime;
 
 use crate::ffprobe::PROBE_TIMEOUT;
@@ -98,7 +103,10 @@ use super::timeline::{
 };
 
 /// Capability names a bumper plugin may declare: each gates one `ctx` call.
-pub const BUMPER_CAPABILITIES: &[&str] = &["probe", "read", "http", "exec"];
+pub const BUMPER_CAPABILITIES: &[&str] = &["probe", "read", "catalog_read", "http", "exec"];
+
+/// The most entries one `ctx.catalog` call returns.
+pub const CATALOG_LIMIT: usize = 5000;
 
 /// The largest file `ctx.read` returns.
 pub const READ_LIMIT_BYTES: u64 = 1 << 20;
@@ -723,6 +731,79 @@ impl Host {
         }
     }
 
+    /// `ctx.catalog(expr)`: the live catalog entries a CEL expression matches
+    /// (the language a pool's `expr` uses), as item maps, in `entry_id` order.
+    /// Each map is the one `ctx.sets` carries, plus `path` (the file the entry
+    /// plays from, `()` when it has no source) and `audio` (the stored audio
+    /// facts, `()` when the entry is not analyzed). At most [`CATALOG_LIMIT`]
+    /// entries come back.
+    fn catalog(&self, expr: &str) -> RhaiResult<Dynamic> {
+        self.require("catalog_read")?;
+        let Some(path) = &self.catalog_path else {
+            tracing::warn!(
+                event = "bumper.catalog_unavailable",
+                channel = %self.channel,
+                "ctx.catalog has no catalog to read; returning no entries"
+            );
+            return Ok(Array::new().into());
+        };
+        let found = (|| -> Result<(Array, usize), String> {
+            let catalog =
+                crate::catalog::Catalog::open_readonly(path).map_err(|e| e.to_string())?;
+            let mut ids = catalog.resolve_query(expr).map_err(|e| e.to_string())?;
+            let matched = ids.len();
+            if matched > CATALOG_LIMIT {
+                tracing::warn!(
+                    event = "bumper.catalog_truncated",
+                    channel = %self.channel,
+                    matched,
+                    limit = CATALOG_LIMIT,
+                    "ctx.catalog matched more entries than it returns"
+                );
+                ids.truncate(CATALOG_LIMIT);
+            }
+            let mut items = crate::score::load_items(&catalog, &ids)?;
+            let mut analyzed = 0usize;
+            for item in &mut items {
+                let mut map = std::mem::take(item).cast::<Map>();
+                let id = map
+                    .get("entry_id")
+                    .and_then(|v| v.clone().into_string().ok())
+                    .unwrap_or_default();
+                let sources = catalog.sources_for(&id).map_err(|e| e.to_string())?;
+                let playing = crate::resolve::pick_playback_source(&sources)
+                    .map(|s| Dynamic::from(s.playback_path.clone()))
+                    .unwrap_or(Dynamic::UNIT);
+                map.insert("path".into(), playing);
+                let facts = catalog
+                    .audio_fact(&id)
+                    .map_err(|e| e.to_string())?
+                    .and_then(|row| row.facts);
+                let audio = match facts {
+                    Some(v) => {
+                        analyzed += 1;
+                        rhai::serde::to_dynamic(v).map_err(|e| e.to_string())?
+                    }
+                    None => Dynamic::UNIT,
+                };
+                map.insert("audio".into(), audio);
+                *item = Dynamic::from_map(map);
+            }
+            Ok((items, analyzed))
+        })()
+        .map_err(|e| format!("ctx.catalog(): {e}"))?;
+        let (found, analyzed) = found;
+        tracing::info!(
+            event = "bumper.catalog",
+            channel = %self.channel,
+            expr,
+            entries = found.len(),
+            analyzed,
+            "bumper script queried the catalog"
+        );
+        Ok(found.into())
+    }
+
     /// `ctx.airings(filter)`: ledger rows, past and scheduled, as maps.
     fn airings(&self, filter: Map) -> RhaiResult<Dynamic> {
         let parsed = airing_filter(&filter, &self.channel)?;
@@ -1034,6 +1115,8 @@ fn bumper_engine(host: Host) -> rhai::Engine {
     });
     let h = host.clone();
     engine.register_fn("probe", move |_ctx: &mut Map, path: &str| h.probe(path));
+    let h = host.clone();
+    engine.register_fn("catalog", move |_ctx: &mut Map, expr: &str| h.catalog(expr));
     let h = host.clone();
     engine.register_fn("airings", move |_ctx: &mut Map, filter: Map| {
         h.airings(filter)
@@ -1577,16 +1660,16 @@ fn build(ctx) {
         let ok = script(&dir, CARD);
         validate_script(&ok, &[]).unwrap();
 
-        let msg = validate_script(&ok, &["catalog_read".into()]).unwrap_err();
+        let msg = validate_script(&ok, &["teleport".into()]).unwrap_err();
         assert!(msg.contains("never declares"), "{msg}");
 
         let declares = script(
             &dir,
-            "fn hooks() { [\"bumper\"] }\nfn capabilities() { [\"catalog_read\"] }\n\
+            "fn hooks() { [\"bumper\"] }\nfn capabilities() { [\"teleport\"] }\n\
              fn build(ctx) { timeline() }",
         );
-        let msg = validate_script(&declares, &["catalog_read".into()]).unwrap_err();
-        assert!(msg.contains("does not offer"), "{msg}");
+        let msg = validate_script(&declares, &["teleport".into()]).unwrap_err();
+        assert!(msg.contains("unknown capability"), "{msg}");
 
         let wrong_hook = script(
             &dir,

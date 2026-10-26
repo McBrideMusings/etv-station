@@ -12,6 +12,13 @@ use etv_render::queue::Queue;
 
 use crate::config::station::RendererConfig;
 
+/// What a plugin that queues a chapter names the bumper segment it airs it in:
+/// `chapter:<job>|<entry>|<entry>...`, `<job>` being the id `enqueue` printed
+/// (or `unqueued-<stem>` when it could not reach the renderer). The airings
+/// ledger carries the name, so `GET /api/channels/{ch}/chapters` can join a
+/// scheduled slot to the queue's plan and state.
+pub const CHAPTER_SEGMENT_PREFIX: &str = "chapter:";
+
 /// Gigabytes the cache may take when `cache_cap_gb` is unset.
 pub const DEFAULT_CACHE_CAP_GB: u64 = 20;
 

@@ -1161,3 +1161,9 @@ Run it through the swarm lock in a worker (`swarm heavy -- tools/verify-reburst.
 ## Verifying the shot list
 
 Run `cargo test -p etv-station --lib shots::` (needs ffmpeg on PATH; four synthetic-frame tests and three real-file tests). Then, against a running daemon, run `tools/facts.sh <entry_id>` and look for a `shots.shots` array whose first shot has `card: true` on a file with a black lead-in. The log events are `shots.analyzed`, `shots.failed` and `shots.deferred`.
+
+## Verifying the megamix plugin
+
+Run `cargo test -p etv-station --test megamix_plugin` (seven fixture songs; stub `enqueue` and `ffmpeg`), `cargo test -p etv-station --lib chapters_list` and `cargo test -p etv-station --lib a_chapter_prints_the_seam_notes`. The first expects a plan of 3 to 5 hooks with every semitone shift within 3, every landing within Camelot distance 1 of the chapter key, every hook starting on an 8-bar boundary, `mv-unsteady` and `mv-weak` never chosen, and `enqueue` called with `--air-at 2027-01-15T07:50:00Z`.
+
+Against a dev stack with analyzed music videos (`STATION_CONFIG=examples/station-megamix.yaml`, inside `swarm heavy`): `curl -s localhost:$ETV_PORT/api/channels/megamix-test/chapters | jq '.chapters[] | {name, state, notes}'` lists each chapter with its seam lines, and `etv-station --config examples/station-megamix.yaml --audit megamix-test --audit-out -` prints a `render:` line per hook. Two rendered chapters back to back with no gap is a listen at the TV; it needs Demucs, PyTorch and librubberband (`/api/health/renders` shows `detected`) and has not been run in a worktree.

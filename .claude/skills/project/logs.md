@@ -62,3 +62,5 @@ Never ask pierce to paste a prod log; read it over SSH. `UNRAID_HOST` and `UNRAI
 `--since`/`--until` take an RFC 3339 time or a duration (`10m`). Times in the container are UTC; the station's own `tz` (America/Chicago) only shapes chunk boundaries.
 
 Filter one channel or event with `jq` on this machine: `… docker logs --since 1h etv-station 2>&1 | jq -c 'select(.fields.channel=="003-for-madi")'`.
+
+The megamix plugin logs `bumper.catalog` (the pool it read: `expr`, `entries`, `analyzed`), `bumper.catalog_truncated`, `bumper.exec` for each `enqueue` and `ffmpeg` call, and `score.log` lines starting `megamix:` (`pool=… candidates=…`, `chapter=… bpm=… queued=…`, one `seam=` line per hook, `idle …` when no chapter fits). `ui.chapters` is the dashboard's chapter list.

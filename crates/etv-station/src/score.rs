@@ -1356,6 +1356,7 @@ pub(crate) fn engine() -> Engine {
         .register_fn("entry_id_for", ScoreCtx::entry_id_for)
         .register_fn("http", ScoreCtx::http);
     engine.register_fn("parse_json", crate::plugin_http::parse_json);
+    engine.register_fn("to_json", crate::plugin_http::to_json);
     engine.register_fn("log", |text: &str| {
         tracing::info!(event = "score.log", "{text}");
     });
