@@ -86,6 +86,16 @@ fn catalog_file(dir: &Path) -> PathBuf {
             unairable_reason: None,
         })
         .unwrap();
+        cat.add_source(&EntrySource {
+            source: Source::Plex,
+            source_id: format!("{}", 9000 + i),
+            entry_id: (*id).into(),
+            playback_path: format!("/library/parts/{}", 9000 + i),
+            last_seen: None,
+            missing_since: None,
+            unairable_reason: None,
+        })
+        .unwrap();
         let landing = 8 * (1 + i % 3);
         cat.set_audio_fact(
             id,
@@ -159,7 +169,12 @@ impl Fixture {
             },
             air_date: "2027-01-15".into(),
             draw: 0,
-            granted: vec!["probe".into(), "catalog_read".into(), "exec".into()],
+            granted: vec![
+                "probe".into(),
+                "catalog_read".into(),
+                "exec".into(),
+                "http".into(),
+            ],
             history: None,
             pass: Vec::new(),
             catalog_path: Some(catalog_file(self.dir.path())),
@@ -353,4 +368,266 @@ fn a_build_with_the_renderer_absent_still_emits_a_timeline() {
     );
     assert!(matches!(segment.source, SegmentSource::Pending { .. }));
     assert_eq!(f.plans().len(), 1, "the plan is still written");
+}
+
+/// A stand-in for the plex-db-ex explorer: answers every request with `reply`
+/// and sends each request's first line and body down the channel.
+fn explorer(reply: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { return };
+            // Read through the body: closing on an unread body resets the client.
+            let mut head = String::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = sock.read(&mut buf).unwrap_or(0);
+                head.push_str(&String::from_utf8_lossy(&buf[..n]));
+                let Some((top, body)) = head.split_once("\r\n\r\n") else {
+                    if n == 0 {
+                        break;
+                    }
+                    continue;
+                };
+                let want = top
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if body.len() >= want || n == 0 {
+                    break;
+                }
+            }
+            let body = head.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            let _ = tx.send(format!("{}\n{body}", head.lines().next().unwrap_or("")));
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    (url, rx)
+}
+
+fn only_plan(f: &Fixture) -> (PathBuf, Plan) {
+    let plans = f.plans();
+    assert_eq!(plans.len(), 1);
+    let plan = Plan::parse(&std::fs::read_to_string(&plans[0]).unwrap())
+        .expect("the renderer accepts the plan");
+    (plans[0].clone(), plan)
+}
+
+#[test]
+fn frame_index_shots_replace_the_other_hooks_pictures() {
+    let f = Fixture::new();
+    // mv-unsteady and mv-weak never become hooks, so they are always valid B-roll.
+    let (url, requests) = explorer(
+        r#"{"shots":[
+            {"item_id":"9005","in_ms":10000,"out_ms":30000,"drawn":1},
+            {"item_id":"9006","in_ms":50000,"out_ms":70000,"drawn":1},
+            {"item_id":"9005","in_ms":1000,"out_ms":2000},
+            {"item_id":"9999","in_ms":0,"out_ms":20000,"drawn":1}
+        ]}"#,
+    );
+    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    input.config.as_mut().unwrap()["plexdb_url"] = json!(url);
+    input.config.as_mut().unwrap()["phrase"] = json!("a neon city at night");
+    build(&plugin_path(), &input).unwrap();
+
+    let request = requests.recv().unwrap();
+    let (line, body) = request.split_once('\n').unwrap();
+    assert!(line.starts_with("POST /api/search/run"), "{line}");
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(body["phrase"], "a neon city at night");
+    let (plan_path, plan) = only_plan(&f);
+    let pool: Vec<String> = body["pool"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(pool.len(), SONGS.len() - plan.hooks.len(), "{pool:?}");
+    for hook in &plan.hooks {
+        let i = SONGS.iter().position(|s| s.0 == hook.entry_id).unwrap();
+        assert!(
+            !pool.contains(&format!("{}", 9000 + i)),
+            "{} is a hook and in the pool",
+            hook.entry_id
+        );
+    }
+    assert_eq!(body["draw"]["n"], plan.hooks.len() * 2);
+
+    let ids: Vec<&str> = plan.broll.iter().map(|b| b.entry_id.as_str()).collect();
+    assert_eq!(ids, ["mv-unsteady", "mv-weak"]);
+    let shots: Vec<_> = plan
+        .cuts
+        .iter()
+        .filter(|c| ids.contains(&c.entry_id.as_str()))
+        .collect();
+    assert_eq!(
+        shots.len(),
+        2,
+        "the unknown item and the short shot are dropped"
+    );
+    assert_eq!((shots[0].native_start_s, shots[0].ratio), (10.0, 1.0));
+    assert_eq!(shots[1].native_start_s, 50.0);
+    let audit_path = plan_path
+        .to_string_lossy()
+        .replace(".plan.json", ".audit.txt");
+    let audit = std::fs::read_to_string(audit_path).unwrap();
+    assert_eq!(audit.matches("broll at ").count(), 2, "{audit}");
+}
+
+#[test]
+fn an_unreachable_explorer_leaves_the_hooks_own_pictures() {
+    let f = Fixture::new();
+    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    input.config.as_mut().unwrap()["plexdb_url"] = json!("http://127.0.0.1:9");
+    input.config.as_mut().unwrap()["phrase"] = json!("anything");
+    build(&plugin_path(), &input).unwrap();
+    let (_, plan) = only_plan(&f);
+    assert!(plan.broll.is_empty());
+}
+
+/// Serves one OpenAI-style chat completion whose message text is `content`,
+/// returning the url and a handle that yields the request it received.
+fn model_server(content: &str) -> (String, std::thread::JoinHandle<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let reply = json!({ "choices": [{ "message": { "role": "assistant", "content": content } }] })
+        .to_string();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            got.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&got).to_string();
+            if let Some(split) = text.find("\r\n\r\n") {
+                let length = text[..split]
+                    .to_lowercase()
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length: ")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if got.len() >= split + 4 + length {
+                    break;
+                }
+            }
+            if n == 0 {
+                break;
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        String::from_utf8_lossy(&got).to_string()
+    });
+    (url, handle)
+}
+
+fn model_input(f: &Fixture, url: &str) -> BumperInput {
+    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    let cfg = input.config.as_mut().unwrap();
+    cfg["ranker"] = json!("model");
+    cfg["model_url"] = json!(url);
+    cfg["model"] = json!("ranker-1");
+    cfg["brief"] = json!("slow-burn eighties, nothing sad");
+    cfg["model_headers"] = json!({ "Authorization": "Bearer test-key" });
+    input
+}
+
+fn hooks_of(name: &str) -> Vec<String> {
+    name.split('|').skip(1).map(String::from).collect()
+}
+
+#[test]
+fn a_model_pick_sets_the_chapters_hooks_in_its_order() {
+    let f = Fixture::new();
+    let (url, request) = model_server(
+        "Here you go:\n{\"cluster\": \"c0\", \"hooks\": [\"mv-d\", \"mv-a\", \"mv-b\"]}\n",
+    );
+    let built = build(&plugin_path(), &model_input(&f, &url)).unwrap();
+    let sent = request.join().unwrap();
+
+    assert_eq!(
+        hooks_of(&built.timeline.segments[0].name),
+        ["mv-d", "mv-a", "mv-b"]
+    );
+    let plan = Plan::parse(&std::fs::read_to_string(&f.plans()[0]).unwrap()).unwrap();
+    let ids: Vec<&str> = plan.hooks.iter().map(|h| h.entry_id.as_str()).collect();
+    assert_eq!(ids, ["mv-d", "mv-a", "mv-b"]);
+    assert!(sent.contains("slow-burn eighties, nothing sad"), "{sent}");
+    assert!(
+        sent.to_lowercase()
+            .contains("authorization: bearer test-key"),
+        "{sent}"
+    );
+    assert!(sent.contains("ranker-1"), "{sent}");
+    assert!(
+        sent.contains("mv-e"),
+        "the cluster's facts are in the prompt: {sent}"
+    );
+}
+
+#[test]
+fn a_rejected_model_pick_falls_back_to_the_rule() {
+    // Each reply breaks one rule: an unfit song, a repeat, too few hooks, an
+    // unoffered cluster, text with no JSON.
+    for reply in [
+        "{\"cluster\": \"c0\", \"hooks\": [\"mv-a\", \"mv-b\", \"mv-weak\"]}",
+        "{\"cluster\": \"c0\", \"hooks\": [\"mv-a\", \"mv-b\", \"mv-a\"]}",
+        "{\"cluster\": \"c0\", \"hooks\": [\"mv-a\", \"mv-b\"]}",
+        "{\"cluster\": \"c9\", \"hooks\": [\"mv-a\", \"mv-b\", \"mv-c\"]}",
+        "I would open with mv-a.",
+    ] {
+        let f = Fixture::new();
+        let (url, request) = model_server(reply);
+        let built = build(&plugin_path(), &model_input(&f, &url)).unwrap();
+        request.join().unwrap();
+        let hooks = hooks_of(&built.timeline.segments[0].name);
+        assert!((3..=5).contains(&hooks.len()), "{reply}: {hooks:?}");
+        assert!(
+            !hooks.iter().any(|h| h == "mv-weak" || h == "mv-unsteady"),
+            "{reply}: {hooks:?}"
+        );
+        let rule = build(
+            &plugin_path(),
+            &f.input("/nonexistent/etv-station", 600_000),
+        )
+        .unwrap();
+        assert_eq!(
+            built.timeline.segments[0].name, rule.timeline.segments[0].name,
+            "{reply}: the fallback is the rule's chapter"
+        );
+    }
+}
+
+#[test]
+fn an_unreachable_model_falls_back_to_the_rule() {
+    let f = Fixture::new();
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/v1/chat/completions",
+        closed.local_addr().unwrap()
+    );
+    drop(closed);
+    let built = build(&plugin_path(), &model_input(&f, &url)).unwrap();
+    assert!((3..=5).contains(&hooks_of(&built.timeline.segments[0].name).len()));
 }

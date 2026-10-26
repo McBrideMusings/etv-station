@@ -38,7 +38,7 @@ rule:
           take: 1
       fill:
         - script: ../plugins/bumpers/megamix.rhai
-          capabilities: [probe, catalog_read, exec]
+          capabilities: [probe, catalog_read, exec, http]
           config:
             expr: 'item.library == "Music Videos"'
             card_script: ../overlays/hook_card.rhai
