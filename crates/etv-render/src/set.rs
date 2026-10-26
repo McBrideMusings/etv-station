@@ -30,6 +30,8 @@ const BASS_CROSSOVER_HZ: u32 = 250;
 const SWEEP_CEILING_HZ: u32 = 1200;
 /// A hard cut fades over this long so it does not click.
 const CUT_FADE_S: f64 = 0.01;
+/// A bar-end or layer-end fade, long enough not to click and short enough to be
+/// inaudible as a fade.
 const SHORT_FADE_S: f64 = 0.02;
 /// The last song fades out over this long.
 const LAST_FADE_S: f64 = 2.0;
@@ -386,6 +388,21 @@ impl SetPlan {
                             b.entry_id, b.enter_s
                         ));
                     }
+                    let tail_s = half;
+                    let b_stops_at = self.seams.get(k + 1).map_or(self.end_s, |s| s.out_s);
+                    let b_alone_s = b.play_out_s(b_stops_at - b.enter_s);
+                    if b_stops_at >= b.enter_s && b_alone_s + 1e-9 < tail_s {
+                        return bad(format!(
+                            "{at}: {} plays alone for {b_alone_s:.2}s before {}, shorter than the {tail_s:.2}s tail of {} the bass swap lays over it",
+                            b.entry_id,
+                            if k + 1 < self.seams.len() {
+                                "the next seam"
+                            } else {
+                                "the set ends"
+                            },
+                            a.entry_id
+                        ));
+                    }
                     let running = a.native_bpm * a.exit_ratio();
                     let wanted = running / b.native_bpm;
                     if (b.ratio - wanted).abs() > RATIO_TOLERANCE {
@@ -428,6 +445,7 @@ impl SetPlan {
             return bad("output is empty".into());
         }
         let total = self.duration_s();
+        let mut prev = 0.0;
         for (i, card) in self.cards.iter().enumerate() {
             if !(card.at_s.is_finite() && card.at_s >= 0.0 && card.at_s <= total) {
                 return bad(format!(
@@ -435,6 +453,14 @@ impl SetPlan {
                     card.at_s
                 ));
             }
+            if card.at_s < prev {
+                return bad(format!(
+                    "cards[{i}]: at_s {} comes before cards[{}] at {prev}s; cards are in air order",
+                    card.at_s,
+                    i - 1
+                ));
+            }
+            prev = card.at_s;
         }
         Ok(())
     }
@@ -1032,7 +1058,13 @@ mod tests {
 
     #[test]
     fn the_last_song_needs_room_for_its_closing_fade() {
-        rejects(|p| p.end_s = 32.5, "closing fade");
+        rejects(
+            |p| {
+                p.seams[0] = seam(Recipe::DropMix, 96.0, 0, false);
+                p.end_s = 32.5;
+            },
+            "closing fade",
+        );
     }
 
     #[test]
@@ -1048,6 +1080,33 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"kind\":\"set\""), "{json}");
         assert_eq!(SetPlan::parse(&json).unwrap(), p);
+    }
+
+    #[test]
+    fn a_bass_swap_tail_longer_than_the_next_body_is_refused() {
+        // 4 bars of 2 s: a 4 s tail. b plays 32 s to 35 s at the closing seam: 3 s.
+        rejects(|p| p.end_s = 35.0, "shorter than the 4.00s tail");
+        let mut p = plan(Recipe::BassSwap, 4);
+        p.tracks.push(track("c", 120.0, 32.0, 1.0));
+        p.seams.push(seam(Recipe::DropMix, 32.0 + 3.0, 0, false));
+        let err = p.validate().unwrap_err().to_string();
+        assert!(err.contains("the next seam"), "{err}");
+        p.seams[1].out_s = 32.0 + 4.0;
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn cards_must_be_in_air_order() {
+        let card = |at_s: f64| Card {
+            at_s,
+            artist: "x".into(),
+            title: "y".into(),
+            year: None,
+        };
+        rejects(|p| p.cards = vec![card(50.0), card(10.0)], "air order");
+        let mut p = plan(Recipe::BassSwap, 4);
+        p.cards = vec![card(0.0), card(10.0), card(10.0)];
+        p.validate().unwrap();
     }
 
     #[test]

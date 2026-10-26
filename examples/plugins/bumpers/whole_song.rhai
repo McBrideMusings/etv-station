@@ -387,7 +387,8 @@ fn build(ctx) {
         let body = play_out(cur, out_s - cur.enter);
         let half = pick.bars / 2.0 * bl;
         let landed = t + body + (if pick.recipe == "bass_swap" { half } else { 0.0 });
-        if landed > gap_s - min_last_s() {
+        let room_after = if pick.recipe == "bass_swap" && half > min_last_s() { half } else { min_last_s() };
+        if landed > gap_s - room_after {
             let fin = finish(cur, room);
             end_s = fin.end_s;
             tracks[tracks.len() - 1].ride = fin.ride;
