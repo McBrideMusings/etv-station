@@ -740,7 +740,8 @@ impl Host {
 
     /// `ctx.catalog(expr)`: the live catalog entries a CEL expression matches
     /// (the language a pool's `expr` uses), as item maps, in `entry_id` order.
-    /// Each map is the one `ctx.sets` carries, plus `path` (the file the entry
+    /// Each map is the one `ctx.sets` carries, plus `source_ids` (each live
+    /// source's own id for the entry), `path` (the file the entry
     /// plays from, `()` when it has no source) and `audio` (the stored audio
     /// facts, `()` when the entry is not analyzed). At most [`CATALOG_LIMIT`]
     /// entries come back.
@@ -782,6 +783,7 @@ impl Host {
                     .map(|s| Dynamic::from(s.playback_path.clone()))
                     .unwrap_or(Dynamic::UNIT);
                 map.insert("path".into(), playing);
+                crate::score::add_source_ids(&catalog, &mut map)?;
                 let facts = catalog
                     .audio_fact(&id)
                     .map_err(|e| e.to_string())?

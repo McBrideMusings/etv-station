@@ -22,6 +22,13 @@
 //                    default "etv-station"
 //   enqueue_args:    extra arguments before `enqueue`, default []
 //   ffmpeg:          program that makes the stand-in, default "ffmpeg"
+//   plexdb_url:      base URL of the plex-db-ex explorer, e.g. "http://host:8765"; with
+//                    `phrase`, the picture between a hook's own cuts is drawn from the
+//                    Frame index instead of another hook's video (needs the `http` grant)
+//   phrase:          text the Frame index search looks for; the shots come from the
+//                    pool's songs that are not hooks of this chapter. Unset, or an
+//                    explorer that is ungranted, unreachable or finds nothing, leaves
+//                    the alternating hook pictures
 //
 // Beside each render it writes <stem>.plan.json (the renderer's plan) and
 // <stem>.audit.txt (one seam line per hook, which `admin audit` and
@@ -37,7 +44,7 @@
 // 8-bar boundaries of the chapter. Every hook but the first begins with
 // `vocal_over_bars` bars of its vocal over the previous song's instrumental.
 fn hooks() { ["bumper"] }
-fn capabilities() { ["probe", "catalog_read", "exec"] }
+fn capabilities() { ["probe", "catalog_read", "exec", "http"] }
 
 // Bars after the landing bar that the renderer separates from a song.
 fn region_bars() { 18 }
@@ -215,8 +222,53 @@ fn shape(bar_s, gap_s, cfg, available) {
     ()
 }
 
+// Shots of the pool's other songs that the explorer's Frame index finds for
+// config.phrase, at most `want`, each #{ entry_id, path, in_s } with room for
+// `need_s` seconds from in_s. Empty when the search is unset, ungranted,
+// unreachable or finds nothing, so the caller keeps the hooks' own pictures.
+fn broll_shots(ctx, cfg, others, want, need_s) {
+    if cfg.plexdb_url == () || cfg.phrase == () || want <= 0 { return []; }
+    let by_plex = #{};
+    for item in others {
+        let ids = item.source_ids;
+        if item.path == () || ids == () || ids.plex == () || item.duration_ms == () { continue; }
+        by_plex["" + ids.plex] = item;
+    }
+    if by_plex.len() == 0 { return []; }
+    let body = to_json(#{
+        phrase: cfg.phrase,
+        pool: by_plex.keys(),
+        draw: #{ n: want, seed: ctx.rng.int(0, 1000000000) },
+    });
+    let reply = ();
+    try {
+        reply = ctx.http(cfg.plexdb_url + "/api/search/run", "POST", body,
+                         #{ "Content-Type": "application/json" });
+    } catch (e) {
+        log("megamix: broll search=skipped reason=" + e);
+        return [];
+    }
+    let found = parse_json(reply).shots;
+    if found == () { found = []; }
+    // The drawn shots first, then the rest in rank order.
+    let ordered = [];
+    for s in found { if s.drawn == 1 { ordered.push(s); } }
+    for s in found { if s.drawn != 1 { ordered.push(s); } }
+    let shots = [];
+    for s in ordered {
+        if shots.len() >= want { break; }
+        let item = by_plex["" + s.item_id];
+        if item == () { continue; }
+        let in_s = num(s.in_ms) / 1000.0;
+        if num(s.out_ms) / 1000.0 - in_s < need_s || in_s + need_s > num(item.duration_ms) / 1000.0 { continue; }
+        shots.push(#{ entry_id: item.entry_id, path: item.path, in_s: in_s });
+    }
+    log("megamix: broll search=" + (if shots.len() == 0 { "empty" } else { "hit" }) + " found=" + found.len() + " used=" + shots.len() + " phrase=" + cfg.phrase);
+    shots
+}
+
 // The plan the renderer reads (docs/schema.md § Chapter plan), and the card copy.
-fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem) {
+fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem, shots) {
     let bar_s = 240.0 / chapter_bpm;
     let over = conf(cfg, "vocal_over_bars", 2);
     let max_shift = conf(cfg, "max_shift", 3);
@@ -250,12 +302,29 @@ fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem) {
         if item.year != () { card.year = item.year; }
         cards.push(card);
     }
-    // Four-bar cuts: the hook's own picture, then another song's, alternating.
+    // Four-bar cuts: the hook's own picture, then a Frame index shot when there
+    // is one left, else another song's, alternating.
     let piece_bars = 4;
     let piece_s = piece_bars * bar_s;
+    let broll = #{};
+    let next_shot = 0;
     for i in 0..chosen.len() {
         let pieces = shape.bars / piece_bars;
         for p in 0..pieces {
+            let out_start = (i * shape.bars + p * piece_bars) * bar_s;
+            if p % 2 == 1 && next_shot < shots.len() {
+                let shot = shots[next_shot];
+                next_shot += 1;
+                broll[shot.entry_id] = shot.path;
+                cuts.push(#{
+                    entry_id: shot.entry_id,
+                    native_start_s: shot.in_s,
+                    out_start_s: out_start,
+                    length_s: piece_s,
+                    ratio: 1.0,
+                });
+                continue;
+            }
             let other = (i + 1 + p / 2) % chosen.len();
             let src = if p % 2 == 0 || other == i { i } else { other };
             let h = hooks[src];
@@ -263,13 +332,16 @@ fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem) {
             cuts.push(#{
                 entry_id: h.entry_id,
                 native_start_s: h.landing_s + p * piece_s * ratio,
-                out_start_s: (i * shape.bars + p * piece_bars) * bar_s,
+                out_start_s: out_start,
                 length_s: piece_s,
                 ratio: ratio,
             });
         }
     }
-    #{
+    let sources = [];
+    for id in broll.keys() { sources.push(#{ entry_id: id, path: broll[id] }); }
+    sources.sort(|a, b| if a.entry_id < b.entry_id { -1 } else if a.entry_id > b.entry_id { 1 } else { 0 });
+    let plan = #{
         bpm: chapter_bpm,
         key: chapter.audio.key + " " + chapter.audio.scale,
         camelot: chapter.audio.camelot,
@@ -278,7 +350,9 @@ fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem) {
         cuts: cuts,
         cards: cards,
         output: dir + "/" + stem + ".mp4",
-    }
+    };
+    if sources.len() > 0 { plan.broll = sources; }
+    plan
 }
 
 fn cfg_dir_of(path) {
@@ -296,6 +370,12 @@ fn seam_notes(plan, chosen, bars) {
         let shift = if h.semitones > 0 { "+" + h.semitones } else { h.semitones.to_string() };
         text += "seam " + (i + 1) + " at bar " + (i * bars) + ": " + item.title + " (" + h.entry_id + ") lands source bar "
             + item.audio.landing_bar + " at " + h.landing_s + "s, " + shift + " semitones, vocal over " + h.vocal_over_bars + " bars\n";
+    }
+    let hooked = #{};
+    for h in plan.hooks { hooked[h.entry_id] = true; }
+    for cut in plan.cuts {
+        if hooked.contains(cut.entry_id) { continue; }
+        text += "broll at " + cut.out_start_s + "s: " + cut.entry_id + " from " + cut.native_start_s + "s, " + cut.length_s + "s\n";
     }
     text
 }
@@ -406,7 +486,14 @@ fn build(ctx) {
     let ids = "";
     for d in drawn { ids += d.entry_id + "|"; }
     let stem = "ch" + ctx.channel.number + "-" + hex(fnv(ids + chapter_bpm));
-    let plan = plan_for(ctx, cfg, drawn, chapter_bpm, seed, fitted, stem);
+    let hooked = #{};
+    for d in drawn { hooked[d.entry_id] = true; }
+    let others = [];
+    for item in pool { if !hooked.contains(item.entry_id) { others.push(item); } }
+    // Every hook's odd four-bar cuts take a shot: 2 per 16-bar hook, 1 per 8-bar hook.
+    let want = drawn.len() * (fitted.bars / 4 / 2);
+    let shots = broll_shots(ctx, cfg, others, want, 4 * bar_s);
+    let plan = plan_for(ctx, cfg, drawn, chapter_bpm, seed, fitted, stem, shots);
     let plan_path = cfg.dir + "/" + stem + ".plan.json";
     write_file(ctx, plan_path, to_json(plan));
     let notes = seam_notes(plan, drawn, fitted.bars);
