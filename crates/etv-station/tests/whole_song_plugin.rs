@@ -144,6 +144,7 @@ impl Fixture {
             next: Some(next),
             prev: None,
             upcoming: Vec::new(),
+            pass: Vec::new(),
             config: Some(json!({
                 "expr": "item.library == \"Music Videos\"",
                 "dir": self.work,
