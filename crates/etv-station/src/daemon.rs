@@ -813,7 +813,14 @@ async fn run_generation(
         let stop = Arc::new(Notify::new());
         stops.push(stop.clone());
         let path = info.path.clone();
-        supervisor_handles.push(tokio::spawn(crate::shots::run_queue(path, stop)));
+        let ffmpeg = crate::shots::ffmpeg_program(station.station.ffmpeg.ffmpeg_path.as_deref());
+        tracing::info!(
+            event = "shots.ffmpeg",
+            program = %ffmpeg.to_string_lossy(),
+            found = crate::shots::ffmpeg_found(&ffmpeg),
+            "shot analysis will run this ffmpeg",
+        );
+        supervisor_handles.push(tokio::spawn(crate::shots::run_queue(path, ffmpeg, stop)));
     }
     for idx in 0..station.channels.len() {
         if let Some(ctx) = build_overlay_context(&station.channels[idx], &station.station.fonts) {

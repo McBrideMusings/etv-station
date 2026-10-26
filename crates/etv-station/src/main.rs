@@ -1722,7 +1722,7 @@ fn facts(config_path: Option<&Path>, args: &FactsArgs) -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Err(e) => fail(e),
+        Err(e) => fail(e.to_string()),
     }
 }
 
