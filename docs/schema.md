@@ -3343,6 +3343,27 @@ A JSON document. Unknown keys are refused. `crates/etv-render/tests/fixtures/cha
 
 The chapter lasts `bar_seconds` times the sum of every hook's `vocal_over_bars` and `full_bars`.
 
+### Set plan
+
+A JSON document that plays whole songs one after another. It names itself with `"kind": "set"`; a plan file with no `kind` is a chapter plan. Unknown keys are refused. `etv-station render` and `enqueue` take either kind, and a job's state file reads the same for both.
+
+| Key | Meaning |
+|---|---|
+| `kind` | `"set"`. |
+| `tracks` | The songs in air order: `entry_id` (unique), `path`, `native_bpm`, `enter_s` (where the song enters, in file seconds: 0 for the whole song, or its landing bar), `ratio` (source seconds per set second; 1.0 is the song's own tempo). |
+| `seams` | One fewer than `tracks`; `seams[i]` joins `tracks[i]` to `tracks[i + 1]`: `recipe`, `out_s` (where in the outgoing song, in file seconds, its phrase ends; at least one bar after it enters, two for `echo_out`), and for `bass_swap` only `bars` (even, 2 or more) and `sweep`. |
+| `end_s` | Where in the last song's file the set stops. The last 2 seconds fade out. |
+| `cards` | `{at_s, artist, title, year?}`. The renderer does not draw them; the overlay does. |
+| `output` | Where the rendered file lands. |
+
+The recipes, in set seconds with `bl` the outgoing song's bar at its `ratio`:
+
+- `bass_swap`: A plays full band through `out_s` and for `bars / 2 * bl` more; over that stretch A's tail continues with its bass cut (and narrowed to 250 to 1200 Hz when `sweep`) while B's bass-cut entry plays from `bars / 2` bars before its `enter_s`; B then plays full band. B's `ratio` must equal A's running tempo over B's `native_bpm` (within 0.002) so the beats stay locked, and `enter_s` must leave the lead-in before the start of the file. The picture cuts between the two once a bar, B's share growing.
+- `echo_out`: A plays to one bar before `out_s`; that bar and the two after it ring out in an echo (`aecho=0.8:0.7`, delay three quarters of a beat) while B enters at its own tempo at `out_s`.
+- `drop_mix`: A stops at `out_s` with a 10 ms fade and B starts on the beat.
+
+The set lasts the sum of each song's body, `(out_s - enter_s) / ratio`, plus each bass swap's `bars / 2 * bl`, plus the last song's `(end_s - enter_s) / ratio`. `crates/etv-render/src/set.rs` lays it out, and a plan whose seams do not fit is refused with the seam named. Audio comes from each song's full mix (no stem separation), and the picture is cut and joined as in a chapter.
+
 ### Naming a queued chapter
 
 A plugin that queues a chapter airs it in a bumper segment named `chapter:<job>|<entry>|<entry>...`, where `<job>` is the id `enqueue` printed (`unqueued-<stem>` when it could not reach the renderer). `GET /api/channels/{ch}/chapters` and `admin audit` find the plan and state through that name. Lines left in `<render stem>.audit.txt` beside the render are shown as the chapter's notes.
@@ -3384,6 +3405,12 @@ The image also reads `ETV_RENDER_PYTHON` (the interpreter with Demucs and PyTorc
 Config keys: `expr` and `dir` (required); `floor` (default 2.5), `steady_beats` (32), `ranker` (only `rule`), `hooks_min` (3), `hooks_max` (5), `tempo_band_pct` (4), `max_shift` (3), `vocal_over_bars` (2), `tail` (12), `seeds` (60), `artist_field` (`show`), `card_script`, `enqueue` (`etv-station`), `enqueue_args` (`[]`), `ffmpeg` (`ffmpeg`). `examples/channels/megamix-test.yaml` fills a 12-minute grid with chapters after each music video.
 
 `GET /api/channels/{ch}/chapters` lists the channel's chapter segments on the airings ledger from an hour ago on, in air order: `name`, `start`, `job`, `hooks`, `state` (`airing`, `aired`, `queued`, `running`, `rendered`, `failed`, `unqueued` or `unknown`), the renderer's `render` record for the job, the `plan`, and the `notes` from `<stem>.audit.txt`. A ledger row is there from the generation that laid it, so a chapter appears within one tick of its build. `admin audit <channel>` prints the same notes under each chapter, as `render:` lines.
+
+### Whole-song plugin
+
+`examples/plugins/bumpers/whole_song.rhai` fills a gap with music videos played whole, joined by seam recipes, and queues a set plan (§ Set plan). It needs `probe`, `catalog_read` and `exec`, and names its segment `chapter:<job>|<entry>|...` so the chapters endpoint, `admin audit` and the recent-songs check treat it as they treat a megamix chapter. Candidates are the pool's entries with audio facts at or above `floor`, a steady run of `steady_beats` beats, and a phrase boundary to leave the song by; songs of the last `tail` sets are skipped. The first song is drawn at random; each next one is drawn from the three nearest in tempo to the running tempo. The recipe per seam, from the autodj spike: `echo_out` when the tempo gap passes `tempo_gap_pct` or either beat confidence is under 1.5; `drop_mix` when the arrival is more than `drop_step_db` louder than the exit; otherwise `bass_swap`, 2 bars with a sweep when the arrival is within 90% of the song's peak and 4 bars without. A song entering at its file start has no lead-in for a bass swap, so that seam is a `drop_mix` on a step up and an `echo_out` otherwise. The last song plays until the gap ends or its file does; a set that ends early leaves the rest of the gap black.
+
+Config keys: `expr` and `dir` (required); `entry` (`landing`, the song's landing bar, or `start`, the whole song), `floor` (2.5), `steady_beats` (32), `tail` (12), `tempo_gap_pct` (8), `drop_step_db` (3), `artist_field` (`show`), `card_script`, `enqueue`, `enqueue_args`, `ffmpeg`. `<stem>.audit.txt` gets one line per seam with the recipe, both songs, the tempo gap and the energy step.
 
 ## Sample configs
 

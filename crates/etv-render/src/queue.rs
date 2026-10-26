@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::cache;
-use crate::plan::Plan;
+use crate::document::Document;
 use crate::render::{self, Timings};
 use crate::settings::Settings;
 
@@ -167,7 +167,7 @@ impl Queue {
     /// given); one that failed or was evicted is queued again.
     pub fn enqueue(
         &self,
-        plan: &Plan,
+        plan: &Document,
         air_at: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> Result<JobState, QueueError> {
@@ -198,7 +198,7 @@ impl Queue {
         write_atomic(&self.plan_path(&id), &json).map_err(|e| self.io(e))?;
         let state = fresh_state(&id, plan, air_at, now, 0);
         self.write(&state)?;
-        tracing::info!(event = "render.enqueued", id = %id, output = %plan.output.display(), "queued a chapter");
+        tracing::info!(event = "render.enqueued", id = %id, output = %plan.output().display(), kind = plan.kind(), "queued a plan");
         Ok(state)
     }
 
@@ -226,7 +226,7 @@ impl Queue {
 
 fn fresh_state(
     id: &str,
-    plan: &Plan,
+    plan: &Document,
     air_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
     attempts: u32,
@@ -234,7 +234,7 @@ fn fresh_state(
     JobState {
         id: id.to_string(),
         status: Status::Queued,
-        output: plan.output.clone(),
+        output: plan.output().to_path_buf(),
         duration_s: plan.duration_s(),
         enqueued_at: now,
         air_at,
@@ -250,7 +250,7 @@ fn fresh_state(
 }
 
 /// Sixteen hex characters of the plan's SHA-256.
-pub fn job_id(plan: &Plan) -> String {
+pub fn job_id(plan: &Document) -> String {
     let bytes = serde_json::to_vec(plan).expect("a plan serializes");
     let digest = Sha256::digest(bytes);
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
@@ -276,8 +276,8 @@ pub fn process_next(
     tracing::info!(event = "render.job_start", id = %job.id, attempt = job.attempts, "job running");
 
     let outcome = match fs::read_to_string(queue.plan_path(&job.id)) {
-        Ok(text) => match Plan::parse(&text) {
-            Ok(plan) => render::render(&plan, settings),
+        Ok(text) => match Document::parse(&text) {
+            Ok(plan) => render::render_document(&plan, settings),
             Err(e) => Err(crate::RenderError::new("plan", e.to_string())),
         },
         Err(e) => Err(crate::RenderError::new(

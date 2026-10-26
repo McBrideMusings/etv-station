@@ -90,7 +90,7 @@ fn a_plan_naming_a_missing_file_fails_with_that_path_in_the_job_state() {
     plan.hooks[1].path = dir.join("gone/song-b.mp4");
     let queue = Queue::new(dir.join("queue"));
     queue
-        .enqueue(&plan, None, OffsetDateTime::now_utc())
+        .enqueue(&plan.into(), None, OffsetDateTime::now_utc())
         .unwrap();
 
     let job = process_next(&queue, &settings, u64::MAX, OffsetDateTime::now_utc).unwrap();

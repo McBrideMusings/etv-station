@@ -1,0 +1,36 @@
+number: 58
+name: songs-test
+# A music-video channel that fills every gap up to the next 12-minute line with a
+# set of whole songs (whole_song.rhai), each pair joined by a seam recipe chosen by
+# rule. `entry: landing` starts every song at its landing bar; `entry: start` plays
+# it whole. A set airs its stand-in until the renderer's file lands.
+# Needs a catalog with audio facts (`ETV_STATION_AUDIO_ANALYZER`) and the renderer
+# named in station-megamix.yaml. Run it with
+# `STATION_CONFIG=examples/station-megamix.yaml ./tools/dev-run.sh`.
+display_name: "Songs Test Channel"
+window_days: 1
+chunk_hours: 1
+roll_interval: "60s"
+retention_days: 1
+
+rule:
+  blocks:
+    - mode: "all"
+      align: 12m
+      pools:
+        - name: videos
+          expr: 'item.library == "Music Videos"'
+          order: random
+          advance: resume
+      pattern:
+        - pool: videos
+          take: 1
+      fill:
+        - script: ../plugins/bumpers/whole_song.rhai
+          capabilities: [probe, catalog_read, exec]
+          config:
+            expr: 'item.library == "Music Videos"'
+            dir: tmp/sets
+            entry: landing
+            enqueue: target/debug/etv-station
+            enqueue_args: ["--config", "examples/station-megamix.yaml"]
