@@ -1190,6 +1190,48 @@ pub(super) fn api_health_audio(state: &AppState) -> Result<(u16, Value), String>
     ))
 }
 
+/// `GET /api/health/shots`: which ffmpeg and ffprobe shot analysis runs and
+/// whether each exists. ffmpeg comes from the station config's
+/// `ffmpeg.ffmpeg_path`, so a missing one is visible here and not only as a
+/// `shots.deferred` log line.
+pub(super) fn api_health_shots(state: &AppState) -> Result<(u16, Value), String> {
+    let path = &state.options.station;
+    let station = crate::config::load_for_inspection(path)
+        .map_err(|e| format!("load {}: {e}", path.display()))?;
+    let ffmpeg = crate::shots::ffmpeg_program(station.station.ffmpeg.ffmpeg_path.as_deref());
+    let ffprobe = crate::ffprobe::program();
+    let status = |program: &std::ffi::OsString| {
+        let name = program.to_string_lossy().into_owned();
+        json!({"program": name, "found": crate::audio::locate(&name).is_some()})
+    };
+    let (ffmpeg, ffprobe) = (status(&ffmpeg), status(&ffprobe));
+    let problems: Vec<String> = [
+        (
+            &ffmpeg,
+            "ffmpeg",
+            "set `ffmpeg.ffmpeg_path` in the station config or install ffmpeg on PATH",
+        ),
+        (
+            &ffprobe,
+            "ffprobe",
+            "set ETV_STATION_FFPROBE or install ffprobe on PATH",
+        ),
+    ]
+    .iter()
+    .filter(|(s, _, _)| s["found"] == json!(false))
+    .map(|(s, name, fix)| {
+        format!(
+            "shot analysis cannot run: {name} `{}` not found; {fix}",
+            s["program"].as_str().unwrap_or("")
+        )
+    })
+    .collect();
+    Ok((
+        200,
+        json!({"ffmpeg": ffmpeg, "ffprobe": ffprobe, "problems": problems}),
+    ))
+}
+
 pub(super) fn api_plex_accounts() -> Result<(u16, Value), String> {
     let env = PlexEnv::from_env().ok_or_else(|| "PLEX_URL/PLEX_TOKEN aren't set".to_string())?;
     let accounts = fetch_accounts(&env).map_err(|e| format!("fetching plex accounts: {e}"))?;

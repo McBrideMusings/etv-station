@@ -34,12 +34,19 @@ const FRAME_BYTES: usize = FRAME_W * FRAME_H;
 /// can fall below it and is missed; fast motion inside one shot stays under it.
 const CUT_THRESHOLD: f64 = 20.0;
 
-/// A shot whose mean luma (0 to 1) is below this is near-black. Limited-range
+/// A frame whose mean luma (0 to 1) is below this is dark. Limited-range
 /// black is 16/255, which is 0.063.
 const BLACK_LUMA: f64 = 0.08;
-/// A shot whose frames average a standard deviation (0 to 255) below this is
+/// A frame whose pixel standard deviation (0 to 255) is below this is
 /// near-uniform: a flat colour, a fade, a slate.
 const UNIFORM_STDDEV: f64 = 3.0;
+/// A dark frame is near-black, not a dark scene, only while its standard
+/// deviation stays below this: noise on a black frame, not picture detail.
+const BLACK_DETAIL_STDDEV: f64 = 6.0;
+/// The share of a shot's frames that must be near-black or near-uniform for
+/// the shot to be a card, so one flash inside a long black does not hide it
+/// and one dark frame inside a scene does not make it one.
+const CARD_FRAME_SHARE: f64 = 0.9;
 
 /// The longest the analyzer lets one file run, whatever its length.
 const FILE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
@@ -48,8 +55,8 @@ const FILE_TIMEOUT: Duration = Duration::from_secs(45 * 60);
 const IDLE_WAIT: Duration = Duration::from_secs(300);
 
 /// One shot: `start` and `end` in seconds, `luma` the mean brightness 0 to 1,
-/// `motion` the mean absolute frame difference 0 to 1, `card` true when the
-/// shot is near-black or near-uniform.
+/// `motion` the mean absolute frame difference 0 to 1, `card` true when nearly
+/// every frame of the shot is near-black or near-uniform.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Shot {
     pub start: f64,
@@ -64,7 +71,7 @@ struct Open {
     first: u64,
     last: u64,
     luma: f64,
-    stddev: f64,
+    card_frames: u64,
     motion: f64,
     motion_frames: u64,
 }
@@ -120,7 +127,10 @@ impl Segmenter {
         });
         open.last = self.frame;
         open.luma += mean;
-        open.stddev += var.sqrt();
+        let stddev = var.sqrt();
+        if stddev < UNIFORM_STDDEV || (mean / 255.0 < BLACK_LUMA && stddev < BLACK_DETAIL_STDDEV) {
+            open.card_frames += 1;
+        }
         if let (false, Some(d)) = (cut, diff) {
             open.motion += d;
             open.motion_frames += 1;
@@ -140,7 +150,7 @@ impl Segmenter {
         };
         let frames = (open.last - open.first + 1) as f64;
         let luma = open.luma / frames / 255.0;
-        let stddev = open.stddev / frames;
+        let card = open.card_frames as f64 / frames >= CARD_FRAME_SHARE;
         let motion = if open.motion_frames == 0 {
             0.0
         } else {
@@ -151,7 +161,7 @@ impl Segmenter {
             end: round((open.last + 1) as f64 / self.fps, 1000.0),
             luma: round(luma, 10_000.0),
             motion: round(motion, 10_000.0),
-            card: luma < BLACK_LUMA || stddev < UNIFORM_STDDEV,
+            card,
         });
     }
 
@@ -183,7 +193,11 @@ impl std::fmt::Display for DetectError {
     }
 }
 
-/// The first video stream's frame rate, or why there is none.
+/// The first video stream's average frame rate, or why there is none. The
+/// average is the frame count over the duration, so a variable-frame-rate file
+/// places its last shot at its true end; `r_frame_rate` is the fastest rate the
+/// stream declares and compresses every time toward the start. A stream that
+/// reports no average falls back to `r_frame_rate`.
 fn frame_rate(path: &Path) -> Result<f64, DetectError> {
     let args: Vec<OsString> = [
         "-v",
@@ -191,9 +205,9 @@ fn frame_rate(path: &Path) -> Result<f64, DetectError> {
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=r_frame_rate",
+        "stream=avg_frame_rate,r_frame_rate",
         "-of",
-        "csv=p=0",
+        "default=noprint_wrappers=1",
         "-protocol_whitelist",
         "file",
         "-i",
@@ -223,24 +237,45 @@ fn frame_rate(path: &Path) -> Result<f64, DetectError> {
     if out.is_empty() {
         return Err(DetectError::Permanent("no video stream".into()));
     }
-    let (num, den) = out.split_once('/').unwrap_or((&out, "1"));
-    let bad = || DetectError::Permanent(format!("unusable frame rate {out:?}"));
-    let (num, den): (f64, f64) = (
-        num.parse().map_err(|_| bad())?,
-        den.parse().map_err(|_| bad())?,
-    );
-    if den <= 0.0 || num <= 0.0 {
-        return Err(bad());
-    }
-    Ok(num / den)
+    pick_frame_rate(&out)
 }
 
-/// The program every shot-analysis ffmpeg spawn runs.
-fn ffmpeg_program() -> OsString {
-    match std::env::var_os("ETV_STATION_FFMPEG") {
-        Some(p) if !p.is_empty() => p,
+/// The usable rate in `key=num/den` lines: `avg_frame_rate` first, else
+/// `r_frame_rate`.
+fn pick_frame_rate(lines: &str) -> Result<f64, DetectError> {
+    let value = |key: &str| {
+        lines
+            .lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .and_then(parse_rate)
+    };
+    value("avg_frame_rate")
+        .or_else(|| value("r_frame_rate"))
+        .ok_or_else(|| DetectError::Permanent(format!("unusable frame rate {lines:?}")))
+}
+
+/// `30000/1001` or `25` as frames per second; `None` for zero or garbage.
+fn parse_rate(text: &str) -> Option<f64> {
+    let (num, den) = text.trim().split_once('/').unwrap_or((text.trim(), "1"));
+    let (num, den): (f64, f64) = (num.parse().ok()?, den.parse().ok()?);
+    (num > 0.0 && den > 0.0).then(|| num / den)
+}
+
+/// The program every shot-analysis ffmpeg spawn runs: the station's
+/// `ffmpeg.ffmpeg_path`, else `ffmpeg` on `PATH`. The same value ETV-next is
+/// given for its transcodes, so one setting decides which ffmpeg the station
+/// uses.
+pub fn ffmpeg_program(configured: Option<&Path>) -> OsString {
+    match configured {
+        Some(p) if !p.as_os_str().is_empty() => p.as_os_str().to_owned(),
         _ => OsString::from("ffmpeg"),
     }
+}
+
+/// Whether `program` can be run: a path with a separator must be a file, a bare
+/// name must be on `PATH`.
+pub fn ffmpeg_found(program: &OsString) -> bool {
+    crate::audio::locate(&program.to_string_lossy()).is_some()
 }
 
 /// Detect the shots of `path`.
@@ -249,11 +284,11 @@ fn ffmpeg_program() -> OsString {
 /// decode stalled on a dead network mount cannot hold this call past `stop` or
 /// [`FILE_TIMEOUT`]: the caller gives up, kills ffmpeg and leaves the reader to
 /// end when the pipe closes.
-pub fn detect(path: &Path, stop: &AtomicBool) -> Result<Vec<Shot>, DetectError> {
+pub fn detect(path: &Path, ffmpeg: &OsString, stop: &AtomicBool) -> Result<Vec<Shot>, DetectError> {
     use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 
     let fps = frame_rate(path)?;
-    let mut child = Command::new(ffmpeg_program())
+    let mut child = Command::new(ffmpeg)
         .args([
             "-nostdin",
             "-v",
@@ -327,15 +362,33 @@ pub fn detect(path: &Path, stop: &AtomicBool) -> Result<Vec<Shot>, DetectError> 
     Ok(shots)
 }
 
+/// Why [`entry_facts`] has no answer: the id names no entry, or the catalog
+/// could not be read.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FactsError {
+    UnknownEntry(String),
+    Catalog(String),
+}
+
+impl std::fmt::Display for FactsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownEntry(id) => write!(f, "no catalog entry {id:?}"),
+            Self::Catalog(e) => f.write_str(e),
+        }
+    }
+}
+
 /// The facts the catalog holds about one entry, as the JSON `etv-station facts`
 /// prints and the dashboard serves: `shots` is `null` for an entry never
 /// analyzed, else the row with its `error` when the analysis failed.
-pub fn entry_facts(catalog: &Catalog, entry_id: &str) -> Result<serde_json::Value, String> {
+pub fn entry_facts(catalog: &Catalog, entry_id: &str) -> Result<serde_json::Value, FactsError> {
+    let catalog_err = |e: crate::catalog::CatalogError| FactsError::Catalog(e.to_string());
     let entry = catalog
         .entry(entry_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no catalog entry {entry_id:?}"))?;
-    let shots = catalog.shots_for(entry_id).map_err(|e| e.to_string())?;
+        .map_err(catalog_err)?
+        .ok_or_else(|| FactsError::UnknownEntry(entry_id.to_string()))?;
+    let shots = catalog.shots_for(entry_id).map_err(catalog_err)?;
     Ok(serde_json::json!({
         "entry_id": entry_id,
         "title": entry.title,
@@ -350,7 +403,7 @@ pub fn entry_facts(catalog: &Catalog, entry_id: &str) -> Result<serde_json::Valu
 
 /// Analyze every entry that has no shot list for its live file, one at a time,
 /// and return how many were analyzed. Stops between files when `stop` is set.
-pub fn analyze_pending(catalog: &Catalog, stop: &AtomicBool) -> usize {
+pub fn analyze_pending(catalog: &Catalog, ffmpeg: &OsString, stop: &AtomicBool) -> usize {
     let pending = match catalog.entries_needing_shots() {
         Ok(p) => p,
         Err(e) => {
@@ -368,7 +421,7 @@ pub fn analyze_pending(catalog: &Catalog, stop: &AtomicBool) -> usize {
             break;
         }
         let started = Instant::now();
-        let result = detect(Path::new(&path), stop);
+        let result = detect(Path::new(&path), ffmpeg, stop);
         if let Err(DetectError::Transient(e)) = &result {
             tracing::warn!(
                 event = "shots.deferred",
@@ -423,14 +476,15 @@ pub fn analyze_pending(catalog: &Catalog, stop: &AtomicBool) -> usize {
 /// the catalog at `catalog_path`, wait, and look again, until `stop` fires.
 /// Each file runs on a blocking thread, so the queue never holds a runtime
 /// worker or a channel's catalog reader.
-pub async fn run_queue(catalog_path: PathBuf, stop: Arc<Notify>) {
+pub async fn run_queue(catalog_path: PathBuf, ffmpeg: OsString, stop: Arc<Notify>) {
     let halt = Arc::new(AtomicBool::new(false));
     loop {
         let pass = {
             let path = catalog_path.clone();
             let halt = Arc::clone(&halt);
+            let ffmpeg = ffmpeg.clone();
             tokio::task::spawn_blocking(move || match Catalog::open(&path) {
-                Ok(catalog) => analyze_pending(&catalog, &halt),
+                Ok(catalog) => analyze_pending(&catalog, &ffmpeg, &halt),
                 Err(e) => {
                     tracing::error!(
                         event = "shots.open_failed",
@@ -543,6 +597,55 @@ mod tests {
         assert!(shots[0].motion > 0.0);
     }
 
+    #[test]
+    fn a_long_dark_scene_with_picture_detail_is_not_a_card() {
+        let mut seg = Segmenter::new(10.0);
+        // Alternating 0 and 30: mean luma 0.059 (dark), standard deviation 15.
+        let dark: Vec<u8> = (0..FRAME_BYTES)
+            .map(|i| if i % 2 == 0 { 0 } else { 30 })
+            .collect();
+        for _ in 0..100 {
+            seg.push(&dark);
+        }
+        let shots = seg.finish();
+        assert_eq!(shots.len(), 1);
+        assert!(shots[0].luma < BLACK_LUMA);
+        assert!(!shots[0].card);
+    }
+
+    #[test]
+    fn a_black_shot_with_sensor_noise_is_still_a_card() {
+        let mut seg = Segmenter::new(10.0);
+        let noisy: Vec<u8> = (0..FRAME_BYTES)
+            .map(|i| if i % 2 == 0 { 14 } else { 20 })
+            .collect();
+        for _ in 0..30 {
+            seg.push(&noisy);
+        }
+        assert!(seg.finish()[0].card);
+    }
+
+    #[test]
+    fn the_frame_rate_is_the_average_one_and_falls_back_to_the_declared_one() {
+        let rate = |t: &str| pick_frame_rate(t).unwrap();
+        assert_eq!(rate("r_frame_rate=60/1\navg_frame_rate=25/1"), 25.0);
+        assert_eq!(
+            rate("avg_frame_rate=0/0\nr_frame_rate=30000/1001"),
+            30000.0 / 1001.0
+        );
+        assert!(pick_frame_rate("avg_frame_rate=0/0\nr_frame_rate=0/0").is_err());
+    }
+
+    #[test]
+    fn the_configured_ffmpeg_wins_and_the_default_is_path_lookup() {
+        assert_eq!(
+            ffmpeg_program(Some(Path::new("/opt/ff/ffmpeg"))),
+            "/opt/ff/ffmpeg"
+        );
+        assert_eq!(ffmpeg_program(Some(Path::new(""))), "ffmpeg");
+        assert_eq!(ffmpeg_program(None), "ffmpeg");
+    }
+
     fn make_fixture(dir: &Path, filter: &str, inputs: &[&str]) -> PathBuf {
         let out = dir.join("fixture.mp4");
         let mut cmd = Command::new("ffmpeg");
@@ -573,7 +676,7 @@ mod tests {
                 "smptebars=s=320x180:r=25:d=2",
             ],
         );
-        let shots = detect(&path, &AtomicBool::new(false)).unwrap();
+        let shots = detect(&path, &ffmpeg_program(None), &AtomicBool::new(false)).unwrap();
         let cuts: Vec<f64> = shots.iter().skip(1).map(|s| s.start).collect();
         let one_frame = 1.0 / 25.0;
         for expected in [2.0, 3.0] {
@@ -596,7 +699,7 @@ mod tests {
                 "testsrc2=s=320x180:r=25:d=3",
             ],
         );
-        let shots = detect(&path, &AtomicBool::new(false)).unwrap();
+        let shots = detect(&path, &ffmpeg_program(None), &AtomicBool::new(false)).unwrap();
         let first = &shots[0];
         assert!(first.card, "{shots:?}");
         assert_eq!(first.start, 0.0);
@@ -615,7 +718,7 @@ mod tests {
             .unwrap()
             .success();
         assert!(ok);
-        let err = detect(&path, &AtomicBool::new(false)).unwrap_err();
+        let err = detect(&path, &ffmpeg_program(None), &AtomicBool::new(false)).unwrap_err();
         assert_eq!(err, DetectError::Permanent("no video stream".into()));
     }
 }

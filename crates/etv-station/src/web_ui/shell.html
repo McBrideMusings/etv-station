@@ -600,9 +600,10 @@ async function loadHealth() {
   const tick = () => { if ($('hstate')) $('hstate').innerHTML = `<span class="spinner"></span>Reading channel health… (${Math.round((Date.now() - began) / 1000)}s)`; };
   tick();
   const timer = setInterval(tick, 1000);
-  let build = {}, data, renders = null, audio = null;
+  let build = {}, data, renders = null, audio = null, shots = null;
   try {
-    const [h, c, rr, a] = await Promise.all([fetch('/api/health'), fetch('/api/health/channels'), fetch('/api/health/renders'), fetch('/api/health/audio')]);
+    const [h, c, rr, a, sh] = await Promise.all([fetch('/api/health'), fetch('/api/health/channels'), fetch('/api/health/renders'), fetch('/api/health/audio'), fetch('/api/health/shots')]);
+    shots = await sh.json().catch(() => null);
     renders = await rr.json().catch(() => null);
     build = await h.json().catch(() => ({}));
     audio = await a.json().catch(() => null);
@@ -619,7 +620,7 @@ async function loadHealth() {
   if (data.error) {
     $('report').innerHTML = head + `<div class="error">${esc(data.error)}</div>`;
   } else {
-    $('report').innerHTML = head + drawAudioHealth(audio) + drawHealth(data) + drawRenders(renders);
+    $('report').innerHTML = head + drawAudioHealth(audio) + drawShotsHealth(shots) + drawHealth(data) + drawRenders(renders);
   }
   $('healthReload').addEventListener('click', loadHealth);
 }
@@ -633,6 +634,11 @@ function drawAudioHealth(a) {
   if (!a || a.error) return '';
   const line = `Audio facts: ${esc(a.analyzed)} of ${esc(a.total)} entries analyzed${a.failed ? `, ${esc(a.failed)} failed` : ''}.`;
   return a.problem ? `<div class="notice">${line} ${esc(a.problem)}</div>` : `<p class="muted">${line}</p>`;
+}
+
+function drawShotsHealth(s) {
+  if (!s || s.error || !(s.problems || []).length) return '';
+  return s.problems.map((p) => `<div class="notice">${esc(p)}</div>`).join('');
 }
 
 function drawHealth(d) {

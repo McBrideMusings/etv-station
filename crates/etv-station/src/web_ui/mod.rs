@@ -65,8 +65,8 @@ use health::api_health_channels;
 use lineup::api_lineup;
 use pools::{
     PoolState, api_audio_fact, api_draft_discard, api_draft_edit, api_draft_open, api_health_audio,
-    api_plex_accounts, api_pools, api_search_item, api_search_keyword, api_search_tag, draft_yaml,
-    scored_channel_count,
+    api_health_shots, api_plex_accounts, api_pools, api_search_item, api_search_keyword,
+    api_search_tag, draft_yaml, scored_channel_count,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
@@ -294,7 +294,10 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
     {
         return match crate::shots::entry_facts(&state.catalog, &percent_decode(id)) {
             Ok(body) => Reply::Json(200, body),
-            Err(error) => Reply::Json(404, json!({ "error": error })),
+            Err(e @ crate::shots::FactsError::UnknownEntry(_)) => {
+                Reply::Json(404, json!({ "error": e.to_string() }))
+            }
+            Err(e) => Reply::Json(500, json!({ "error": e.to_string() })),
         };
     }
     if let Some(rest) = path.strip_prefix("/api/channels/") {
@@ -355,6 +358,7 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
         (Method::Get, "/api/health") => Ok(api_health(state)),
         (Method::Get, "/api/health/channels") => api_health_channels(state),
         (Method::Get, "/api/health/audio") => api_health_audio(state),
+        (Method::Get, "/api/health/shots") => api_health_shots(state),
         (Method::Get, "/api/health/renders") => health::api_health_renders(state),
         (Method::Get, "/api/lineup") => api_lineup(state),
         (Method::Get, "/api/search/keyword") => api_search_keyword(state, query),
@@ -483,6 +487,20 @@ mod tests {
             Reply::Json(status, body) => (status, body),
             _ => panic!("{path} did not answer JSON"),
         }
+    }
+
+    /// An id the catalog lacks is a 404; `/api/health/shots` names the ffmpeg
+    /// the station config selects and whether it exists.
+    #[test]
+    fn entry_facts_404_for_an_unknown_entry_and_health_shots_names_both_programs() {
+        let mut state = example_state();
+        let (status, body) = get_json(&mut state, "/api/entries/nope/facts");
+        assert_eq!(status, 404, "{body}");
+        let (status, body) = get_json(&mut state, "/api/health/shots");
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["ffmpeg"]["program"], json!("ffmpeg"));
+        assert!(body["ffprobe"]["found"].is_boolean(), "{body}");
+        assert!(body["problems"].is_array(), "{body}");
     }
 
     /// `GET /api/audio/{id}` is what `admin facts` prints, and the Health tab's
