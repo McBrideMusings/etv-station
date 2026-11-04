@@ -26,11 +26,18 @@
 # Every selected check runs in both workspaces even if an earlier one fails;
 # the exit status is non-zero if any of them failed, and the summary at the end
 # names which.
+#
+# Load cap: every command runs at `nice -n 10` with CARGO_BUILD_JOBS and
+# RUST_TEST_THREADS set to VERIFY_JOBS (default 4), so one run holds at most
+# that many compiler processes and that many concurrently running tests per
+# test binary. Raise it for a run on an idle machine: VERIFY_JOBS=8 tools/verify-all.sh
 
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENDOR="$ROOT/vendor/etv-next"
+
+VERIFY_JOBS="${VERIFY_JOBS:-4}"
 
 FAILED=()
 PASSED=()
@@ -40,7 +47,7 @@ run() {
   local label="$1" dir="$2"
   shift 2
   printf '\n\033[1m==> %s\033[0m\n    (cd %s && %s)\n' "$label" "${dir#"$ROOT"/}" "$*"
-  if (cd "$dir" && "$@"); then
+  if (cd "$dir" && CARGO_BUILD_JOBS="$VERIFY_JOBS" RUST_TEST_THREADS="$VERIFY_JOBS" nice -n 10 "$@"); then
     PASSED+=("$label")
   else
     FAILED+=("$label")

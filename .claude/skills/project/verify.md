@@ -19,6 +19,10 @@ for three orchestrate rounds.
 ./tools/verify-all.sh test         # just tests, still both
 ```
 
+Every command in the script runs at `nice -n 10` with `CARGO_BUILD_JOBS` and `RUST_TEST_THREADS`
+set to `VERIFY_JOBS` (default 4), so one run holds at most that many compiler processes and
+concurrent tests per test binary. Raise it on an idle machine: `VERIFY_JOBS=8 ./tools/verify-all.sh test`.
+
 The web UI's pages are plain HTML with an inline script that no cargo test loads.
 Run the load check after any edit to `crates/etv-station/src/web_ui/shell.html`:
 
