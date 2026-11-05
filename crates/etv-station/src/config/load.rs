@@ -152,6 +152,30 @@ pub fn validate_channel_candidate(
     channel_path: &Path,
     text: &str,
 ) -> Result<(), String> {
+    load_candidate(station_path, channel_path, text).map(|_| ())
+}
+
+/// The station with `text` swapped in for the lineup entry at `channel_path`,
+/// without the validity check or the comparison load: what a simulation of an
+/// edit needs.
+pub fn inspect_candidate(
+    station_path: &Path,
+    channel_path: &Path,
+    text: &str,
+) -> Result<Station, ConfigError> {
+    inspect_with(station_path, Some((channel_path, text)))
+}
+
+/// [`validate_channel_candidate`]'s check, keeping what it loaded: the station
+/// as the files hold it now (`before`) and with `text` swapped in (`after`).
+/// Both loads use the same inspection rules, so a value that differs between
+/// them is the edit's doing. `after.channels` lacks the channel when its only
+/// fault is an `${ENV}` variable this process cannot see.
+pub fn load_candidate(
+    station_path: &Path,
+    channel_path: &Path,
+    text: &str,
+) -> Result<CandidateLoad, String> {
     let before = inspect_with(station_path, None).map_err(|e| e.to_string())?;
     let after =
         inspect_with(station_path, Some((channel_path, text))).map_err(|e| e.to_string())?;
@@ -171,7 +195,13 @@ pub fn validate_channel_candidate(
         }
         return Err(format!("{}: {}", d.config_path.display(), d.reason));
     }
-    Ok(())
+    Ok(CandidateLoad { before, after })
+}
+
+/// The two loads [`load_candidate`] compared.
+pub struct CandidateLoad {
+    pub before: Station,
+    pub after: Station,
 }
 
 /// What [`load_for_inspection`] stands in for an unset `${var}`. Deliberately

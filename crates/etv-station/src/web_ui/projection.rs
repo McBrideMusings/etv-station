@@ -117,6 +117,9 @@ pub struct Request {
     /// The draft whose pools replace the deployed ones, when this projection
     /// is a draft's.
     pub draft: Option<DraftEdits>,
+    /// The channel file's text to simulate in place of the file, when this
+    /// projection is a candidate edit's.
+    pub candidate: Option<Arc<String>>,
 }
 
 impl Request {
@@ -125,6 +128,7 @@ impl Request {
     fn series(&self) -> String {
         match &self.draft {
             Some(d) if d.is_edited() => format!("{}#draft", self.channel),
+            _ if self.candidate.is_some() => format!("{}#candidate", self.channel),
             _ => self.channel.clone(),
         }
     }
@@ -340,6 +344,7 @@ pub fn digests(
     frontier: String,
     candidates: String,
     draft: Option<&DraftEdits>,
+    candidate: Option<&str>,
 ) -> Digests {
     let file = |p: &Path| match std::fs::read(p) {
         Ok(bytes) => sha_hex(&[b"file", &bytes]),
@@ -358,7 +363,13 @@ pub fn digests(
     }));
     let scripts = sha_hex(&[scripts.join("\n").as_bytes()]);
     BTreeMap::from([
-        ("config".to_string(), file(config_path)),
+        (
+            "config".to_string(),
+            match candidate {
+                Some(text) => sha_hex(&[b"candidate", text.as_bytes()]),
+                None => file(config_path),
+            },
+        ),
         ("scripts".to_string(), scripts),
         ("station".to_string(), file(station_path)),
         ("frontier".to_string(), frontier),
@@ -440,6 +451,13 @@ impl SimCache {
             return Lookup::Failed(why.clone());
         }
         if g.running.as_deref() != Some(&key) && !g.queue.iter().any(|j| j.key == key) {
+            // A newer text for the same channel replaces an older one still
+            // waiting: nobody is looking at that simulation any more.
+            if req.candidate.is_some() {
+                let series = req.series();
+                g.queue
+                    .retain(|j| j.request.candidate.is_none() || j.request.series() != series);
+            }
             g.queue.push_back(Job {
                 key,
                 request: req,
@@ -600,8 +618,12 @@ impl SimCache {
     }
 
     fn simulate(&self, req: &Request, catalog: &Catalog) -> Result<Simulation, String> {
-        let mut station = config::load_for_inspection(&self.station_path)
-            .map_err(|e| format!("load {}: {e}", self.station_path.display()))?;
+        let mut station = match &req.candidate {
+            Some(text) => config::inspect_candidate(&self.station_path, &req.config_path, text)
+                .map_err(|e| format!("load {} with the edit: {e}", self.station_path.display()))?,
+            None => config::load_for_inspection(&self.station_path)
+                .map_err(|e| format!("load {}: {e}", self.station_path.display()))?,
+        };
         let tz = crate::tz::parse(&station.station.tz).map_err(|e| e.to_string())?;
         let lc = station
             .channels
@@ -682,6 +704,7 @@ mod tests {
             resume: ResumeMap::new(),
             digests: digests_of(config),
             draft: None,
+            candidate: None,
         }
     }
 
@@ -769,5 +792,29 @@ mod tests {
         c.store(job, Err("boom".into()));
         assert!(matches!(c.lookup(request("a", 7, "c1")), Lookup::Failed(m) if m == "boom"));
         assert!(matches!(c.lookup(request("a", 7, "c1")), Lookup::Pending));
+    }
+
+    #[test]
+    fn a_newer_candidate_text_replaces_an_older_one_still_queued() {
+        let c = cache("candidate-supersede");
+        let with_text = |config: &str, text: &str| {
+            let mut r = request("a", 3, config);
+            r.candidate = Some(Arc::new(text.to_string()));
+            r
+        };
+        assert!(matches!(c.lookup(with_text("c1", "one")), Lookup::Pending));
+        assert!(matches!(c.lookup(with_text("c2", "two")), Lookup::Pending));
+        // A deployed projection of the same channel is not a candidate's.
+        assert!(matches!(
+            c.lookup(request("a", 3, "deployed")),
+            Lookup::Pending
+        ));
+        let queued: Vec<String> = c
+            .lock()
+            .queue
+            .iter()
+            .map(|j| j.request.digests["config"].clone())
+            .collect();
+        assert_eq!(queued, vec!["c2".to_string(), "deployed".to_string()]);
     }
 }

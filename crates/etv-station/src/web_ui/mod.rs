@@ -13,8 +13,9 @@
 //! endpoint. `{ch}` is the channel's lineup key, percent-encoded when it holds
 //! a `/`.
 //!
-//! The Edit tab (`edit`, `apply`) is the one page that writes a channel file: it reads the
-//! deployed `channel.yaml`, checks edited text with the daemon's loader and applies it.
+//! The Edit tab (`edit`, `apply`, `preview`) is the one page that writes a channel file: it reads the
+//! deployed `channel.yaml`, checks edited text with the daemon's loader, previews what applying
+//! would change and rewind, and applies it.
 //! Otherwise nothing here writes to the station's config or data: a draft's profile
 //! edits live in this process's memory, stills cache under the OS temp
 //! directory and projections under the data volume beside the catalog. The server listens on the network in the container with no
@@ -45,6 +46,7 @@ mod health;
 mod lineup;
 mod overlap;
 mod pools;
+mod preview;
 mod projection;
 mod real;
 
@@ -74,6 +76,7 @@ use pools::{
     api_health_shots, api_plex_accounts, api_pools, api_search_item, api_search_keyword,
     api_search_tag, draft_yaml, scored_channel_count,
 };
+use preview::api_preview;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use tiny_http::Method;
@@ -317,6 +320,9 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
             (Method::Get, [key, "file"]) => return json_reply(api_file(state, key)),
             (Method::Post, [key, "validate"]) => {
                 return json_reply(api_validate(state, key, body));
+            }
+            (Method::Post, [key, "preview"]) => {
+                return json_reply(api_preview(state, key, body));
             }
             (Method::Post, [key, "profile"]) => {
                 return json_reply(api_profile(state, key, body));

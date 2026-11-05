@@ -173,7 +173,7 @@ pub(super) fn api_channel_review(
 ) -> Result<(u16, Value), String> {
     let params = parse_query(query);
     let Some(draft_id) = params.get("draft").filter(|d| !d.is_empty()).cloned() else {
-        return channel_review(state, key, &params, None);
+        return channel_review(state, key, &params, None, None);
     };
     let edits = match super::pools::draft_edits(state, key, &draft_id) {
         Ok(e) => e,
@@ -185,8 +185,8 @@ pub(super) fn api_channel_review(
         .or_insert_with(|| format!("{DRAFT_PROJECT_DAYS}d"));
     // Both are asked before either answer is read, so a cold cache queues the
     // two simulations together.
-    let (dep_status, deployed) = channel_review(state, key, &params, None)?;
-    let (draft_status, draft) = channel_review(state, key, &params, Some(&edits))?;
+    let (dep_status, deployed) = channel_review(state, key, &params, None, None)?;
+    let (draft_status, draft) = channel_review(state, key, &params, Some(&edits), None)?;
     for (status, body) in [(dep_status, &deployed), (draft_status, &draft)] {
         if status != 200 && status != 202 {
             return Ok((status, body.clone()));
@@ -308,17 +308,34 @@ fn review_diff(deployed: &Value, draft: &Value) -> Value {
     })
 }
 
-/// One review: the deployed channel's, or `draft`'s pools swapped in.
-fn channel_review(
+/// A station already loaded for one review, and the channel text that was
+/// swapped into it when the review is a candidate edit's.
+pub(super) struct Loaded {
+    pub(super) station: config::Station,
+    pub(super) candidate: Option<Arc<String>>,
+}
+
+/// One review: the deployed channel's, or `draft`'s pools swapped in. With
+/// `loaded` the review reads that station instead of loading the files again;
+/// its `candidate` text is the channel file's stand-in for the simulation and
+/// the candidate digest.
+pub(super) fn channel_review(
     state: &mut AppState,
     key: &str,
     params: &HashMap<String, String>,
     draft: Option<&projection::DraftEdits>,
+    loaded: Option<Loaded>,
 ) -> Result<(u16, Value), String> {
     let began = std::time::Instant::now();
     let key = key.to_string();
-    let station = config::load_for_inspection(&state.review.station_path)
-        .map_err(|e| format!("load {}: {e}", state.review.station_path.display()))?;
+    let (station, candidate) = match loaded {
+        Some(l) => (l.station, l.candidate),
+        None => (
+            config::load_for_inspection(&state.review.station_path)
+                .map_err(|e| format!("load {}: {e}", state.review.station_path.display()))?,
+            None,
+        ),
+    };
 
     // Every channel file the station's `channels:` patterns found, loaded or
     // not, in station.yaml order.
@@ -403,7 +420,8 @@ fn channel_review(
     let mut projected_until: Option<time::OffsetDateTime> = None;
     if let Some(n) = project_days {
         let seed = real::seed(lc, history.as_ref(), generation::ledger_reach(&lc.config))?;
-        let candidates = candidates_digest(&mut state.review, &state.catalog, lc)?;
+        let candidates =
+            candidates_digest(&mut state.review, &state.catalog, lc, candidate.as_deref())?;
         let digests = projection::digests(
             &state.options.station,
             &lc.config_path,
@@ -417,6 +435,7 @@ fn channel_review(
             ),
             candidates,
             draft,
+            candidate.as_deref().map(String::as_str),
         );
         let request = projection::Request {
             channel: key.clone(),
@@ -429,6 +448,7 @@ fn channel_review(
             resume: seed.resume,
             digests,
             draft: draft.cloned(),
+            candidate: candidate.clone(),
         };
         let request_key = request.key();
         match state.review.sims.lookup(request) {
@@ -953,9 +973,20 @@ fn candidates_digest(
     review: &mut ReviewState,
     catalog: &Catalog,
     lc: &config::LoadedChannel,
+    candidate: Option<&String>,
 ) -> Result<String, String> {
     let mtime = file_mtime(&lc.config_path)?;
-    if let Some((cached_mtime, at, digest)) = review.candidate_digests.get(&lc.config_path)
+    // A candidate text resolves different candidates than the file, so it
+    // caches under its own key.
+    let cache_key = match candidate {
+        Some(text) => {
+            use sha2::{Digest, Sha256};
+            let tag = format!("{:x}", Sha256::digest(text.as_bytes()));
+            PathBuf::from(format!("{}#{tag}", lc.config_path.display()))
+        }
+        None => lc.config_path.clone(),
+    };
+    if let Some((cached_mtime, at, digest)) = review.candidate_digests.get(&cache_key)
         && *cached_mtime == mtime
         && at.elapsed() < CANDIDATE_DIGEST_LIFE
     {
@@ -970,8 +1001,13 @@ fn candidates_digest(
     )
     .map_err(|e| e.to_string())?;
     let digest = projection::candidates_digest(candidate_contents(catalog, ids)?);
+    // Entries past their life are never read again, and a candidate text is a
+    // new key every edit, so they go here instead of accumulating.
+    review
+        .candidate_digests
+        .retain(|_, (_, at, _)| at.elapsed() < CANDIDATE_DIGEST_LIFE);
     review.candidate_digests.insert(
-        lc.config_path.clone(),
+        cache_key,
         (mtime, std::time::Instant::now(), digest.clone()),
     );
     Ok(digest)

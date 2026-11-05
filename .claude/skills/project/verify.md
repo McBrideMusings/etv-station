@@ -57,7 +57,10 @@ without touching `deploy/`: make a throwaway station and channel files under
 `/private/tmp/claude/etv-station/ui/`, run `target/debug/etv-station --config <it> --serve-ui --ui-port 4748
 --ui-private-catalog` (the catalog may be `tmp/claude/scratchpad/station-cache/catalog.db`), and open
 `#/edit/a`. A pane narrower than 900 px gets the narrow layout, so screenshot it inside an iframe 1280 px wide.
-Every state keeps the draft bar at one rectangle; measure `#ebar` in each. The daemon's reload outcome
+Every state keeps the draft bar and the preview panel (`.pv`, `#pvtabs`) at one rectangle; measure `#ebar`, `.pv` and `#pvtabs` in each.
+The preview's rewind span needs a channel with published playout: run `target/debug/etv-station --config <it>` for about a minute under `timeout 60`, then
+`POST /api/channels/{ch}/preview` with the file text edited (`seed: 7` to `seed: 8` changes the schedule; a `# note` line leaves the fingerprint `same`).
+Check `rewind.airings` against the chunk files in the station's output folder: an item that straddles a chunk boundary is listed in both files, so count distinct starts. The daemon's reload outcome
 (`reverted`, `channel_dropped`) needs a running daemon; without one, stub `apply/status` in the page.
 
 The dashboard's Guide tab reads ETV-next's `/channels.m3u` and `/xmltv.xml` in the browser

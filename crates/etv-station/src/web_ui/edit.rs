@@ -33,7 +33,7 @@ pub(super) fn api_file(state: &mut AppState, key: &str) -> Answer {
 }
 
 /// The first `line N` a loader message names.
-fn line_of(reason: &str) -> Option<u64> {
+pub(super) fn line_of(reason: &str) -> Option<u64> {
     let at = reason.find("line ")? + "line ".len();
     let digits: String = reason[at..]
         .chars()

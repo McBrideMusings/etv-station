@@ -74,7 +74,7 @@ pub fn open_history(output_base: &Path) -> Result<Option<HistoryDb>, String> {
 /// Every item of the channel's chunk files finishing after `since`,
 /// deduplicated on `(id, start)` (a boundary-straddling item is written into
 /// both neighbouring chunks).
-fn published_items(
+pub(super) fn published_items(
     lc: &LoadedChannel,
     since: OffsetDateTime,
 ) -> Result<Vec<ersatztv_playout::playout::PlayoutItem>, String> {

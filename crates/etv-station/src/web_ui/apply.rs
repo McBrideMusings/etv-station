@@ -469,4 +469,36 @@ mod tests {
         );
         assert_eq!(status, 400, "{refused}");
     }
+
+    #[test]
+    fn the_preview_tells_a_comment_from_a_change_and_an_unchanged_text_from_both() {
+        let mut f = fixture(CHANNEL);
+        let preview = |f: &mut Fixture, yaml: &str| {
+            call(
+                f,
+                Method::Post,
+                "/api/channels/a/preview",
+                json!({ "yaml": yaml }),
+            )
+        };
+        let (status, same_text) = preview(&mut f, CHANNEL);
+        assert_eq!(status, 200, "{same_text}");
+        assert_eq!(same_text, json!({ "valid": true, "changed": false }));
+
+        let (_, comment) = preview(&mut f, &format!("# a note\n{CHANNEL}"));
+        assert_eq!(comment["fingerprint"]["state"], json!("same"), "{comment}");
+        assert_eq!(comment["rewind"]["state"], json!("none"), "{comment}");
+
+        let (_, edit) = preview(&mut f, &edited());
+        assert_eq!(edit["fingerprint"]["state"], json!("changed"), "{edit}");
+        // Nothing is published under the fixture's output folder.
+        assert_eq!(edit["rewind"]["state"], json!("none"), "{edit}");
+
+        let bad = CHANNEL.replace("- pool: movies", "- pool: no-such-pool");
+        let (_, invalid) = preview(&mut f, &bad);
+        assert_eq!(invalid["valid"], json!(false), "{invalid}");
+        assert!(invalid["error"].as_str().is_some_and(|e| !e.is_empty()));
+        assert_eq!(std::fs::read_to_string(f.channel_file()).unwrap(), CHANNEL);
+        assert!(f.backups().is_empty());
+    }
 }

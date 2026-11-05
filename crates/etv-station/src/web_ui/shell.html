@@ -300,7 +300,7 @@
   .enote.bad { background: var(--err-bg); color: var(--err-fg); }
   .enote b { font-weight: 800; }
   .epage { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-  .ebody { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 300px; grid-template-rows: minmax(0, 1fr); gap: 12px; }
+  .ebody { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 400px; grid-template-rows: minmax(0, 1fr); gap: 12px; }
   .ed { position: relative; min-height: 0; display: grid; grid-template-columns: 4.2em minmax(0, 1fr); border: 1px solid var(--line); border-radius: 3px; overflow: hidden; background: var(--bg); }
   .ed .gut { overflow: hidden; background: var(--panel); border-right: 1px solid var(--line); padding: 6px 0; font: 12px/18px ui-monospace, monospace; color: var(--muted); text-align: right; }
   .ed .gut div { height: 18px; padding-right: 8px; position: relative; font-variant-numeric: tabular-nums; }
@@ -311,7 +311,18 @@
     white-space: pre; overflow: auto; tab-size: 2; min-width: 0; }
   .ed textarea:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
   .ed .eload { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: var(--bg); }
-  .eprof { min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 3px; padding: 8px 10px; font-size: 12.5px; }
+  .pv { min-height: 0; display: grid; grid-template-rows: 32px minmax(0, 1fr); border: 1px solid var(--line); border-radius: 3px; font-size: 12.5px; overflow: hidden; }
+  .pvtabs { display: grid; grid-template-columns: minmax(0, 1.9fr) minmax(0, .7fr) minmax(0, 1.3fr) minmax(0, 1fr); border-bottom: 1px solid var(--line); background: var(--panel); }
+  .pvtabs button { border: 0; border-radius: 0; background: none; padding: 0 4px; font-size: 12px; font-weight: 600; color: var(--muted); border-bottom: 2px solid transparent; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .pvtabs button[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+  .pvtabs button.bad { color: var(--err-fg); }
+  .pvbody, .eprof { min-height: 0; overflow: auto; padding: 8px 10px; }
+  .pvrow { border-top: 1px solid var(--line); padding: 5px 0; }
+  .pvrow:first-child { border-top: 0; }
+  .pvrow .t { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .pvrow .was { color: var(--muted); }
+  .pvrow .mv { font-variant-numeric: tabular-nums; font-weight: 700; }
+  .pvbig { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 2px 0 6px; }
   .eprof .pool { border-top: 1px solid var(--line); padding: 6px 0; }
   .eprof .pool:first-of-type { border-top: 0; }
   .eprof .pe { display: flex; gap: 6px; align-items: center; padding: 1px 0; }
@@ -627,6 +638,7 @@ function markRoute(r) {
 // The draft bar and the note row under it are drawn once and only have their text changed, so nothing moves between states.
 const EDIT_VALIDATE_MS = 400;
 const EDIT_POLL_MS = 1000;
+const EDIT_PREVIEW_POLL_MS = 2000; // a re-simulation takes seconds
 const EDIT_POLL_DEADLINE_MS = 60000;
 const editDrafts = {};   // channel key -> the text a person left unapplied, kept when they switch channels
 let editState = null;    // the open page: { channel, base, text, valid, phase, ... }
@@ -688,7 +700,7 @@ async function loadEdit(channel) {
   $('report').innerHTML = `<div class="epage"><div class="ebar" id="ebar"><span class="ech">${esc(channel)}</span><span class="est">Loading…</span><span class="eval"></span>
       <button type="button" disabled>Discard</button><button type="button" disabled>Copy YAML</button><button type="button" class="primary" disabled>Apply to prod…</button></div>
     <div class="enote" id="enote"></div>
-    <div class="ebody"><div class="ed"><div class="eload"><span class="spinner"></span>Loading the deployed channel.yaml…</div></div><aside class="eprof"></aside></div></div>`;
+    <div class="ebody"><div class="ed"><div class="eload"><span class="spinner"></span>Loading the deployed channel.yaml…</div></div><aside class="pv"></aside></div></div>`;
   const ebar = $('ebar');
   let r;
   try { r = await editJson(`${url}/file`); } catch (e) { r = { ok: false, data: { error: String(e) } }; }
@@ -698,7 +710,7 @@ async function loadEdit(channel) {
     return;
   }
   const base = r.data.yaml;
-  editState = { channel, url, path: r.data.path, base, text: editDrafts[channel] && editDrafts[channel].base === base ? editDrafts[channel].text : base, valid: null, phase: 'edit', note: null, seq: 0, profSeq: 0, timer: null, profTimer: null, poll: null };
+  editState = { channel, url, path: r.data.path, base, text: editDrafts[channel] && editDrafts[channel].base === base ? editDrafts[channel].text : base, valid: null, phase: 'edit', note: null, tab: 'schedule', preview: null, pvSeq: 0, pvTimer: null, schedSeq: -1, schedBegan: 0, seq: 0, profSeq: 0, timer: null, profTimer: null, poll: null };
   const stale = editDrafts[channel] && editDrafts[channel].base !== base;
   if (stale) delete editDrafts[channel];
   drawEdit();
@@ -713,7 +725,7 @@ window.addEventListener('beforeunload', (ev) => { if (Object.keys(editDrafts).le
 
 function stopEditTimers() {
   if (!editState) return;
-  clearTimeout(editState.timer); clearTimeout(editState.profTimer); clearTimeout(editState.poll);
+  clearTimeout(editState.timer); clearTimeout(editState.profTimer); clearTimeout(editState.poll); clearTimeout(editState.pvTimer);
 }
 
 function drawEdit() {
@@ -723,11 +735,15 @@ function drawEdit() {
     <div class="enote" id="enote" aria-live="polite"></div>
     <div class="ebody"><div class="ed"><div class="gut" id="egut" aria-hidden="true"></div>
       <textarea id="etext" spellcheck="false" wrap="off" aria-label="${esc(e.channel)} channel.yaml"></textarea></div>
-      <aside class="eprof" id="eprof" aria-label="Taste profiles"><div class="muted">Reading the pools…</div></aside></div></div>`;
+      <aside class="pv" aria-label="Preview"><nav class="pvtabs" id="pvtabs" role="tablist">
+        <button type="button" role="tab" data-tab="schedule">Schedule vs deployed</button><button type="button" role="tab" data-tab="profile">Profile</button>
+        <button type="button" role="tab" data-tab="slots">Published slots</button><button type="button" role="tab" data-tab="validation">Validation</button></nav>
+        <div class="pvbody" id="pvbody"></div><div class="eprof" id="eprof" aria-label="Taste profiles" hidden><div class="muted">Reading the pools…</div></div></aside></div></div>`;
   const ta = $('etext');
   ta.value = e.text;
   ta.addEventListener('input', () => { if (e.phase === 'applying') return; e.text = ta.value; e.note = null; editChanged(false); });
   ta.addEventListener('scroll', () => { $('egut').scrollTop = ta.scrollTop; });
+  for (const b of $('pvtabs').querySelectorAll('button')) b.addEventListener('click', () => { e.tab = b.dataset.tab; paintPreview(); if (e.tab === 'schedule' && e.preview && e.preview.data && e.preview.data.valid && e.preview.data.changed && !e.preview.sched) editSchedule(e.pvSeq, e.text); });
   $('ediscard').addEventListener('click', () => { if (e.phase === 'applying') return; e.text = e.base; delete editDrafts[e.channel]; e.note = null; ta.value = e.text; editChanged(false); });
   $('ecopy').addEventListener('click', () => editCopy());
   $('eapply').addEventListener('click', () => editApply());
@@ -739,22 +755,14 @@ function editChanged(first) {
   if (!e || !$('etext') || !$('etext').isConnected) return;
   e.diff = lineDiff(e.base, e.text);
   if (e.text === e.base) delete editDrafts[e.channel]; else editDrafts[e.channel] = { base: e.base, text: e.text };
-  clearTimeout(e.timer); clearTimeout(e.profTimer);
-  e.seq++; e.profSeq++;
-  if (e.text === e.base) e.valid = { ok: true, same: true };
-  else { e.valid = null; e.timer = setTimeout(editValidate, first ? 0 : EDIT_VALIDATE_MS); }
+  clearTimeout(e.profTimer);
+  e.profSeq++; e.pvSeq++;
+  clearTimeout(e.pvTimer);
+  e.preview = null;
+  // One request answers validity, fingerprint and rewind; the draft bar and the tabs read it.
+  if (e.text === e.base) { e.valid = { ok: true, same: true }; e.pvTimer = null; }
+  else { e.valid = null; e.pvTimer = setTimeout(editPreview, first ? 0 : EDIT_VALIDATE_MS); }
   e.profTimer = setTimeout(editProfiles, first ? 0 : EDIT_VALIDATE_MS);
-  paintEdit();
-}
-
-async function editValidate() {
-  const e = editState, ta = $('etext');
-  if (!e || !ta || !ta.isConnected) return;
-  const seq = ++e.seq, text = e.text;
-  let r;
-  try { r = await editJson(`${e.url}/validate`, { yaml: text }); } catch (x) { r = { ok: false, data: { error: String(x) } }; }
-  if (e !== editState || seq !== e.seq || !ta.isConnected) return;
-  e.valid = r.ok && r.data.valid ? { ok: true } : { ok: false, error: r.data.error || `HTTP ${r.status}`, line: r.data.line || null };
   paintEdit();
 }
 
@@ -786,6 +794,7 @@ function paintEdit() {
   }
   $('egut').innerHTML = rows;
   $('egut').scrollTop = $('etext').scrollTop;
+  paintPreview();
 }
 
 function editCopy() {
@@ -798,7 +807,7 @@ function editCopy() {
 async function editApply() {
   const e = editState;
   if (!e || e.phase === 'applying' || !(e.valid && e.valid.ok) || e.text === e.base) return;
-  if (!confirm(`Apply ${e.diff.hunks} edit${e.diff.hunks === 1 ? '' : 's'} to ${e.channel} on the deployed station?\n\nThe file is backed up, replaced, and the daemon is told to reload it.`)) return;
+  if (!confirm(`Apply ${e.diff.hunks} edit${e.diff.hunks === 1 ? '' : 's'} to ${e.channel} on the deployed station?\n\n${rewindSentence(e)}\n\nThe file is backed up, replaced, and the daemon is told to reload it.`)) return;
   const text = e.text;
   e.phase = 'applying'; e.note = { kind: '', html: '<span class="spinner"></span>Writing the file and telling the daemon…' };
   $('etext').readOnly = true;
@@ -837,6 +846,118 @@ async function editApply() {
     e.poll = setTimeout(poll, EDIT_POLL_MS);
   };
   poll();
+}
+
+
+// ---- Preview: what applying this text would do, from POST /preview. Four tabs in one fixed frame.
+const utcShort = (ts) => new Date(ts * 1000).toISOString().slice(5, 16).replace('T', ' ') + ' UTC';
+const rankOf = (r) => (r == null ? '' : ` (rank ${r})`);
+
+// One sentence for the Apply confirmation: what the preview says about published slots, or that it is not known.
+function rewindSentence(e) {
+  const pv = e.preview;
+  if (!pv || pv.text !== e.text || !pv.data || !pv.data.rewind) return 'It is unknown whether published slots rewind: the preview has not answered for this text.';
+  const r = pv.data.rewind;
+  if (r.state === 'rewinds') return `Applying rewinds ${r.airings} published airing${r.airings === 1 ? '' : 's'}${r.bumpers ? ` and ${r.bumpers} bumper${r.bumpers === 1 ? '' : 's'}` : ''}, ${utcShort(r.from)} to ${utcShort(r.to)}.`;
+  if (r.state === 'none') return `Published slots do not move: ${r.why}.`;
+  return `It is unknown whether published slots rewind: ${r.why}.`;
+}
+
+// The quick answer (validity, fingerprint, rewind) never waits on the schedule: that is a second request, made only while the Schedule tab is open.
+// The daemon compares an edit with the fingerprint it recorded, not with the file: when those already differ, a reload rewinds whatever the edit is.
+function daemonNote(d) {
+  return d.fingerprint && d.fingerprint.daemon === 'differs'
+    ? '<div class="notice" style="margin-top:8px">The fingerprint the daemon recorded for this channel differs from the file’s now (an earlier change not yet reloaded, or a difference in the daemon’s environment). The daemon may rewind published slots on its next reload whatever this edit is.</div>' : '';
+}
+
+function editPreview() {
+  const e = editState;
+  if (!editLive(e) || e.text === e.base) return;
+  clearTimeout(e.pvTimer);
+  const seq = ++e.pvSeq, text = e.text;
+  (async () => {
+    let r;
+    try { r = await editJson(`${e.url}/preview`, { yaml: text, schedule: false }); } catch (x) { r = { ok: false, status: 0, data: { error: String(x) } }; }
+    if (!editLive(e) || seq !== e.pvSeq) return;
+    e.preview = { text, data: r.ok ? r.data : null, error: r.ok ? null : (r.data.error || `HTTP ${r.status}`), sched: null };
+    e.valid = r.ok && r.data.valid ? { ok: true } : { ok: false, error: r.data.error || `HTTP ${r.status}`, line: r.data.line || null };
+    paintEdit();
+    if (e.tab === 'schedule' && r.ok && r.data.valid && r.data.changed) editSchedule(seq, text);
+  })();
+}
+
+async function editSchedule(seq, text) {
+  const e = editState;
+  if (!editLive(e) || seq !== e.pvSeq || !e.preview || e.preview.text !== text) return;
+  if (e.schedSeq === seq && e.preview.sched !== null && !e.preview.sched.pending) return;
+  if (e.schedSeq !== seq) { e.schedSeq = seq; e.schedBegan = Date.now(); }
+  clearTimeout(e.pvTimer);
+  let r;
+  try { r = await editJson(`${e.url}/preview`, { yaml: text, schedule: true }); } catch (x) { r = { ok: false, status: 0, data: { error: String(x) } }; }
+  if (!editLive(e) || seq !== e.pvSeq) return;
+  let sched = r.ok && r.data.schedule ? r.data.schedule : { error: r.data.error || `HTTP ${r.status}` };
+  if (r.ok && r.data.changed === false) sched = { days: 0, changed_airings: [] };
+  if (sched.pending && Date.now() - e.schedBegan > EDIT_POLL_DEADLINE_MS) sched = { error: `The projection has not finished in ${EDIT_POLL_DEADLINE_MS / 1000} s. Check the station's log.` };
+  e.preview.sched = sched;
+  paintPreview();
+  if (sched.pending) e.pvTimer = setTimeout(() => editSchedule(seq, text), EDIT_PREVIEW_POLL_MS);
+}
+
+function paintPreview() {
+  const e = editState, body = $('pvbody');
+  if (!e || !body || !body.isConnected) return;
+  for (const b of $('pvtabs').querySelectorAll('button')) {
+    b.setAttribute('aria-selected', b.dataset.tab === e.tab ? 'true' : 'false');
+    b.classList.toggle('bad', b.dataset.tab === 'validation' && e.text !== e.base && !!e.valid && !e.valid.ok);
+  }
+  $('eprof').hidden = e.tab !== 'profile';
+  body.hidden = e.tab === 'profile';
+  if (e.tab === 'profile') return;
+  const dirty = e.text !== e.base, pv = e.preview, d = pv && pv.text === e.text ? pv.data : null;
+  let html = '';
+  if (e.tab === 'validation') {
+    if (!dirty) html = '<div class="muted">No changes to check.</div>';
+    else if (!e.valid) html = '<div class="muted"><span class="spinner"></span>Checking with the loader…</div>';
+    else if (e.valid.ok) html = '<div class="pvbig" style="color:var(--up)">valid ✓</div><div class="muted">The loader keeps this channel in the lineup.</div>';
+    else html = `<div class="pvrow"><b>${e.valid.line ? `Line ${esc(e.valid.line)}` : 'Whole file'}</b>
+        ${e.valid.line ? '<button type="button" id="pvgo" style="float:right">Go to line</button>' : ''}<div class="error" style="margin-top:4px">${esc(e.valid.error)}</div></div>`;
+  } else if (!dirty) {
+    html = '<div class="muted">No changes: no airing moves and no published slot rewinds.</div>';
+  } else if (e.valid && !e.valid.ok) {
+    html = '<div class="muted">The loader rejects this text, so there is nothing to preview. See Validation.</div>';
+  } else if (!d) {
+    html = pv && pv.error ? `<div class="error">${esc(pv.error)}</div>` : '<div class="muted"><span class="spinner"></span>Asking the daemon’s loader and published schedule…</div>';
+  } else if (e.tab === 'slots') {
+    const r = d.rewind || {};
+    if (r.state === 'rewinds') html = `<div class="pvbig">${esc(r.airings)} published airing${r.airings === 1 ? '' : 's'} rewind</div>${r.bumpers ? `<div class="muted">plus ${esc(r.bumpers)} bumper${r.bumpers === 1 ? '' : 's'} in the same span</div>` : ''}
+        <div class="pvrow"><span class="t">${esc(utcShort(r.from))} → ${esc(utcShort(r.to))}</span><div class="muted">${esc(r.basis)}. Aired and on-screen airings are never touched. As of ${esc(utcShort(r.as_of))}; the daemon cuts at its own clock when it reloads.</div></div>${daemonNote(d)}`;
+    else if (r.state === 'none') html = `<div class="pvbig">No published slot rewinds</div><div class="muted">${esc(r.why)}.</div>${daemonNote(d)}`;
+    else html = `<div class="pvbig">Unknown</div><div class="muted">This preview cannot tell whether applying rewinds published slots: ${esc(r.why)}. The apply confirmation says so too.</div>`;
+  } else if (e.tab === 'schedule') {
+    const sc = pv.sched;
+    if (!sc) html = '<div class="muted"><span class="spinner"></span>Projecting the schedule from this text…</div>';
+    else if (sc.error) html = `<div class="error">${esc(sc.error)}</div>`;
+    else if (sc.pending) html = `<div class="muted"><span class="spinner"></span>Re-projecting ${esc(sc.days)} days from this text and from the deployed file… this takes seconds.</div>`;
+    else if (!sc.changed_airings.length) html = `<div class="pvbig">No airing differs</div><div class="muted">${sc.days ? `Over the next ${esc(sc.days)} days the schedule from this text matches the deployed one at every instant.` : 'This text is the deployed file.'}</div>`;
+    else html = `<div class="pvbig">${sc.changed_airings.length} airing${sc.changed_airings.length === 1 ? '' : 's'} differ</div>` + sc.changed_airings.map((a) => {
+      const was = a.deployed;
+      const mv = a.rank != null && was && was.rank != null ? `<span class="mv">${was.rank === a.rank ? 'rank ' + a.rank + ' (same)' : `rank ${was.rank} → ${a.rank}`}</span>` : '';
+      return `<div class="pvrow"><span class="t">${esc(utcShort(a.start))}</span> ${esc(a.pool || '')} ${mv}<div><b>${esc(a.title)}</b>${esc(rankOf(a.rank))}</div>
+        <div class="was">was ${was ? `${esc(was.title)}${esc(rankOf(was.rank))}${was.start !== a.start ? ` at ${esc(utcShort(was.start))}` : ''}` : 'nothing scheduled in this place'}</div></div>`;
+    }).join('');
+  }
+  body.innerHTML = html;
+  const go = $('pvgo');
+  if (go) go.addEventListener('click', () => {
+    const ta = $('etext'), line = e.valid.line;
+    const starts = ta.value.split('\n');
+    let from = 0;
+    for (let i = 0; i < line - 1 && i < starts.length; i++) from += starts[i].length + 1;
+    ta.focus();
+    ta.setSelectionRange(from, from + (starts[line - 1] || '').length);
+    ta.scrollTop = Math.max(0, (line - 3) * 18);
+    $('egut').scrollTop = ta.scrollTop;
+  });
 }
 
 // The profile panel: the plugin pools of the text as it stands, and edits that are spliced back into the text.

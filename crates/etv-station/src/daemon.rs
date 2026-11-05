@@ -2457,7 +2457,7 @@ mod regen_floor_tests {
 ///
 /// Returns `None` only if the config or overlay cannot be serialized, which
 /// regenerates rather than skipping on a guess.
-fn channel_config_fingerprint(
+pub(crate) fn channel_config_fingerprint(
     channel: &LoadedChannel,
     station_tracks: Option<&crate::config::TrackRules>,
 ) -> Option<String> {
@@ -2582,6 +2582,21 @@ async fn take_refresh_request(output: &Path) -> Result<bool, StationError> {
 /// Returns `now` unchanged when nothing is airing: a gap in coverage, or a
 /// channel whose schedule has not reached `now`. There is no item to protect,
 /// so there is nothing to advance past.
+/// Where a refresh cuts, given the `(start, finish)` of published items and
+/// when it is now: the finish of the item on screen, else `now`. The daemon
+/// applies it to every chunk file that could hold that item; the dashboard's
+/// preview applies it to the published items it reads, so both name one cut.
+pub(crate) fn cut_after_airing(
+    items: impl IntoIterator<Item = (OffsetDateTime, OffsetDateTime)>,
+    now: OffsetDateTime,
+) -> OffsetDateTime {
+    items
+        .into_iter()
+        .filter(|(start, finish)| *start <= now && *finish > now)
+        .map(|(_, finish)| finish)
+        .fold(now, OffsetDateTime::max)
+}
+
 async fn airing_item_finish(
     channel: &LoadedChannel,
     now: OffsetDateTime,
@@ -2603,11 +2618,10 @@ async fn airing_item_finish(
                 path: f.path.clone(),
                 source,
             })?;
-        for item in &playout.items {
-            if item.start <= now && item.finish > now {
-                cut = cut.max(item.finish);
-            }
-        }
+        cut = cut.max(cut_after_airing(
+            playout.items.iter().map(|i| (i.start, i.finish)),
+            now,
+        ));
     }
     Ok(cut)
 }
