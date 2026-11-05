@@ -244,6 +244,7 @@ mod tests {
             catalog: Catalog::open_in_memory().expect("in-memory catalog"),
             pools: PoolState::default(),
             review: channel::ReviewState::new(station.clone(), PathBuf::from("/nonexistent/c.db")),
+            mcp: None,
             options: Options {
                 station,
                 catalog: PathBuf::from("/nonexistent/c.db"),
@@ -500,5 +501,166 @@ mod tests {
         assert!(invalid["error"].as_str().is_some_and(|e| !e.is_empty()));
         assert_eq!(std::fs::read_to_string(f.channel_file()).unwrap(), CHANNEL);
         assert!(f.backups().is_empty());
+    }
+
+    use super::super::mcp::testing::Dashboard;
+
+    fn serve_fixture(f: Fixture) -> (Dashboard, tempfile::TempDir) {
+        let Fixture { dir, state } = f;
+        (Dashboard::start(move || state), dir)
+    }
+
+    fn tool(d: &Dashboard, name: &str, args: Value) -> super::super::mcp::Outcome {
+        let Value::Object(args) = args else { panic!() };
+        d.mcp.call(name, &args).unwrap()
+    }
+
+    #[test]
+    fn each_read_tool_returns_the_body_of_its_route() {
+        let (d, _dir) = serve_fixture(fixture(CHANNEL));
+        for (name, args, target) in [
+            ("lineup", json!({}), "/api/lineup"),
+            ("health", json!({}), "/api/health"),
+            (
+                "channel_file",
+                json!({"channel": "a"}),
+                "/api/channels/a/file",
+            ),
+            (
+                "channel_pools",
+                json!({"channel": "a"}),
+                "/api/channels/a/pools",
+            ),
+            (
+                "channel_review",
+                json!({"channel": "a"}),
+                "/api/channels/a/review",
+            ),
+            (
+                "apply_status",
+                json!({"channel": "a", "after": 0}),
+                "/api/channels/a/apply/status?after=0",
+            ),
+        ] {
+            let out = tool(&d, name, args);
+            let (status, body) = d.get(target);
+            assert_eq!(status, 200, "{name}: {body}");
+            assert!(!out.is_error, "{name}: {}", out.text);
+            assert_eq!(out.text, body, "{name}");
+            assert!(serde_json::from_str::<Value>(&out.text).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_route_error_is_a_tool_error_leading_with_its_status() {
+        let (d, _dir) = serve_fixture(fixture(CHANNEL));
+        let out = tool(&d, "airing_audit", json!({"airing": "not-an-id"}));
+        let (status, body) = d.get("/api/airings/not-an-id/audit");
+        assert_eq!(status, 400);
+        assert!(out.is_error);
+        assert_eq!(out.text, format!("HTTP 400: {body}"));
+        let out = tool(&d, "channel_file", json!({"channel": "nope"}));
+        assert!(
+            out.is_error && out.text.starts_with("HTTP 404: "),
+            "{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn the_apply_tool_calls_the_apply_route_and_returns_its_status() {
+        let (d, dir) = serve_fixture(fixture(CHANNEL));
+        let file = dir.path().join("channels/a/channel.yaml");
+        let out = tool(
+            &d,
+            "apply_channel",
+            json!({"channel": "a", "yaml": edited()}),
+        );
+        assert!(!out.is_error, "{}", out.text);
+        assert_eq!(out.status, 200);
+        let body: Value = serde_json::from_str(&out.text).unwrap();
+        assert_eq!(body["status"], json!("written_not_signalled"), "{body}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), edited());
+
+        let refused = tool(
+            &d,
+            "apply_channel",
+            json!({"channel": "a", "yaml": CHANNEL.replace("- pool: movies", "- pool: nope")}),
+        );
+        assert!(
+            refused.is_error && refused.status == 422,
+            "{}",
+            refused.text
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), edited());
+
+        let unchanged = tool(
+            &d,
+            "apply_channel",
+            json!({"channel": "a", "yaml": edited()}),
+        );
+        assert!(unchanged.text.contains("unchanged"), "{}", unchanged.text);
+    }
+
+    /// The JSON-RPC a client sends, through the real accept loop and the
+    /// thread `/mcp` is moved to.
+    fn rpc(d: &Dashboard, body: Value) -> (u16, Value) {
+        let r = ureq::post(&format!("{}/mcp", d.base))
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json, text/event-stream")
+            .send_string(&body.to_string());
+        let r = match r {
+            Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+            Err(e) => panic!("{e}"),
+        };
+        let status = r.status();
+        let text = r.into_string().unwrap();
+        (
+            status,
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        )
+    }
+
+    #[test]
+    fn mcp_initializes_lists_the_tools_and_calls_one_through_the_accept_loop() {
+        let (d, _dir) = serve_fixture(fixture(CHANNEL));
+        let (status, init) = rpc(
+            &d,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"}}}),
+        );
+        assert_eq!(status, 200, "{init}");
+        assert_eq!(init["result"]["serverInfo"]["name"], json!("etv-station"));
+        assert!(
+            init["result"]["capabilities"]["tools"].is_object(),
+            "{init}"
+        );
+
+        let (status, list) = rpc(
+            &d,
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        );
+        assert_eq!(status, 200, "{list}");
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let expected: Vec<&str> = super::super::mcp::TOOLS.iter().map(|t| t.name).collect();
+        assert_eq!(names, expected);
+
+        let (status, called) = rpc(
+            &d,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                   "params": {"name": "channel_file", "arguments": {"channel": "a"}}}),
+        );
+        assert_eq!(status, 200, "{called}");
+        let (_, body) = d.get("/api/channels/a/file");
+        assert_eq!(called["result"]["content"][0]["text"], json!(body));
+        assert_ne!(called["result"]["isError"], json!(true));
+        // The page is still served beside it.
+        assert_eq!(d.get("/api/lineup").0, 200);
     }
 }

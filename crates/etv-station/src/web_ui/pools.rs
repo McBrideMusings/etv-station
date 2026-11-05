@@ -1377,6 +1377,7 @@ mod tests {
             catalog: Catalog::open_readonly(&catalog_path).unwrap(),
             pools: PoolState::default(),
             review: ReviewState::new(station.clone(), catalog_path.clone()),
+            mcp: None,
             options: Options {
                 station,
                 catalog: catalog_path,

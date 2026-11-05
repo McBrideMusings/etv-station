@@ -17,13 +17,17 @@ etv-render = { workspace = true }
 # The one list of picture-subtitle codecs, so the track selector and the
 # pipeline that burns them cannot disagree about which streams are pictures.
 ffpipeline = { workspace = true }
+bytes = { workspace = true }
 glob = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
 humantime = { workspace = true }
 humantime-serde = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
 plexdb-reader = { workspace = true }
 regex = { workspace = true }
+rmcp = { workspace = true }
 rhai = { workspace = true }
 rusqlite = { workspace = true }
 serde = { workspace = true }

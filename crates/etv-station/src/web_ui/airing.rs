@@ -205,6 +205,7 @@ mod tests {
                 station_path.clone(),
                 PathBuf::from("/nonexistent/catalog.db"),
             ),
+            mcp: None,
             options: Options {
                 station: station_path,
                 catalog: PathBuf::from("/nonexistent/catalog.db"),

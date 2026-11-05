@@ -33,6 +33,7 @@
 //! airing, which is how the Guide answers "why is this on" (`airing`).
 //! `GET /assets/hls.min.js` serves the hls.js copy embedded in the binary, which
 //! the Guide's player loads for browsers that cannot play HLS natively.
+//! `POST /mcp` serves the same routes to an MCP client (`mcp`).
 //! `GET /api/health/channels` is the Health tab: each channel's encoder verdict,
 //! ETV-next's failure state and its last stall (`health`).
 
@@ -44,6 +45,7 @@ mod edit;
 mod graphics;
 mod health;
 mod lineup;
+mod mcp;
 mod overlap;
 mod pools;
 mod preview;
@@ -103,6 +105,8 @@ struct AppState {
     options: Options,
     pools: PoolState,
     review: ReviewState,
+    /// The `/mcp` endpoint; `None` where no server is listening (the router's tests).
+    mcp: Option<mcp::Mcp>,
 }
 
 /// Listen on `options.bind:options.port` and serve until the process ends.
@@ -130,6 +134,21 @@ pub fn serve(options: Options) -> Result<(), String> {
         "web UI listening"
     );
 
+    let listen = server
+        .server_addr()
+        .to_ip()
+        .ok_or("the dashboard listens on a socket with no IP address")?;
+    let wait = mcp::wait_from_env();
+    let mcp = mcp::Mcp::new(listen, wait)?;
+    tracing::info!(
+        event = "ui.mcp.listen",
+        path = mcp::PATH,
+        port = listen.port(),
+        tools = mcp::TOOLS.len(),
+        wait_secs = wait.as_secs(),
+        "MCP endpoint listening"
+    );
+
     let review = ReviewState::new(options.station.clone(), options.catalog.clone());
     review.sims.spawn();
     review.overlap.spawn();
@@ -138,11 +157,17 @@ pub fn serve(options: Options) -> Result<(), String> {
         pools: PoolState::default(),
         review,
         options,
+        mcp: Some(mcp),
     };
-    for request in server.incoming_requests() {
-        handle(&mut state, request);
-    }
+    run(&server, &mut state);
     Ok(())
+}
+
+/// Answer requests until the server is dropped.
+fn run(server: &tiny_http::Server, state: &mut AppState) {
+    for request in server.incoming_requests() {
+        handle(state, request);
+    }
 }
 
 /// `GET /api/health`: what this process serves from, and whether the station
@@ -177,6 +202,7 @@ fn api_health(state: &AppState) -> (u16, Value) {
         "revision": std::env::var("ETV_STATION_REVISION").ok(),
         "build_time": std::env::var("ETV_STATION_CREATED").ok().filter(|t| !t.is_empty()),
         "etv_next_url": std::env::var("ETV_NEXT_URL").ok().filter(|u| !u.is_empty()),
+        "mcp": mcp::health(state.mcp.as_ref()),
     });
     (status, body)
 }
@@ -204,6 +230,18 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (url.clone(), String::new()),
     };
+
+    if path == mcp::PATH {
+        match &state.mcp {
+            Some(mcp) => mcp.serve(request),
+            None => respond_json(
+                request,
+                404,
+                &json!({"error": format!("no route: {} {}", method, path)}),
+            ),
+        }
+        return;
+    }
 
     let content_type = request
         .headers()
@@ -496,6 +534,7 @@ mod tests {
             catalog: Catalog::open_in_memory().expect("in-memory catalog"),
             pools: PoolState::default(),
             review: ReviewState::new(station.clone(), PathBuf::from("/nonexistent/catalog.db")),
+            mcp: None,
             options: Options {
                 station,
                 catalog: PathBuf::from("/nonexistent/catalog.db"),
@@ -504,6 +543,28 @@ mod tests {
                 port: 0,
                 health: HealthSources::default(),
             },
+        }
+    }
+
+    /// Every tool is one row that names a route the router answers: none falls
+    /// through to the "no route:" 404.
+    #[test]
+    fn every_mcp_tool_resolves_to_a_route_in_dispatch() {
+        let mut state = example_state();
+        for tool in mcp::TOOLS {
+            let args = tool.sample_args();
+            let built = mcp::build(tool, &args).unwrap_or_else(|e| panic!("{}: {e}", tool.name));
+            let (path, query) = built.target.split_once('?').unwrap_or((&built.target, ""));
+            let method = match tool.verb {
+                mcp::Verb::Get => Method::Get,
+                mcp::Verb::Post => Method::Post,
+                mcp::Verb::Delete => Method::Delete,
+            };
+            let body = built.body.unwrap_or_default();
+            if let Reply::Json(_, body) = dispatch(&mut state, &method, path, query, &body) {
+                let error = body["error"].as_str().unwrap_or("");
+                assert!(!error.starts_with("no route:"), "{}: {error}", tool.name);
+            }
         }
     }
 
@@ -815,6 +876,7 @@ mod tests {
             catalog: Catalog::open_readonly(&catalog_path).unwrap(),
             pools: PoolState::default(),
             review: ReviewState::new(station.clone(), catalog_path.clone()),
+            mcp: None,
             options: Options {
                 station,
                 catalog: catalog_path,

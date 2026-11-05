@@ -90,7 +90,7 @@ docker run -d --name etv-station \
   etv-station:latest
 ```
 
-The image is built from this repo's `Dockerfile`: one builder stage for the station workspace, one for the vendored ETV-next workspace, and a runtime stage on ErsatzTV's own ffmpeg image carrying `etv-station`, `etv-overlay`, `ersatztv`, and `ersatztv-channel`. `docker/entrypoint.sh` renders ETV-next's config from `station.yaml`, creates every channel's playout folder, then runs both processes, plus the station's web UI (`etv-station --serve-ui` on port 4747, at `nice -n 19`). The web UI has no auth of its own; the operator fronts it with their own proxy.
+The image is built from this repo's `Dockerfile`: one builder stage for the station workspace, one for the vendored ETV-next workspace, and a runtime stage on ErsatzTV's own ffmpeg image carrying `etv-station`, `etv-overlay`, `ersatztv`, and `ersatztv-channel`. `docker/entrypoint.sh` renders ETV-next's config from `station.yaml`, creates every channel's playout folder, then runs both processes, plus the station's web UI (`etv-station --serve-ui` on port 4747, at `nice -n 19`). The web UI has no auth of its own; the operator fronts it with their own proxy. The same process answers MCP at `/mcp` on that port, one tool per dashboard route (`lineup`, `channel_review`, `apply_channel` and nine more; `apply_channel` writes the live `channel.yaml`), behind the same proxy.
 
 Key properties:
 - The playout folder is a plain directory inside the container that the daemon writes and ETV-next reads. Lock-free producer/consumer; the OS guarantees atomicity for `rename(2)`.

@@ -81,6 +81,22 @@ server answering `/api/health`, `/channels.m3u`, `/xmltv.xml`, `/assets/hls.min.
 `/channel/{n}.m3u8` (an `ffmpeg -f hls` testsrc) exercises the page; to force the hls.js path in a
 browser with native HLS, override `HTMLMediaElement.prototype.canPlayType` to return `''` first.
 
+The dashboard's MCP endpoint (`POST /mcp`, `web_ui/mcp.rs`) is driven with curl JSON-RPC against the same throwaway
+station (start it with `/private/tmp/claude/etv-station/ui/serve.sh`, port 4748). Both `Accept` types are required:
+
+```bash
+H=(-H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
+curl -s -X POST localhost:4748/mcp "${H[@]}" -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+curl -s -X POST localhost:4748/mcp "${H[@]}" -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+curl -s -X POST localhost:4748/mcp "${H[@]}" -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"channel_review","arguments":{"channel":"b","project":"1d"}}}'
+```
+
+`tools/list` names the twelve tools, as `GET /api/health`'s `mcp.tools` does. `channel_review` with `project` waits through
+the route's 202 and returns the 200 review (the server log's `ui.mcp.call` line shows `polls=1` and the wait in `ms`).
+A tool's `result.content[0].text` equals the route's body byte for byte; a route answering 400 or more gives
+`isError: true` with `HTTP <status>: ` leading the text; an unknown tool is a JSON-RPC error. `apply_channel` writes the
+channel file (and a `.bak-` copy) in the throwaway station, so drive it there, never against `deploy/`.
+
 Passing this is necessary, not sufficient — the rest of this skill is booting the
 daemon and watching it actually do its job.
 
