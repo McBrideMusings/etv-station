@@ -35,7 +35,7 @@ pub use filter::{Filter, SeasonSel};
 pub use hooks::{HookDecl, HookGrant, HookTrigger};
 pub use load::{
     DropCause, DroppedChannel, LoadedChannel, Station, expand_process_env, load,
-    load_for_inspection, read_channel, read_station,
+    load_for_inspection, read_channel, read_station, validate_channel_candidate,
 };
 pub use mode::Mode;
 pub use order::{Dir, FieldSort, Order};

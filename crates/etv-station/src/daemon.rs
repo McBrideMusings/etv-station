@@ -115,10 +115,29 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         startup: true,
         config_reload: false,
     };
+    // Set when a reload reverted, so the generation that re-spawns the last-known-good
+    // config does not overwrite that outcome with `applied`.
+    let mut reverted_just_now = false;
     loop {
         let tz = match prepare_generation(&station).await {
             Ok(tz) => {
                 last_good = Some(station.clone());
+                if should_record_applied(announce.config_reload, &mut reverted_just_now) {
+                    let dropped = station
+                        .dropped
+                        .iter()
+                        .map(|d| crate::reload_status::DroppedChannel {
+                            path: d.config_path.display().to_string(),
+                            reason: d.reason.clone(),
+                        })
+                        .collect();
+                    record_reload(
+                        &station,
+                        crate::reload_status::Outcome::Applied,
+                        dropped,
+                        None,
+                    );
+                }
                 tz
             }
             // First generation (nothing good yet) → fail loud at startup. A
@@ -132,6 +151,13 @@ pub async fn run(station: Station) -> Result<(), StationError> {
                         error = %e,
                         "generation failed to prepare on reload; reverting to last-known-good config",
                     );
+                    record_reload(
+                        good,
+                        crate::reload_status::Outcome::Reverted,
+                        Vec::new(),
+                        Some(e.to_string()),
+                    );
+                    reverted_just_now = true;
                     station = good.clone();
                     continue;
                 }
@@ -202,8 +228,66 @@ pub async fn run(station: Station) -> Result<(), StationError> {
                     config = %config_path.display(),
                     "configuration reload failed to parse; keeping previous config running",
                 );
+                record_reload(
+                    &station,
+                    crate::reload_status::Outcome::Failed,
+                    Vec::new(),
+                    Some(e.to_string()),
+                );
             }
         }
+    }
+}
+
+/// Whether a generation that prepared cleanly should record `applied`: only a
+/// reload does, and not the generation that re-spawns a reverted config, whose
+/// `reverted` outcome is already on disk. Clears the revert flag.
+fn should_record_applied(config_reload: bool, reverted_just_now: &mut bool) -> bool {
+    config_reload && !std::mem::take(reverted_just_now)
+}
+
+#[cfg(test)]
+mod reload_record_tests {
+    use super::should_record_applied;
+
+    #[test]
+    fn a_reload_that_prepared_cleanly_records_applied() {
+        let mut reverted = false;
+        assert!(should_record_applied(true, &mut reverted));
+    }
+
+    #[test]
+    fn the_generation_after_a_revert_keeps_the_reverted_outcome_once() {
+        let mut reverted = true;
+        assert!(!should_record_applied(true, &mut reverted));
+        assert!(!reverted, "the flag is spent by the re-spawn");
+        assert!(should_record_applied(true, &mut reverted));
+    }
+
+    #[test]
+    fn startup_records_nothing() {
+        let mut reverted = false;
+        assert!(!should_record_applied(false, &mut reverted));
+    }
+}
+
+/// Leave a reload's outcome where the dashboard can read it. A write that
+/// fails is logged and never stops the daemon: the reload itself already
+/// happened.
+fn record_reload(
+    station: &Station,
+    outcome: crate::reload_status::Outcome,
+    dropped: Vec<crate::reload_status::DroppedChannel>,
+    error: Option<String>,
+) {
+    if let Err(e) =
+        crate::reload_status::record(&station.station.output_base, outcome, dropped, error)
+    {
+        tracing::warn!(
+            event = "reload_status.write_failed",
+            error = %e,
+            "could not record the reload outcome; the dashboard will not see it"
+        );
     }
 }
 

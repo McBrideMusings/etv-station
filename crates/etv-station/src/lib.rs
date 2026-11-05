@@ -32,6 +32,7 @@ pub mod pattern;
 pub mod plugin_http;
 pub mod profile;
 pub mod reconcile;
+pub mod reload_status;
 pub mod renderer;
 pub mod reset;
 pub mod resolve;

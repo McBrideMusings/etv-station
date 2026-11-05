@@ -180,13 +180,13 @@ pub(super) fn scored_channel_count(station_path: &Path) -> Result<usize, String>
 }
 
 /// A lineup channel, loaded.
-struct Located {
-    config_path: PathBuf,
+pub(super) struct Located {
+    pub(super) config_path: PathBuf,
     dir: PathBuf,
     channel: config::ChannelConfig,
 }
 
-enum Lookup {
+pub(super) enum Lookup {
     Ready(Box<Located>),
     /// In the lineup, but its config fails to load.
     Broken {
@@ -199,7 +199,7 @@ enum Lookup {
 
 /// The channel the lineup key `key` names. Only a lineup channel is ever
 /// read: the key comes from the browser and the server has no auth of its own.
-fn locate(state: &AppState, key: &str) -> Result<Lookup, String> {
+pub(super) fn locate(state: &AppState, key: &str) -> Result<Lookup, String> {
     let path = &state.options.station;
     let station =
         config::load_for_inspection(path).map_err(|e| format!("load {}: {e}", path.display()))?;

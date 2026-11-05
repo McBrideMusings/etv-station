@@ -111,6 +111,14 @@ pub fn load(station_path: &Path) -> Result<Station, ConfigError> {
 /// The `ETV_STATION_*` overrides read the plain environment: an unset one
 /// leaves the station file's own value, never the placeholder.
 pub fn load_for_inspection(station_path: &Path) -> Result<Station, ConfigError> {
+    inspect_with(station_path, None)
+}
+
+/// [`load_for_inspection`], with one lineup entry's text taken from `swap`
+/// instead of its file: a proposed edit loaded exactly as the daemon would load
+/// it, relative paths resolving from the real file, without anything written.
+/// `swap` is `(the lineup entry's path, the text to read in its place)`.
+fn inspect_with(station_path: &Path, swap: Option<(&Path, &str)>) -> Result<Station, ConfigError> {
     let unset = RefCell::new(Vec::new());
     load_with(
         station_path,
@@ -125,7 +133,45 @@ pub fn load_for_inspection(station_path: &Path) -> Result<Station, ConfigError> 
             }))
         },
         &unset,
+        swap,
     )
+}
+
+/// Whether `text`, as the config of the lineup channel at `channel_path`, would
+/// load the way the running daemon loads a channel: `Ok` when it would join the
+/// lineup, `Err` with the loader's own reason when the daemon would drop it, or
+/// when it would make another channel drop (a name or number collision).
+///
+/// Nothing is written: the text replaces the file's contents inside the load,
+/// and the file's own path is still what relative paths (overlays, fonts,
+/// includes) resolve from. A channel whose only fault is an `${ENV}` variable
+/// set in the daemon's environment and not in this process is not held against
+/// the edit, since this process cannot tell.
+pub fn validate_channel_candidate(
+    station_path: &Path,
+    channel_path: &Path,
+    text: &str,
+) -> Result<(), String> {
+    let before = inspect_with(station_path, None).map_err(|e| e.to_string())?;
+    let after =
+        inspect_with(station_path, Some((channel_path, text))).map_err(|e| e.to_string())?;
+    for d in &after.dropped {
+        if d.config_path == channel_path {
+            if matches!(d.cause, DropCause::UnsetEnv { .. }) {
+                continue;
+            }
+            return Err(d.reason.clone());
+        }
+        if before
+            .dropped
+            .iter()
+            .any(|b| b.config_path == d.config_path)
+        {
+            continue;
+        }
+        return Err(format!("{}: {}", d.config_path.display(), d.reason));
+    }
+    Ok(())
 }
 
 /// What [`load_for_inspection`] stands in for an unset `${var}`. Deliberately
@@ -136,7 +182,7 @@ fn unset_placeholder(var: &str) -> String {
 }
 
 fn load_with_env(station_path: &Path, env: EnvLookup<'_>) -> Result<Station, ConfigError> {
-    load_with(station_path, env, env, &RefCell::new(Vec::new()))
+    load_with(station_path, env, env, &RefCell::new(Vec::new()), None)
 }
 
 /// `overrides` answers the `ETV_STATION_*` variables that replace station
@@ -148,6 +194,7 @@ fn load_with(
     overrides: EnvLookup<'_>,
     refs: EnvLookup<'_>,
     unset: &RefCell<Vec<String>>,
+    swap: Option<(&Path, &str)>,
 ) -> Result<Station, ConfigError> {
     let mut station: StationConfig = read_config_file(station_path)?;
     apply_env_overrides(
@@ -182,15 +229,25 @@ fn load_with(
     let mut dropped = Vec::new();
     for channel_path in channel_paths {
         unset.borrow_mut().clear();
-        match load_one_channel(
-            &station,
-            &base,
-            &channel_path,
-            &categories,
-            &chronologies,
-            &arcs,
-            refs,
-        ) {
+        let parsed: Result<ChannelConfig, ConfigError> =
+            match swap.filter(|(real, _)| *real == channel_path) {
+                Some((_, text)) => parse_config_text(&channel_path, text),
+                None => read_config_file(&channel_path),
+            };
+        match parsed.and_then(|config| {
+            load_one_channel(
+                config,
+                &station,
+                &base,
+                &channel_path,
+                &StationLookups {
+                    categories: &categories,
+                    chronologies: &chronologies,
+                    arcs: &arcs,
+                },
+                refs,
+            )
+        }) {
             Ok(channel) => channels.push(channel),
             Err(e) => {
                 tracing::error!(
@@ -253,24 +310,29 @@ fn resolve_fonts(
     Ok(())
 }
 
-/// Load and resolve one channel config to a [`LoadedChannel`], or the single
+/// The station-wide files every channel is resolved against.
+struct StationLookups<'a> {
+    categories: &'a Categories,
+    chronologies: &'a Chronologies,
+    arcs: &'a std::sync::Arc<Arcs>,
+}
+
+/// Load and resolve one parsed channel config to a [`LoadedChannel`], or the single
 /// [`ConfigError`] that channel failed on. Split out of [`load_with_env`] so
 /// that loop can catch the error per channel instead of propagating it with
 /// `?` and aborting every other channel's load (#263, #156).
 fn load_one_channel(
+    mut config: ChannelConfig,
     station: &StationConfig,
     base: &Path,
     channel_path: &Path,
-    categories: &Categories,
-    chronologies: &Chronologies,
-    arcs: &std::sync::Arc<Arcs>,
+    lookups: &StationLookups<'_>,
     env: EnvLookup<'_>,
 ) -> Result<LoadedChannel, ConfigError> {
-    let mut config: ChannelConfig = read_config_file(channel_path)?;
     resolve_blocks(&mut config, channel_path, env)?;
-    expand_categories(&mut config, channel_path, categories)?;
-    attach_chronologies(&mut config, channel_path, chronologies)?;
-    attach_arcs(&mut config, channel_path, arcs)?;
+    expand_categories(&mut config, channel_path, lookups.categories)?;
+    attach_chronologies(&mut config, channel_path, lookups.chronologies)?;
+    attach_arcs(&mut config, channel_path, lookups.arcs)?;
     validate::validate_channel(channel_path, &config)?;
     if let Some(key) = &config.ffmpeg_profile
         && !station.ffmpeg_profiles.contains_key(key)
@@ -962,18 +1024,27 @@ pub fn read_station(path: &Path) -> Result<StationConfig, ConfigError> {
 /// `entries:` element and `fallback:` map against its own concrete variant
 /// struct, feeding anything it finds into the same `ignored` list below.
 fn read_config_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
-    let is_yaml = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"));
     let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    parse_config_text(path, &contents)
+}
+
+/// [`read_config_file`] over text already in hand; `path` names it in errors and
+/// picks YAML or TOML by its extension.
+fn parse_config_text<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    contents: &str,
+) -> Result<T, ConfigError> {
+    let is_yaml = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"));
 
     let mut ignored: Vec<String> = Vec::new();
     let parsed = if is_yaml {
-        let de = serde_norway::Deserializer::from_str(&contents);
+        let de = serde_norway::Deserializer::from_str(contents);
         serde_ignored::deserialize(de, |p| ignored.push(p.to_string())).map_err(|source| {
             ConfigError::ParseYaml {
                 path: path.to_path_buf(),
@@ -981,7 +1052,7 @@ fn read_config_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Co
             }
         })?
     } else {
-        let de = toml::Deserializer::new(&contents);
+        let de = toml::Deserializer::new(contents);
         serde_ignored::deserialize(de, |p| ignored.push(p.to_string())).map_err(|source| {
             ConfigError::Parse {
                 path: path.to_path_buf(),
@@ -998,9 +1069,9 @@ fn read_config_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Co
     // here fail the load — this is a diagnostic on top of a parse that
     // already succeeded above.
     let raw: Option<serde_json::Value> = if is_yaml {
-        serde_norway::from_str(&contents).ok()
+        serde_norway::from_str(contents).ok()
     } else {
-        toml::from_str(&contents).ok()
+        toml::from_str(contents).ok()
     };
     if let Some(raw) = raw {
         collect_entry_unknown_keys(&raw, "", &mut ignored);
@@ -1980,6 +2051,7 @@ mod tests {
             &no_env,
             &placeholder,
             &RefCell::new(Vec::new()),
+            None,
         )
         .expect("station loads");
         assert_eq!(station.station.tz, "UTC");

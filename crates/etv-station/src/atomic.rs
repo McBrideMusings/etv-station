@@ -18,19 +18,7 @@ where
 /// [`atomic_write_json`] uses, for content that is already encoded — the
 /// play-history ledger (#70) is newline-delimited JSON, not one JSON value.
 pub async fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("playout");
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let temp = parent.join(format!(
-        ".{file_name}.tmp.{pid}.{nonce}",
-        pid = std::process::id(),
-    ));
+    let temp = temp_path(path);
 
     if let Err(source) = write_and_sync(&temp, bytes).await {
         let _ = fs::remove_file(&temp).await;
@@ -46,6 +34,47 @@ pub async fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), AtomicW
     }
 
     Ok(())
+}
+
+/// [`atomic_write_bytes`] for a caller that is not on the async runtime (the
+/// web dashboard's request thread): the same sibling temp file, `fsync`, then
+/// rename, so a crash mid-write leaves the old file intact.
+pub fn atomic_write_bytes_sync(path: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
+    use std::io::Write;
+    let temp = temp_path(path);
+    let written = std::fs::File::create(&temp).and_then(|mut f| {
+        f.write_all(bytes)?;
+        f.sync_all()
+    });
+    if let Err(source) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(AtomicWriteError::Io { path: temp, source });
+    }
+    if let Err(source) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(AtomicWriteError::Io {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    Ok(())
+}
+
+/// The sibling temp file both write paths stage into, unique per process and instant.
+fn temp_path(path: &Path) -> std::path::PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("playout");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(
+        ".{file_name}.tmp.{pid}.{nonce}",
+        pid = std::process::id(),
+    ))
 }
 
 async fn write_and_sync(temp: &Path, bytes: &[u8]) -> std::io::Result<()> {

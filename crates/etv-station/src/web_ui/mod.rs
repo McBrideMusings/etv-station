@@ -34,6 +34,7 @@
 //! ETV-next's failure state and its last stall (`health`).
 
 mod airing;
+mod apply;
 mod channel;
 mod chapters;
 mod graphics;
@@ -56,6 +57,7 @@ use crate::profile::ProfileEntry;
 use crate::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
 use crate::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unavailable};
 use airing::api_airing_audit;
+use apply::{api_apply, api_apply_status};
 use channel::{ReviewState, api_channel_review, still_reply};
 use graphics::{
     api_channel_graphics, api_graphics_render, api_render, render_file, respond_render_file,
@@ -308,6 +310,12 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
                 return json_reply(api_channel_review(state, key, query));
             }
             (Method::Get, [key, "pools"]) => return json_reply(api_pools(state, key, query)),
+            (Method::Post, [key, "apply"]) => {
+                return json_reply(api_apply(state, key, body));
+            }
+            (Method::Get, [key, "apply", "status"]) => {
+                return json_reply(api_apply_status(state, key, query));
+            }
             (Method::Post, [key, "drafts"]) => {
                 return json_reply(api_draft_open(state, key, body));
             }
