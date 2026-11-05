@@ -45,6 +45,7 @@ The common operations:
 ./tools/dev-station.sh                   # run ONLY the station daemon (.env sourced, no ETV-next build)
 ./tools/station-ui.sh                    # run ONLY the station web dashboard (`etv-station --serve-ui`, :4747; tools/ui-get.sh reads its JSON); Channels › Graphics renders a channel's overlay and bumper scripts
 ./tools/verify-integration.sh            # smoke test: start dev stack, probe HTTP endpoints, verify clean shutdown
+./tools/verify-reverted-reload.sh        # SIGHUP a live daemon into a config it cannot prepare, check the status file says reverted
 ./tools/verify-reburst.sh                # freeze a channel's ffmpeg until ETV-next logs a reburst, check it recovers
 ./tools/verify-all.sh                    # test + clippy + fmt --check in BOTH workspaces
 ./tools/verify-all.sh test|lint|fmt-check  # one read-only check, still across both workspaces

@@ -1145,6 +1145,16 @@ the real side needs only the chunk files.
 
 `cargo test -p etv-station --lib a_channel_rule` covers spacing across pools, the ledger-tail seam, and the forced fallback. At the surface, run the web UI's Review on a scratch channel whose pools overlap — three `select: random` pools over one expression — once without the key and once with `rule: { no_repeat_within: "7d" }`, then compare `first_repeat.days` and the smallest gap between two airings of the same `entry_id` in `airings`. Observed 2026-10-17 on 14 days of Animation films: 0.15 days without the rule, 7.0 days with it. At the daemon, `event="channel_repeat.applied"` logs `blocked`/`forced` per generation, and `constraints.unsatisfied scope=channel` means the rule could not hold.
 
+## Verifying a reverted reload (`tools/verify-reverted-reload.sh`)
+
+A SIGHUP reload that parses but cannot be prepared (here: the new channel name's output folder is a regular file) must leave
+`outcome: reverted` in `<output_base>/.etv-station.reload.json`, keep the last-known-good lineup running, and not be
+overwritten by `applied` when that lineup respawns. Build first (`cargo build -p etv-station`), then run
+`tools/verify-reverted-reload.sh` from the repo root; it exits 0 when all eight checks pass and prints one PASS or FAIL line each.
+It needs the debug binary and `python3`, runs 40 to 90 seconds (the daemon takes up to 40 s to tear a generation down on a reload), and leaves its scratch folder and `daemon.log` under
+`/private/tmp/claude/etv-station/revert`. To see it fail, make `should_record_applied` in `crates/etv-station/src/daemon.rs`
+return `config_reload` alone: the status check after the respawn reads `outcome=applied`.
+
 ## Verifying a reburst (`tools/verify-reburst.sh`)
 
 A reburst is ETV-next restarting a channel's ffmpeg mid-item when the segment lead falls
