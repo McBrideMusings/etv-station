@@ -51,6 +51,15 @@ two schedules match and the test panics with "the two passes matched". Observed
 2026-08-20 passing and failing on back-to-back runs of the identical tree. Re-run
 it; if it is the only failure, the tree is green.
 
+The dashboard's Edit tab (`#/edit/{channel}`) edits a channel's whole `channel.yaml` through
+`GET /api/channels/{ch}/file`, `POST .../validate`, `POST .../profile` and the apply route. To drive it
+without touching `deploy/`: make a throwaway station and channel files under
+`/private/tmp/claude/etv-station/ui/`, run `target/debug/etv-station --config <it> --serve-ui --ui-port 4748
+--ui-private-catalog` (the catalog may be `tmp/claude/scratchpad/station-cache/catalog.db`), and open
+`#/edit/a`. A pane narrower than 900 px gets the narrow layout, so screenshot it inside an iframe 1280 px wide.
+Every state keeps the draft bar at one rectangle; measure `#ebar` in each. The daemon's reload outcome
+(`reverted`, `channel_dropped`) needs a running daemon; without one, stub `apply/status` in the page.
+
 The dashboard's Guide tab reads ETV-next's `/channels.m3u` and `/xmltv.xml` in the browser
 (base URL: `ETV_NEXT_URL` from `GET /api/health`'s `etv_next_url`, else the page's host on
 port 8409). Clicking a programme asks `GET /api/airings/{number}.{start unix seconds}/audit`

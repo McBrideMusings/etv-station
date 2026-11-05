@@ -509,7 +509,7 @@ fn baseline(
 /// round-tripped rewrite would destroy, so the tool never edits the file;
 /// the person pastes this in by hand. Empty when the profile has no entries
 /// (the real file omits the key).
-fn profile_yaml(entries: &[ProfileEntry]) -> String {
+pub(super) fn profile_yaml(entries: &[ProfileEntry]) -> String {
     if entries.is_empty() {
         return String::new();
     }
@@ -825,7 +825,11 @@ pub(super) fn api_draft_edit(state: &mut AppState, key: &str, id: &str, body: &s
     Ok(response)
 }
 
-fn apply_edit(profile: &mut Vec<ProfileEntry>, op: &str, entry: &Value) -> Result<(), String> {
+pub(super) fn apply_edit(
+    profile: &mut Vec<ProfileEntry>,
+    op: &str,
+    entry: &Value,
+) -> Result<(), String> {
     let index = || -> Result<usize, String> {
         let i = entry
             .get("index")

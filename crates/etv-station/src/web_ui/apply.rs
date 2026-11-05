@@ -54,7 +54,7 @@ fn same_file(recorded: &str, mine: &Path) -> bool {
     )
 }
 
-fn channel_path(state: &AppState, key: &str) -> Result<Result<PathBuf, Answer>, String> {
+pub(super) fn channel_path(state: &AppState, key: &str) -> Result<Result<PathBuf, Answer>, String> {
     Ok(match locate(state, key)? {
         Lookup::Ready(l) => Ok(l.config_path),
         // A broken channel is exactly the one an edit has to be able to fix.
@@ -376,5 +376,97 @@ mod tests {
 
         record(&f.out(), Outcome::Failed, vec![], Some("no parse".into())).unwrap();
         assert_eq!(f.status(third)["status"], json!("failed"));
+    }
+
+    fn call(f: &mut Fixture, method: Method, path: &str, body: Value) -> (u16, Value) {
+        match dispatch(&mut f.state, &method, path, "", &body.to_string()) {
+            Reply::Json(status, body) => (status, body),
+            _ => panic!("{path} did not answer JSON"),
+        }
+    }
+
+    #[test]
+    fn the_edit_page_reads_the_deployed_text_and_checks_a_candidate_without_writing() {
+        let mut f = fixture(CHANNEL);
+        let (status, body) = call(&mut f, Method::Get, "/api/channels/a/file", json!({}));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["yaml"], json!(CHANNEL));
+        let (_, ok) = call(
+            &mut f,
+            Method::Post,
+            "/api/channels/a/validate",
+            json!({ "yaml": edited() }),
+        );
+        assert_eq!(ok["valid"], json!(true), "{ok}");
+        let (status, bad) = call(
+            &mut f,
+            Method::Post,
+            "/api/channels/a/validate",
+            json!({ "yaml": CHANNEL.replace("- pool: movies", "- pool: no-such-pool") }),
+        );
+        assert_eq!(status, 200, "{bad}");
+        assert_eq!(bad["valid"], json!(false), "{bad}");
+        assert!(
+            bad["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "{bad}"
+        );
+        let (_, syntax) = call(
+            &mut f,
+            Method::Post,
+            "/api/channels/a/validate",
+            json!({ "yaml": "number: 1\nname: [unclosed\n" }),
+        );
+        assert_eq!(syntax["valid"], json!(false), "{syntax}");
+        assert!(syntax["line"].as_u64().is_some(), "{syntax}");
+        assert_eq!(std::fs::read_to_string(f.channel_file()).unwrap(), CHANNEL);
+        assert!(f.backups().is_empty());
+    }
+
+    #[test]
+    fn a_profile_edit_rewrites_one_pools_block_and_keeps_the_rest_of_the_text() {
+        let mut f = fixture(CHANNEL);
+        let text = format!(
+            "# keep me\n{}",
+            CHANNEL.replace(
+                "          order: random\n",
+                "          plugin: p.rhai\n          order: random\n",
+            )
+        );
+        let read = |f: &mut Fixture, yaml: &str| {
+            call(
+                f,
+                Method::Post,
+                "/api/channels/a/profile",
+                json!({ "yaml": yaml, "op": "read" }),
+            )
+            .1
+        };
+        assert_eq!(read(&mut f, &text)["pools"][0]["entries"], json!([]));
+        let (status, added) = call(
+            &mut f,
+            Method::Post,
+            "/api/channels/a/profile",
+            json!({ "yaml": text, "op": "add", "pool": "movies", "entry": { "keyword": "heist", "weight": 2.0 } }),
+        );
+        assert_eq!(status, 200, "{added}");
+        let yaml = added["yaml"].as_str().unwrap();
+        assert!(yaml.starts_with("# keep me\n"), "{yaml}");
+        assert!(yaml.contains("          profile:\n"), "{yaml}");
+        assert_eq!(added["pools"][0]["entries"][0]["keyword"], json!("heist"));
+        let (_, removed) = call(
+            &mut f,
+            Method::Post,
+            "/api/channels/a/profile",
+            json!({ "yaml": yaml, "op": "remove", "pool": "movies", "entry": { "index": 0 } }),
+        );
+        assert_eq!(removed["yaml"], json!(text), "{removed}");
+        // A pool no plugin scores has no profile to edit.
+        let (status, refused) = call(
+            &mut f,
+            Method::Post,
+            "/api/channels/a/profile",
+            json!({ "yaml": CHANNEL, "op": "add", "pool": "movies", "entry": { "keyword": "x", "weight": 1.0 } }),
+        );
+        assert_eq!(status, 400, "{refused}");
     }
 }

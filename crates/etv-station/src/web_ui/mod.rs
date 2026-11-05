@@ -1,5 +1,5 @@
 //! The station's web dashboard, served by `etv-station --serve-ui`: one page
-//! at `/` with a tab bar (Channels, Guide, Health) and, on Channels, a rail of
+//! at `/` with a tab bar (Channels, Edit, Guide, Health) and, on Channels, a rail of
 //! every lineup channel. A channel's Schedule is its review — the airings
 //! the daemon has published and aired, a projection past them on request, their
 //! depth, overlap and programming grades, and why each airing is on it
@@ -13,7 +13,9 @@
 //! endpoint. `{ch}` is the channel's lineup key, percent-encoded when it holds
 //! a `/`.
 //!
-//! Nothing here writes to the station's config or data: a draft's profile
+//! The Edit tab (`edit`, `apply`) is the one page that writes a channel file: it reads the
+//! deployed `channel.yaml`, checks edited text with the daemon's loader and applies it.
+//! Otherwise nothing here writes to the station's config or data: a draft's profile
 //! edits live in this process's memory, stills cache under the OS temp
 //! directory and projections under the data volume beside the catalog. The server listens on the network in the container with no
 //! auth of its own, so every channel a request names is checked against the
@@ -37,6 +39,7 @@ mod airing;
 mod apply;
 mod channel;
 mod chapters;
+mod edit;
 mod graphics;
 mod health;
 mod lineup;
@@ -59,6 +62,7 @@ use crate::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unava
 use airing::api_airing_audit;
 use apply::{api_apply, api_apply_status};
 use channel::{ReviewState, api_channel_review, still_reply};
+use edit::{api_file, api_profile, api_validate};
 use graphics::{
     api_channel_graphics, api_graphics_render, api_render, render_file, respond_render_file,
 };
@@ -310,6 +314,13 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
                 return json_reply(api_channel_review(state, key, query));
             }
             (Method::Get, [key, "pools"]) => return json_reply(api_pools(state, key, query)),
+            (Method::Get, [key, "file"]) => return json_reply(api_file(state, key)),
+            (Method::Post, [key, "validate"]) => {
+                return json_reply(api_validate(state, key, body));
+            }
+            (Method::Post, [key, "profile"]) => {
+                return json_reply(api_profile(state, key, body));
+            }
             (Method::Post, [key, "apply"]) => {
                 return json_reply(api_apply(state, key, body));
             }

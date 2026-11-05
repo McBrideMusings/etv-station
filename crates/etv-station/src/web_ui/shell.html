@@ -282,6 +282,44 @@
   .grow input { background: var(--bg); border: 1px solid var(--line); border-radius: 3px; padding: 2px 5px; width: 5em; }
   .grow input.ggap { width: 6em; }
   .gmedia { display: block; width: 100%; background: #000; aspect-ratio: 16 / 9; object-fit: contain; border: 1px solid var(--line); }
+
+  /* Edit: the draft bar and the note row under it are always laid out, so no control or text moves between states. */
+  .tabs .soon { margin-left: auto; padding: 4px 12px; color: var(--muted); font-weight: 600; font-size: 13px; opacity: .55; cursor: not-allowed; }
+  .ebar { flex: none; display: grid; grid-template-columns: 9em 11em minmax(0, 1fr) auto auto auto; gap: 10px; align-items: center;
+    height: 40px; padding: 0 10px; border: 1px solid var(--line); border-radius: 3px; background: var(--panel); font-size: 13px; }
+  .ebar .ech { font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ebar .est { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .ebar .eval { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .ebar .eval.bad { color: var(--err-fg); }
+  .ebar .eval.ok { color: var(--up); }
+  .ebar button.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 700; }
+  .enote { flex: none; height: 3.4em; margin: 6px 0; overflow: auto; border-radius: 3px; padding: 4px 10px; font-size: 12.5px;
+    background: var(--panel); color: var(--muted); }
+  .enote.ok { background: #16301d; color: var(--up); }
+  .enote.warn { background: var(--warn-bg); color: var(--warn-fg); }
+  .enote.bad { background: var(--err-bg); color: var(--err-fg); }
+  .enote b { font-weight: 800; }
+  .epage { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+  .ebody { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 300px; grid-template-rows: minmax(0, 1fr); gap: 12px; }
+  .ed { position: relative; min-height: 0; display: grid; grid-template-columns: 4.2em minmax(0, 1fr); border: 1px solid var(--line); border-radius: 3px; overflow: hidden; background: var(--bg); }
+  .ed .gut { overflow: hidden; background: var(--panel); border-right: 1px solid var(--line); padding: 6px 0; font: 12px/18px ui-monospace, monospace; color: var(--muted); text-align: right; }
+  .ed .gut div { height: 18px; padding-right: 8px; position: relative; font-variant-numeric: tabular-nums; }
+  .ed .gut .chg { background: rgba(142,156,255,.28); color: var(--fg); box-shadow: inset 3px 0 0 var(--accent); }
+  .ed .gut .del::before { content: ''; position: absolute; left: 0; right: 0; top: 0; border-top: 2px solid var(--err-fg); }
+  .ed .gut .err { background: var(--err-bg); color: var(--err-fg); box-shadow: inset 3px 0 0 var(--err-fg); font-weight: 800; }
+  .ed textarea { border: 0; outline: 0; resize: none; background: transparent; color: var(--fg); padding: 6px 10px; font: 12px/18px ui-monospace, monospace;
+    white-space: pre; overflow: auto; tab-size: 2; min-width: 0; }
+  .ed textarea:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+  .ed .eload { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: var(--bg); }
+  .eprof { min-height: 0; overflow: auto; border: 1px solid var(--line); border-radius: 3px; padding: 8px 10px; font-size: 12.5px; }
+  .eprof .pool { border-top: 1px solid var(--line); padding: 6px 0; }
+  .eprof .pool:first-of-type { border-top: 0; }
+  .eprof .pe { display: flex; gap: 6px; align-items: center; padding: 1px 0; }
+  .eprof .pe .k { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .eprof input, .eprof select { background: var(--bg); border: 1px solid var(--line); border-radius: 3px; padding: 1px 4px; font-size: 12.5px; }
+  .eprof input.w { width: 4.5em; font-variant-numeric: tabular-nums; }
+  .eprof .padd { display: flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
+  .eprof .padd input.v { flex: 1; min-width: 5em; }
   #tip { position: fixed; z-index: 10; max-width: 360px; background: var(--fg); color: var(--bg); font-size: 12px; padding: 5px 8px; border-radius: 3px; pointer-events: none; }
 </style>
 </head>
@@ -289,8 +327,10 @@
 <nav class="tabs" aria-label="Dashboard">
   <span class="brand">etv-station</span>
   <a id="tabChannels" href="#/channels">Channels</a>
+  <a id="tabEdit" href="#/edit">Edit</a>
   <a id="tabGuide" href="#/guide">Guide</a>
   <a id="tabHealth" href="#/health">Health</a>
+  <span id="tabWatch" class="soon" aria-disabled="true" title="Watch: the viewer is planned">Watch</span>
 </nav>
 <div class="app" id="app">
   <nav class="lineup" id="lineup" aria-label="Channels"><div class="lstate muted">Loading the lineup…</div></nav>
@@ -339,15 +379,15 @@ let lineup = null;    // GET /api/lineup's channels, once loaded
 let loadSeq = 0;  // a newer load() supersedes an older one still polling
 
 // The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|pattern|graphics}?project=Nd`,
-// `#/channels/{key}/pools?draft=ID`, `#/guide`, `#/health`. A key holding a `/` (an examples/ channel) is percent-encoded.
+// `#/channels/{key}/pools?draft=ID`, `#/edit/{key}`, `#/guide`, `#/health`. A key holding a `/` (an examples/ channel) is percent-encoded.
 function parseRoute() {
   const [path, qs] = location.hash.replace(/^#/, '').split('?');
   const parts = path.split('/').filter(Boolean);
   const q = new URLSearchParams(qs || '');
-  const tab = ['channels', 'guide', 'health'].includes(parts[0]) ? parts[0] : 'channels';
+  const tab = ['channels', 'edit', 'guide', 'health'].includes(parts[0]) ? parts[0] : 'channels';
   return {
     tab,
-    channel: tab === 'channels' && parts[1] ? decodeURIComponent(parts[1]) : null,
+    channel: (tab === 'channels' || tab === 'edit') && parts[1] ? decodeURIComponent(parts[1]) : null,
     view: ['pattern', 'pools', 'graphics'].includes(parts[2]) ? parts[2] : 'schedule',
     project: ['1d', '3d', '7d', '14d'].includes(q.get('project')) ? q.get('project') : null,
     draft: q.get('draft'),
@@ -358,6 +398,7 @@ function routeWithDraftWindow(r) {
   if (r.draft && r.view === 'schedule' && !r.project) r.project = '3d';
   return r;
 }
+function editHash(channel) { return channel ? `#/edit/${encodeURIComponent(channel)}` : '#/edit'; }
 function channelHash(channel, view, project, draft) {
   const q = [];
   if (project && view !== 'pools') q.push(`project=${project}`);
@@ -547,25 +588,31 @@ async function loadLineup() {
 // Marks where the page is: the tab, the channel in the lineup, the sub-tab, and the links that keep the days.
 function markRoute(r) {
   routeWithDraftWindow(r);
-  for (const [id, tab] of [['tabChannels', 'channels'], ['tabGuide', 'guide'], ['tabHealth', 'health']]) {
+  for (const [id, tab] of [['tabChannels', 'channels'], ['tabEdit', 'edit'], ['tabGuide', 'guide'], ['tabHealth', 'health']]) {
     if (r.tab === tab) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
-  $('app').classList.toggle('wide', r.tab !== 'channels');
-  $('lineup').hidden = r.tab !== 'channels';
-  $('lineupSelect').hidden = r.tab !== 'channels';
+  const railed = r.tab === 'channels' || r.tab === 'edit';
+  $('app').classList.toggle('wide', !railed);
+  $('lineup').hidden = !railed;
+  $('lineupSelect').hidden = !railed;
   $('toolbar').hidden = r.tab !== 'channels';
   setControls(r.project, false);
   // Project ahead belongs to the schedule; Graphics has no projection to ask for.
   const projecting = r.tab === 'channels' && r.view !== 'graphics';
   for (const id of ['projState', 'projLabel', 'projBtns', 'projClear']) $(id).hidden = !projecting;
-  if (r.tab !== 'channels' || !lineup) return;
+  if (!railed || !lineup) return;
   const project = r.project;
   $('projCtl').hidden = r.view === 'pools';
   for (const a of $('lineup').querySelectorAll('a')) {
-    a.href = channelHash(a.dataset.key, r.view, project);   // a draft belongs to one channel, so the rail drops it
+    a.href = r.tab === 'edit' ? editHash(a.dataset.key) : channelHash(a.dataset.key, r.view, project);   // a draft belongs to one channel, so the rail drops it
     if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   $('lineupSelect').value = r.channel;
+  if (r.tab === 'edit') {
+    const sel = $('lineup').querySelector('[aria-current="page"]');
+    if (sel) sel.scrollIntoView({ block: 'nearest' });
+    return;
+  }
   for (const [id, view] of [['subSchedule', 'schedule'], ['subPattern', 'pattern'], ['subPools', 'pools'], ['subGraphics', 'graphics']]) {
     $(id).href = channelHash(r.channel, view, project, r.draft);
     if (r.view === view) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
@@ -574,6 +621,280 @@ function markRoute(r) {
   $('position').textContent = i < 0 ? '' : `${i + 1} of ${lineup.length} in station.yaml order`;
   const sel = $('lineup').querySelector('[aria-current="page"]');
   if (sel) sel.scrollIntoView({ block: 'nearest' });
+}
+
+// ---- Edit: a channel's whole channel.yaml as text, checked by the daemon's loader and applied through the apply route.
+// The draft bar and the note row under it are drawn once and only have their text changed, so nothing moves between states.
+const EDIT_VALIDATE_MS = 400;
+const EDIT_POLL_MS = 1000;
+const EDIT_POLL_DEADLINE_MS = 60000;
+const editDrafts = {};   // channel key -> the text a person left unapplied, kept when they switch channels
+let editState = null;    // the open page: { channel, base, text, valid, phase, ... }
+
+// Line diff of the deployed text against the edit: which new lines are changed or added, which lines follow a deletion, and how many hunks.
+function lineDiff(base, text) {
+  const a = base.split('\n'), b = text.split('\n');
+  let lo = 0;
+  while (lo < a.length && lo < b.length && a[lo] === b[lo]) lo++;
+  let ea = a.length, eb = b.length;
+  while (ea > lo && eb > lo && a[ea - 1] === b[eb - 1]) { ea--; eb--; }
+  const n = ea - lo, m = eb - lo;
+  const changed = new Set(), deleted = new Set();
+  if (n * m > 4000000) {
+    for (let j = lo; j < eb; j++) changed.add(j);
+    if (n > m) deleted.add(eb);
+  } else {
+    const w = m + 1, dp = new Uint32Array((n + 1) * w);
+    for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) {
+      dp[i * w + j] = a[lo + i] === b[lo + j] ? dp[(i + 1) * w + j + 1] + 1 : Math.max(dp[(i + 1) * w + j], dp[i * w + j + 1]);
+    }
+    let i = 0, j = 0;
+    while (i < n || j < m) {
+      if (i < n && j < m && a[lo + i] === b[lo + j]) { i++; j++; }
+      else if (j < m && (i === n || dp[i * w + j + 1] >= dp[(i + 1) * w + j])) { changed.add(lo + j); j++; }
+      else { deleted.add(lo + j); i++; }
+    }
+  }
+  let hunks = 0, prev = -2;
+  const marks = [...new Set([...changed, ...deleted])].sort((x, y) => x - y);
+  for (const k of marks) { if (k !== prev + 1) hunks++; prev = k; }
+  return { changed, deleted, hunks, lines: b.length };
+}
+
+const EDIT_RESULT = {
+  applied: ['ok', 'Applied', 'The daemon reloaded and kept this channel.'],
+  unchanged: ['ok', 'Unchanged', 'The text is the file already deployed; nothing was written.'],
+  written_not_signalled: ['warn', 'Written, daemon not told', 'The file was written. The daemon is not running, so nothing has loaded it; it will on the next start.'],
+};
+
+async function editJson(url, body) {
+  const res = await fetch(url, body === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  let data;
+  try { data = await res.json(); } catch (e) { data = {}; }
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function loadEdit(channel) {
+  document.title = `etv-station · ${channel || 'Edit'} · Edit`;
+  $('state').textContent = '';
+  $('report').classList.remove('loading');
+  stopEditTimers();
+  if (!channel || (lineup && !lineup.some((c) => c.channel === channel))) {
+    editState = null;
+    $('report').innerHTML = `<div class="empty"><h1>No channel to edit</h1><p class="muted">${channel ? `The lineup has no channel ${esc(channel)}.` : 'The station lists no channels.'}</p></div>`;
+    return;
+  }
+  const url = `/api/channels/${encodeURIComponent(channel)}`;
+  $('report').innerHTML = `<div class="epage"><div class="ebar" id="ebar"><span class="ech">${esc(channel)}</span><span class="est">Loading…</span><span class="eval"></span>
+      <button type="button" disabled>Discard</button><button type="button" disabled>Copy YAML</button><button type="button" class="primary" disabled>Apply to prod…</button></div>
+    <div class="enote" id="enote"></div>
+    <div class="ebody"><div class="ed"><div class="eload"><span class="spinner"></span>Loading the deployed channel.yaml…</div></div><aside class="eprof"></aside></div></div>`;
+  const ebar = $('ebar');
+  let r;
+  try { r = await editJson(`${url}/file`); } catch (e) { r = { ok: false, data: { error: String(e) } }; }
+  if (!ebar.isConnected) return;
+  if (!r.ok) {
+    $('report').innerHTML = `<div class="epage"><div class="ebar"><span class="ech">${esc(channel)}</span></div><div class="enote bad">${esc(r.data.error || `HTTP ${r.status}`)}</div></div>`;
+    return;
+  }
+  const base = r.data.yaml;
+  editState = { channel, url, path: r.data.path, base, text: editDrafts[channel] && editDrafts[channel].base === base ? editDrafts[channel].text : base, valid: null, phase: 'edit', note: null, seq: 0, profSeq: 0, timer: null, profTimer: null, poll: null };
+  const stale = editDrafts[channel] && editDrafts[channel].base !== base;
+  if (stale) delete editDrafts[channel];
+  drawEdit();
+  if (stale) editState.note = { kind: 'warn', html: '<b>The deployed file changed since you left this channel.</b> The unapplied draft was dropped so it cannot overwrite the newer file.' };
+  editChanged(true);
+}
+
+function editLive(e) { return e === editState && !!$('etext') && $('etext').isConnected; }
+
+// An unapplied draft is lost on reload or tab close, so the browser is asked first.
+window.addEventListener('beforeunload', (ev) => { if (Object.keys(editDrafts).length) { ev.preventDefault(); ev.returnValue = ''; } });
+
+function stopEditTimers() {
+  if (!editState) return;
+  clearTimeout(editState.timer); clearTimeout(editState.profTimer); clearTimeout(editState.poll);
+}
+
+function drawEdit() {
+  const e = editState;
+  $('report').innerHTML = `<div class="epage"><div class="ebar" id="ebar"><span class="ech" title="${esc(e.path)}">${esc(e.channel)}</span><span class="est" id="est"></span><span class="eval" id="eval"></span>
+      <button type="button" id="ediscard">Discard</button><button type="button" id="ecopy">Copy YAML</button><button type="button" class="primary" id="eapply">Apply to prod…</button></div>
+    <div class="enote" id="enote" aria-live="polite"></div>
+    <div class="ebody"><div class="ed"><div class="gut" id="egut" aria-hidden="true"></div>
+      <textarea id="etext" spellcheck="false" wrap="off" aria-label="${esc(e.channel)} channel.yaml"></textarea></div>
+      <aside class="eprof" id="eprof" aria-label="Taste profiles"><div class="muted">Reading the pools…</div></aside></div></div>`;
+  const ta = $('etext');
+  ta.value = e.text;
+  ta.addEventListener('input', () => { if (e.phase === 'applying') return; e.text = ta.value; e.note = null; editChanged(false); });
+  ta.addEventListener('scroll', () => { $('egut').scrollTop = ta.scrollTop; });
+  $('ediscard').addEventListener('click', () => { if (e.phase === 'applying') return; e.text = e.base; delete editDrafts[e.channel]; e.note = null; ta.value = e.text; editChanged(false); });
+  $('ecopy').addEventListener('click', () => editCopy());
+  $('eapply').addEventListener('click', () => editApply());
+}
+
+// The text changed: redraw the gutter and the bar now, then check it with the loader and read its profiles after a pause.
+function editChanged(first) {
+  const e = editState;
+  if (!e || !$('etext') || !$('etext').isConnected) return;
+  e.diff = lineDiff(e.base, e.text);
+  if (e.text === e.base) delete editDrafts[e.channel]; else editDrafts[e.channel] = { base: e.base, text: e.text };
+  clearTimeout(e.timer); clearTimeout(e.profTimer);
+  e.seq++; e.profSeq++;
+  if (e.text === e.base) e.valid = { ok: true, same: true };
+  else { e.valid = null; e.timer = setTimeout(editValidate, first ? 0 : EDIT_VALIDATE_MS); }
+  e.profTimer = setTimeout(editProfiles, first ? 0 : EDIT_VALIDATE_MS);
+  paintEdit();
+}
+
+async function editValidate() {
+  const e = editState, ta = $('etext');
+  if (!e || !ta || !ta.isConnected) return;
+  const seq = ++e.seq, text = e.text;
+  let r;
+  try { r = await editJson(`${e.url}/validate`, { yaml: text }); } catch (x) { r = { ok: false, data: { error: String(x) } }; }
+  if (e !== editState || seq !== e.seq || !ta.isConnected) return;
+  e.valid = r.ok && r.data.valid ? { ok: true } : { ok: false, error: r.data.error || `HTTP ${r.status}`, line: r.data.line || null };
+  paintEdit();
+}
+
+function paintEdit() {
+  const e = editState;
+  if (!e || !$('etext') || !$('etext').isConnected) return;
+  const d = e.diff, dirty = e.text !== e.base;
+  const n = d.hunks;
+  $('est').textContent = e.phase === 'applying' ? 'Applying…' : dirty ? `Draft · ${n} edit${n === 1 ? '' : 's'}` : e.note?.kind === 'bad' && e.note.sticky ? 'Not live' : 'Clean';
+  const v = $('eval');
+  let vtext = '', vcls = '';
+  if (dirty && e.valid === null) vtext = 'checking…';
+  else if (dirty && e.valid.ok) { vtext = 'valid ✓'; vcls = 'ok'; }
+  else if (dirty) { vtext = e.valid.line ? `line ${e.valid.line}: ${e.valid.error}` : e.valid.error; vcls = 'bad'; }
+  v.textContent = vtext; v.className = `eval ${vcls}`; v.title = vtext;
+  const busy = e.phase === 'applying';
+  $('ediscard').disabled = !dirty || busy;
+  $('ecopy').disabled = false;
+  $('eapply').disabled = !dirty || busy || !(e.valid && e.valid.ok);
+  const note = $('enote');
+  if (e.note) { note.className = `enote ${e.note.kind}`; note.innerHTML = e.note.html; }
+  else if (dirty && e.valid && !e.valid.ok) { note.className = 'enote bad'; note.innerHTML = `<b>The loader rejects this text, so Apply is off.</b> ${esc(e.valid.error)}`; }
+  else { note.className = 'enote'; note.innerHTML = `<span class="muted">${esc(e.path)} · ${d.lines} lines · edits are marked in the gutter against the deployed file</span>`; }
+  const errLine = dirty && e.valid && !e.valid.ok ? e.valid.line : null;
+  let rows = '';
+  for (let i = 0; i < d.lines; i++) {
+    const cls = [d.changed.has(i) ? 'chg' : '', d.deleted.has(i) ? 'del' : '', errLine === i + 1 ? 'err' : ''].filter(Boolean).join(' ');
+    rows += `<div class="${cls}">${i + 1}</div>`;
+  }
+  $('egut').innerHTML = rows;
+  $('egut').scrollTop = $('etext').scrollTop;
+}
+
+function editCopy() {
+  const e = editState, ta = $('etext');
+  const done = (ok) => { e.note = { kind: ok ? 'ok' : 'warn', html: ok ? `Copied ${e.diff.lines} lines to the clipboard. Nothing was written.` : 'The browser refused the clipboard. Select the text and copy it by hand.' }; paintEdit(); };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(e.text).then(() => done(true), () => done(false));
+  else { ta.select(); done(document.execCommand('copy')); }
+}
+
+async function editApply() {
+  const e = editState;
+  if (!e || e.phase === 'applying' || !(e.valid && e.valid.ok) || e.text === e.base) return;
+  if (!confirm(`Apply ${e.diff.hunks} edit${e.diff.hunks === 1 ? '' : 's'} to ${e.channel} on the deployed station?\n\nThe file is backed up, replaced, and the daemon is told to reload it.`)) return;
+  const text = e.text;
+  e.phase = 'applying'; e.note = { kind: '', html: '<span class="spinner"></span>Writing the file and telling the daemon…' };
+  $('etext').readOnly = true;
+  paintEdit();
+  const settle = (note, wrote) => {
+    e.phase = 'edit'; e.note = note; $('etext').readOnly = false;
+    if (wrote) { e.base = text; if (e.text === text) delete editDrafts[e.channel]; e.diff = lineDiff(e.base, e.text); }
+    paintEdit();
+  };
+  let r;
+  try { r = await editJson(`${e.url}/apply`, { yaml: text }); } catch (x) { r = { ok: false, status: 0, data: { error: String(x) } }; }
+  if (!editLive(e)) return;
+  if (r.status === 422) return settle({ kind: 'bad', html: `<b>Refused. Nothing was written.</b> ${esc(r.data.error)}` }, false);
+  if (!r.ok) return settle({ kind: 'bad', html: `<b>The apply failed.</b> ${esc(r.data.error || `HTTP ${r.status}`)}` }, false);
+  const st = r.data.status;
+  if (st === 'unchanged') return settle({ kind: 'ok', html: `<b>${EDIT_RESULT.unchanged[1]}.</b> ${EDIT_RESULT.unchanged[2]}` }, true);
+  if (st === 'written_not_signalled') return settle({ kind: 'warn', html: `<b>${EDIT_RESULT.written_not_signalled[1]}.</b> ${EDIT_RESULT.written_not_signalled[2]} Backup: ${esc(r.data.backup)}` }, true);
+  if (st === 'written_signal_failed') return settle({ kind: 'bad', sticky: true, html: `<b>Written, but the daemon was not told.</b> ${esc(r.data.signal_error || '')} The running station still has the old channel; restart it or send SIGHUP. Backup: ${esc(r.data.backup)}` }, true);
+  // signalled: the file is replaced; wait for the daemon's own record of the reload.
+  e.base = text; delete editDrafts[e.channel];
+  const began = Date.now(), after = r.data.seq_before;
+  const poll = async () => {
+    if (!editLive(e)) return;
+    let s;
+    try { s = await editJson(`${e.url}/apply/status?after=${after}`); } catch (x) { s = { ok: false, data: {} }; }
+    if (!editLive(e)) return;
+    const st2 = s.ok ? s.data.status : 'pending';
+    const others = s.data.other_dropped ? ` ${s.data.other_dropped} other channel${s.data.other_dropped === 1 ? ' was' : 's were'} also dropped in that reload.` : '';
+    if (st2 === 'applied') return settle({ kind: 'ok', html: `<b>Applied.</b> The daemon reloaded and kept ${esc(e.channel)}.${others}` }, true);
+    if (st2 === 'channel_dropped') return settle({ kind: 'bad', sticky: true, html: `<b>Not live. The daemon dropped ${esc(e.channel)} from the lineup.</b> The file was written and the reload was logged as done. ${esc(s.data.reason || '')}${others}` }, true);
+    if (st2 === 'reverted') return settle({ kind: 'bad', sticky: true, html: `<b>Not live. The file was written, the daemon reloaded and rejected it.</b> ${esc(s.data.reason || '')}` }, true);
+    if (st2 === 'failed') return settle({ kind: 'bad', sticky: true, html: `<b>Not live. The daemon's reload failed.</b> ${esc(s.data.reason || '')}` }, true);
+    if (Date.now() - began > EDIT_POLL_DEADLINE_MS) return settle({ kind: 'warn', html: `<b>No answer from the daemon.</b> The file was written, but no reload was recorded in ${EDIT_POLL_DEADLINE_MS / 1000} s. Check the station's log.` }, true);
+    e.note = { kind: '', html: `<span class="spinner"></span>Written. Waiting for the daemon to report the reload… (${Math.round((Date.now() - began) / 1000)}s)` };
+    paintEdit();
+    e.poll = setTimeout(poll, EDIT_POLL_MS);
+  };
+  poll();
+}
+
+// The profile panel: the plugin pools of the text as it stands, and edits that are spliced back into the text.
+async function editProfiles(op) {
+  const e = editState, ta = $('etext');
+  if (!e || !ta || !ta.isConnected) return;
+  const seq = ++e.profSeq;
+  let r;
+  try { r = await editJson(`${e.url}/profile`, { yaml: e.text, op: 'read' }); } catch (x) { r = { ok: false, data: { error: String(x) } }; }
+  if (e !== editState || seq !== e.profSeq || !ta.isConnected) return;
+  paintProfiles(r.ok ? r.data : { pools: [], error: r.data.error || `HTTP ${r.status}` });
+}
+
+const PROFILE_KINDS = ['keyword', 'genre', 'label', 'cast', 'director', 'writer', 'producer', 'country', 'studio', 'content_rating', 'item', 'set'];
+function paintProfiles(d) {
+  const panel = $('eprof');
+  if (!panel) return;
+  if (d.error) { panel.innerHTML = `<h2>Taste profiles</h2><div class="muted">The text does not parse, so the profiles cannot be read: ${esc(d.error)}</div>`; return; }
+  if (!d.pools.length) { panel.innerHTML = '<h2>Taste profiles</h2><div class="muted">No pool in this file is scored by a plugin.</div>'; return; }
+  panel.innerHTML = `<h2>Taste profiles</h2>` + d.pools.map((p) => `<div class="pool" data-pool="${esc(p.name)}"><b>${esc(p.name)}</b>
+    ${p.entries.map((en, i) => {
+      const { weight, exclude, require, ...ref } = en;
+      const [k, v] = Object.entries(ref)[0] || ['', ''];
+      return `<div class="pe" data-i="${i}"><span class="k" title="${esc(`${k}: ${v}`)}">${esc(k)}: ${esc(v)}</span>
+        ${weight != null ? `<input class="w" type="number" step="0.5" value="${esc(weight)}" aria-label="weight">` : `<span class="muted">${exclude ? 'exclude' : require ? 'require' : ''}</span>`}
+        <button type="button" class="prm" aria-label="Remove">×</button></div>`;
+    }).join('') || '<div class="muted">No inline profile entries.</div>'}
+    <div class="padd"><select>${PROFILE_KINDS.map((k) => `<option>${k}</option>`).join('')}</select><input class="v" placeholder="value" aria-label="value"><input class="w" type="number" step="0.5" value="1" aria-label="weight"><button type="button" class="pad">Add</button></div></div>`).join('')
+    + '<p class="muted">Editing a profile rewrites that pool’s <code>profile:</code> block in the text; every other line stays.</p>';
+  for (const pool of panel.querySelectorAll('.pool')) {
+    const name = pool.dataset.pool;
+    pool.querySelector('.pad').addEventListener('click', () => {
+      const kind = pool.querySelector('select').value, value = pool.querySelector('input.v').value.trim();
+      const weight = Number(pool.querySelector('.padd input.w').value);
+      if (value) editProfileOp('add', name, { [kind]: value, weight });
+    });
+    for (const row of pool.querySelectorAll('.pe')) {
+      const i = Number(row.dataset.i);
+      row.querySelector('.prm').addEventListener('click', () => editProfileOp('remove', name, { index: i }));
+      const w = row.querySelector('input.w');
+      if (w) w.addEventListener('change', () => editProfileOp('update', name, { index: i, weight: Number(w.value) }));
+    }
+  }
+}
+
+async function editProfileOp(op, pool, entry) {
+  const e = editState, ta = $('etext');
+  if (!e || e.phase === 'applying') return;
+  const sent = e.text;
+  let r;
+  try { r = await editJson(`${e.url}/profile`, { yaml: sent, op, pool, entry }); } catch (x) { r = { ok: false, data: { error: String(x) } }; }
+  if (e !== editState || !ta.isConnected) return;
+  if (e.text !== sent || e.phase === 'applying') { e.note = { kind: 'warn', html: 'The text changed while the profile edit ran, so it was not applied. Make the edit again.' }; paintEdit(); return; }
+  if (!r.ok) { e.note = { kind: 'bad', html: `<b>Profile edit refused.</b> ${esc(r.data.error || `HTTP ${r.status}`)}` }; paintEdit(); return; }
+  e.text = r.data.yaml; e.note = null;
+  ta.value = e.text;
+  editChanged(false);
+  paintProfiles(r.data);
 }
 
 // ---- Health: each channel's encoder verdict, ETV-next's failure state and its last stall. Read-only.
@@ -689,8 +1010,10 @@ async function route() {
     // A bare `#/channels` (or no hash) opens the first channel in the lineup.
     if (lineup && lineup.length) { location.replace(channelHash(lineup[0].channel, 'schedule', r.project)); return; }
   }
+  if (r.tab === 'edit' && !r.channel && lineup && lineup.length) { location.replace(editHash(lineup[0].channel)); return; }
   markRoute(r);
   stopPlayer();
+  if (r.tab === 'edit') { loadSeq++; guideSeq++; poolsSeq++; healthSeq++; shown = null; current = null; loadEdit(r.channel); return; }
   if (r.tab !== 'channels' || r.view !== 'graphics') { gSeq++; renderSeq++; }
   if (r.tab === 'guide') { loadSeq++; poolsSeq++; healthSeq++; shown = null; current = null; document.title = 'etv-station · Guide'; $('state').textContent = ''; $('report').classList.remove('loading'); loadGuide(); return; }
   if (r.tab === 'health') { loadSeq++; guideSeq++; poolsSeq++; shown = null; current = null; loadHealth(); return; }
@@ -1724,7 +2047,7 @@ async function discardDraft() {
   location.hash = channelHash(channel, 'pools');
 }
 
-$('lineupSelect').addEventListener('change', () => { const r = parseRoute(); location.hash = channelHash($('lineupSelect').value, r.view, r.project); });
+$('lineupSelect').addEventListener('change', () => { const r = parseRoute(); if (r.tab === 'edit') { location.hash = editHash($('lineupSelect').value); return; } location.hash = channelHash($('lineupSelect').value, r.view, r.project); });
 // Choosing a projection length changes the hash; choosing the pressed length again asks for it afresh.
 function chooseProject(project) {
   const r = parseRoute();
