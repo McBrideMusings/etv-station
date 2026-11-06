@@ -485,6 +485,141 @@ fn frame_index_shots_replace_the_other_hooks_pictures() {
     assert_eq!(audit.matches("broll at ").count(), 2, "{audit}");
 }
 
+/// The explorer answers `/api/extras/fields` with an artist for every id asked,
+/// named `Extra <id>`, and `/api/search/run` with no shots; each request's first
+/// line and body go down the channel.
+fn extras_explorer() -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut sock) = stream else { return };
+            let mut head = String::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = sock.read(&mut buf).unwrap_or(0);
+                head.push_str(&String::from_utf8_lossy(&buf[..n]));
+                let Some((top, body)) = head.split_once("\r\n\r\n") else {
+                    if n == 0 {
+                        break;
+                    }
+                    continue;
+                };
+                let want = top
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if body.len() >= want || n == 0 {
+                    break;
+                }
+            }
+            let line = head.lines().next().unwrap_or("").to_string();
+            let body = head.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            let reply = if line.starts_with("POST /api/extras/fields") {
+                let asked: serde_json::Value = serde_json::from_str(&body).unwrap();
+                let items: serde_json::Map<String, serde_json::Value> = asked["ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|id| {
+                        let id = id.as_str().unwrap();
+                        (
+                            id.to_string(),
+                            json!({"fields": [
+                                {"name": "year", "values": [{"value": "1999", "source": "person"}]},
+                                {"name": "artist", "values": [
+                                    {"value": format!("Extra {id}"), "source": "person"},
+                                    {"value": "Scraped", "source": "scraper"}]}
+                            ]}),
+                        )
+                    })
+                    .collect();
+                json!({ "items": items }).to_string()
+            } else {
+                r#"{"shots":[]}"#.to_string()
+            };
+            let _ = tx.send(format!("{line}\n{body}"));
+            let _ = write!(
+                sock,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+        }
+    });
+    (url, rx)
+}
+
+#[test]
+fn a_card_without_the_artist_field_reads_it_from_the_extras_fields() {
+    let f = Fixture::new();
+    let (url, requests) = extras_explorer();
+    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    input.config.as_mut().unwrap()["plexdb_url"] = json!(url);
+    input.config.as_mut().unwrap()["artist_field"] = json!("artist");
+    build(&plugin_path(), &input).unwrap();
+
+    let (_, plan) = only_plan(&f);
+    let request = requests.recv().unwrap();
+    let (line, body) = request.split_once('\n').unwrap();
+    assert!(line.starts_with("POST /api/extras/fields"), "{line}");
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let asked: Vec<&str> = body["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let hooks: Vec<&str> = plan.hooks.iter().map(|h| h.entry_id.as_str()).collect();
+    assert_eq!(asked, hooks, "one call, every hook's entry id");
+    for (card, hook) in plan.cards.iter().zip(&plan.hooks) {
+        assert_eq!(card.artist, format!("Extra {}", hook.entry_id));
+    }
+}
+
+#[test]
+fn an_extra_is_searched_by_its_entry_id_and_found_by_it() {
+    let f = Fixture::new();
+    // mv-unsteady and mv-weak are never hooks; make them extras, which carry no
+    // Plex source and whose item_id in the explorer is their entry id.
+    let (url, requests) = explorer(
+        r#"{"shots":[
+            {"item_id":"mv-unsteady","in_ms":10000,"out_ms":30000,"drawn":1},
+            {"item_id":"mv-weak","in_ms":50000,"out_ms":70000,"drawn":1}
+        ]}"#,
+    );
+    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    input.config.as_mut().unwrap()["plexdb_url"] = json!(url);
+    let conn = rusqlite::Connection::open(f.dir.path().join("catalog.db")).unwrap();
+    conn.execute(
+        "DELETE FROM entry_sources WHERE source = 'plex' AND entry_id IN ('mv-unsteady', 'mv-weak')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    input.config.as_mut().unwrap()["phrase"] = json!("a neon city at night");
+    build(&plugin_path(), &input).unwrap();
+
+    let request = requests.recv().unwrap();
+    let (_, body) = request.split_once('\n').unwrap();
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let pool: Vec<&str> = body["pool"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(pool.contains(&"mv-unsteady") && pool.contains(&"mv-weak"), "{pool:?}");
+    let (_, plan) = only_plan(&f);
+    let ids: Vec<&str> = plan.broll.iter().map(|b| b.entry_id.as_str()).collect();
+    assert_eq!(ids, ["mv-unsteady", "mv-weak"]);
+}
+
 #[test]
 fn an_unreachable_explorer_leaves_the_hooks_own_pictures() {
     let f = Fixture::new();

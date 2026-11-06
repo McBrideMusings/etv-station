@@ -24,7 +24,10 @@
 //   vocal_over_bars: bars a hook's vocal sings over the previous song, default 2
 //   tail:            recent chapters whose hooks are not reused, default 12
 //   seeds:           most cluster seeds tried per build, default 60
-//   artist_field:    item field holding the artist for the card, default "show"
+//   artist_field:    item field holding the artist for the card, default "show"; an
+//                    item without it (an extra) is looked up by entry id in the
+//                    explorer's extras fields under that name (needs plexdb_url
+//                    and the `http` grant)
 //   card_script:     overlay script that draws the card copy, relative to the
 //                    channel config's directory; unset carries no overlay
 //   enqueue:         program run as `<enqueue> <enqueue_args...> enqueue <plan> --air-at <t>`,
@@ -369,16 +372,21 @@ fn shape(bar_s, gap_s, cfg, available) {
 // unreachable or finds nothing, so the caller keeps the hooks' own pictures.
 fn broll_shots(ctx, cfg, others, want, need_s) {
     if cfg.plexdb_url == () || cfg.phrase == () || want <= 0 { return []; }
-    let by_plex = #{};
+    // The explorer's item_id: a Plex entry's rating key, an extra's entry id.
+    let by_item = #{};
     for item in others {
         let ids = item.source_ids;
-        if item.path == () || ids == () || ids.plex == () || item.duration_ms == () { continue; }
-        by_plex["" + ids.plex] = item;
+        if item.path == () || item.duration_ms == () { continue; }
+        if ids != () && ids.plex != () {
+            by_item["" + ids.plex] = item;
+        } else {
+            by_item[item.entry_id] = item;
+        }
     }
-    if by_plex.len() == 0 { return []; }
+    if by_item.len() == 0 { return []; }
     let body = to_json(#{
         phrase: cfg.phrase,
-        pool: by_plex.keys(),
+        pool: by_item.keys(),
         draw: #{ n: want, seed: ctx.rng.int(0, 1000000000) },
     });
     let reply = ();
@@ -404,7 +412,7 @@ fn broll_shots(ctx, cfg, others, want, need_s) {
     let shots = [];
     for s in ordered {
         if shots.len() >= want { break; }
-        let item = by_plex["" + s.item_id];
+        let item = by_item["" + s.item_id];
         if item == () { continue; }
         let in_s = num(s.in_ms) / 1000.0;
         if num(s.out_ms) / 1000.0 - in_s < need_s || in_s + need_s > num(item.duration_ms) / 1000.0 { continue; }
@@ -412,6 +420,42 @@ fn broll_shots(ctx, cfg, others, want, need_s) {
     }
     log("megamix: broll search=" + (if shots.len() == 0 { "empty" } else { "hit" }) + " found=" + found.len() + " used=" + shots.len() + " phrase=" + cfg.phrase);
     shots
+}
+
+// The artist of each chosen item that lacks `field`, read from the explorer's
+// `POST /api/extras/fields` (the first value, person first), as entry_id -> artist.
+// Empty when plexdb_url is unset, `http` is ungranted, the explorer is unreachable
+// or names no such field, so the card falls back to show/studio.
+fn extras_artists(ctx, cfg, chosen, field) {
+    let missing = [];
+    for item in chosen { if item[field] == () { missing.push(item.entry_id); } }
+    if cfg.plexdb_url == () || missing.len() == 0 { return #{}; }
+    let reply = ();
+    try {
+        reply = ctx.http(cfg.plexdb_url + "/api/extras/fields", "POST", to_json(#{ ids: missing }),
+                         #{ "Content-Type": "application/json" });
+    } catch (e) {
+        log("megamix: extras fields=skipped reason=" + e);
+        return #{};
+    }
+    let items = ();
+    try {
+        items = parse_json(reply).items;
+    } catch (e) {
+        log("megamix: extras fields=skipped reason=unreadable reply: " + e);
+        return #{};
+    }
+    let artists = #{};
+    if items == () { return artists; }
+    for id in items.keys() {
+        for f in items[id].fields ?? [] {
+            if f.name == field && f.values != () && f.values.len() > 0 {
+                artists[id] = f.values[0].value.to_string();
+            }
+        }
+    }
+    log("megamix: extras fields=" + (if artists.len() == 0 { "empty" } else { "hit" }) + " asked=" + missing.len() + " found=" + artists.len());
+    artists
 }
 
 // The plan the renderer reads (docs/schema.md § Chapter plan), and the card copy.
@@ -427,6 +471,7 @@ fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem, shots) {
     let cards = [];
     let cuts = [];
     let fields = conf(cfg, "artist_field", "show");
+    let extra_artists = extras_artists(ctx, cfg, chosen, fields);
     for i in 0..chosen.len() {
         let item = chosen[i];
         let a = item.audio;
@@ -443,7 +488,7 @@ fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem, shots) {
         });
         let card = #{
             at_s: i * shape.bars * bar_s,
-            artist: (item[fields] ?? item.show ?? item.studio ?? "").to_string(),
+            artist: (item[fields] ?? extra_artists[item.entry_id] ?? item.show ?? item.studio ?? "").to_string(),
             title: (item.title ?? "").to_string(),
         };
         if item.year != () { card.year = item.year; }
