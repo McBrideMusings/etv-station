@@ -7,6 +7,9 @@
 //! profile and ranking, and lets a person try profile edits in a draft
 //! (`pools`). The rail is the lineup in `station.yaml` order (`lineup`).
 //!
+//! A channel's Blocks, Bumpers and Preview views read the same review and graphics routes; a row's
+//! item inspector also asks `GET /api/entries/{id}/arr` for Radarr's or Sonarr's record (`arr`).
+//!
 //! The page's routes and the API's use the same nouns in the same order: the
 //! page's `#/channels/{ch}/schedule` is answered by
 //! `GET /api/channels/{ch}/review`, so a URL read off the page names its
@@ -39,6 +42,7 @@
 
 mod airing;
 mod apply;
+mod arr;
 mod channel;
 mod chapters;
 mod edit;
@@ -107,6 +111,8 @@ struct AppState {
     review: ReviewState,
     /// The `/mcp` endpoint; `None` where no server is listening (the router's tests).
     mcp: Option<mcp::Mcp>,
+    /// Radarr and Sonarr, for the item inspector.
+    arr: arr::ArrEnv,
 }
 
 /// Listen on `options.bind:options.port` and serve until the process ends.
@@ -158,6 +164,7 @@ pub fn serve(options: Options) -> Result<(), String> {
         review,
         options,
         mcp: Some(mcp),
+        arr: arr::ArrEnv::from_env(),
     };
     run(&server, &mut state);
     Ok(())
@@ -344,6 +351,30 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
             Err(e @ crate::shots::FactsError::UnknownEntry(_)) => {
                 Reply::Json(404, json!({ "error": e.to_string() }))
             }
+            Err(e) => Reply::Json(500, json!({ "error": e.to_string() })),
+        };
+    }
+    if *method == Method::Get
+        && let Some(id) = path
+            .strip_prefix("/api/entries/")
+            .and_then(|rest| rest.strip_suffix("/arr"))
+    {
+        return match state.catalog.entry(&percent_decode(id)) {
+            Ok(Some(entry)) => {
+                let tmdb = state
+                    .catalog
+                    .external_id_of(&entry.entry_id, crate::catalog::ExternalNs::Tmdb)
+                    .ok()
+                    .flatten();
+                {
+                    let (status, body) = arr::inspect(&state.arr, &entry, tmdb.as_deref());
+                    Reply::Json(status, body)
+                }
+            }
+            Ok(None) => Reply::Json(
+                404,
+                json!({ "error": format!("no catalog entry {:?}", percent_decode(id)) }),
+            ),
             Err(e) => Reply::Json(500, json!({ "error": e.to_string() })),
         };
     }
@@ -535,6 +566,7 @@ mod tests {
             pools: PoolState::default(),
             review: ReviewState::new(station.clone(), PathBuf::from("/nonexistent/catalog.db")),
             mcp: None,
+            arr: arr::ArrEnv::default(),
             options: Options {
                 station,
                 catalog: PathBuf::from("/nonexistent/catalog.db"),
@@ -578,9 +610,11 @@ mod tests {
     /// An id the catalog lacks is a 404; `/api/health/shots` names the ffmpeg
     /// the station config selects and whether it exists.
     #[test]
-    fn entry_facts_404_for_an_unknown_entry_and_health_shots_names_both_programs() {
+    fn entry_facts_and_arr_404_for_an_unknown_entry_and_health_shots_names_both_programs() {
         let mut state = example_state();
         let (status, body) = get_json(&mut state, "/api/entries/nope/facts");
+        assert_eq!(status, 404, "{body}");
+        let (status, body) = get_json(&mut state, "/api/entries/nope/arr");
         assert_eq!(status, 404, "{body}");
         let (status, body) = get_json(&mut state, "/api/health/shots");
         assert_eq!(status, 200, "{body}");
@@ -877,6 +911,7 @@ mod tests {
             pools: PoolState::default(),
             review: ReviewState::new(station.clone(), catalog_path.clone()),
             mcp: None,
+            arr: arr::ArrEnv::default(),
             options: Options {
                 station,
                 catalog: catalog_path,

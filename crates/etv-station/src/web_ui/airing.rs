@@ -206,6 +206,7 @@ mod tests {
                 PathBuf::from("/nonexistent/catalog.db"),
             ),
             mcp: None,
+            arr: super::arr::ArrEnv::default(),
             options: Options {
                 station: station_path,
                 catalog: PathBuf::from("/nonexistent/catalog.db"),

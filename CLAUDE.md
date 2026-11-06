@@ -90,7 +90,7 @@ variables are unset stops and asks rather than proceeding.
 
 `PLEX_URL` and `PLEX_TOKEN` are the same pair the daemon's own catalog ingester
 reads (`PlexEnv::from_env`), so configuring the skill configures the ingest too.
-Radarr and Sonarr are discovery conveniences only — the daemon never contacts them.
+Radarr and Sonarr are discovery conveniences only — the daemon never contacts them. The dashboard process (`--serve-ui`) does, read-only, for the Channels item inspector (`web_ui/arr.rs`), with the same four variables.
 
 ## `tools/*.py` is not auto-formatted
 

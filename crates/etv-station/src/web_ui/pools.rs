@@ -1378,6 +1378,7 @@ mod tests {
             pools: PoolState::default(),
             review: ReviewState::new(station.clone(), catalog_path.clone()),
             mcp: None,
+            arr: super::arr::ArrEnv::default(),
             options: Options {
                 station,
                 catalog: catalog_path,

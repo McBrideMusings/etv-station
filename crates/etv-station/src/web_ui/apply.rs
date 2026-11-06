@@ -245,6 +245,7 @@ mod tests {
             pools: PoolState::default(),
             review: channel::ReviewState::new(station.clone(), PathBuf::from("/nonexistent/c.db")),
             mcp: None,
+            arr: super::arr::ArrEnv::default(),
             options: Options {
                 station,
                 catalog: PathBuf::from("/nonexistent/c.db"),

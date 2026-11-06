@@ -175,6 +175,16 @@
   .insp .sum { font-size: 12px; color: var(--muted); }
   .insp .x { float: right; border: 0; background: none; font-size: 16px; line-height: 1; padding: 0 2px; }
   .insp table.steps td { font-size: 12px; }
+  .insp .arrposter { float: right; width: 70px; margin: 0 0 6px 8px; border: 1px solid var(--line); }
+  #editLink { font-size: 12.5px; margin-left: 12px; white-space: nowrap; }
+  .blockcard { margin-bottom: 18px; }
+  .blockcard h5 { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 8px 0 3px; }
+  table.airings td.why { color: var(--muted); font-size: 11.5px; }
+  tr.airrow { cursor: pointer; }
+  tr.airrow:hover, tr.airrow.sel { background: var(--panel); }
+  tr.airrow.sel { outline: 2px solid var(--fg); outline-offset: -2px; }
+  .preview-page .samples { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+  .preview-page .sample { font-size: 12.5px; }
 
   .ptotal { display: flex; gap: 10px; align-items: baseline; margin-bottom: 4px; }
   .ptotal .big { font-size: 20px; font-weight: 750; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -360,11 +370,14 @@
     <div class="toolbar" id="toolbar">
       <nav class="subtabs" aria-label="Channel views">
         <a id="subSchedule" href="#">Schedule</a>
-        <a id="subPattern" href="#">Pattern</a>
-        <a id="subGraphics" href="#">Graphics</a>
+        <a id="subBlocks" href="#">Blocks</a>
+        <a id="subBumpers" href="#">Bumpers</a>
+        <a id="subPreview" href="#">Preview</a>
         <a id="subPools" href="#">Pools</a>
+        <a id="subGraphics" href="#">Graphics</a>
       </nav>
       <span id="position" class="muted"></span>
+      <a id="editLink" href="#">Edit this channel</a>
       <span class="spacer"></span>
       <span id="projCtl" class="toolbar" style="margin:0">
         <span id="projState" class="muted" aria-live="polite"></span>
@@ -399,7 +412,7 @@ let current = null;   // the last channel review payload
 let lineup = null;    // GET /api/lineup's channels, once loaded
 let loadSeq = 0;  // a newer load() supersedes an older one still polling
 
-// The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|pattern|graphics}?project=Nd`,
+// The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|blocks|bumpers|preview|graphics}?project=Nd`,
 // `#/channels/{key}/pools?draft=ID`, `#/edit/{key}`, `#/guide`, `#/health`. A key holding a `/` (an examples/ channel) is percent-encoded.
 function parseRoute() {
   const [path, qs] = location.hash.replace(/^#/, '').split('?');
@@ -409,7 +422,7 @@ function parseRoute() {
   return {
     tab,
     channel: (tab === 'channels' || tab === 'edit') && parts[1] ? decodeURIComponent(parts[1]) : null,
-    view: ['pattern', 'pools', 'graphics'].includes(parts[2]) ? parts[2] : 'schedule',
+    view: ['blocks', 'bumpers', 'preview', 'pools', 'graphics'].includes(parts[2]) ? parts[2] : 'schedule',
     project: ['1d', '3d', '7d', '14d'].includes(q.get('project')) ? q.get('project') : null,
     draft: q.get('draft'),
   };
@@ -423,7 +436,7 @@ function editHash(channel) { return channel ? `#/edit/${encodeURIComponent(chann
 function channelHash(channel, view, project, draft) {
   const q = [];
   if (project && view !== 'pools') q.push(`project=${project}`);
-  if (draft && view !== 'pattern') q.push(`draft=${encodeURIComponent(draft)}`);
+  if (draft && !['blocks', 'bumpers', 'preview'].includes(view)) q.push(`draft=${encodeURIComponent(draft)}`);
   return `#/channels/${encodeURIComponent(channel)}/${view || 'schedule'}${q.length ? `?${q.join('&')}` : ''}`;
 }
 
@@ -577,7 +590,9 @@ function setControls(project, busy) {
 }
 
 function draw(view) {
-  if (view === 'pattern') renderPattern(current); else render(current);
+  if (view === 'blocks') renderBlocks(current);
+  else if (view === 'preview') renderPreview(current);
+  else render(current);
 }
 
 // The lineup rail: every channel in station.yaml order as "number name"; one that failed to load shows its key in red.
@@ -619,7 +634,7 @@ function markRoute(r) {
   $('toolbar').hidden = r.tab !== 'channels';
   setControls(r.project, false);
   // Project ahead belongs to the schedule; Graphics has no projection to ask for.
-  const projecting = r.tab === 'channels' && r.view !== 'graphics';
+  const projecting = r.tab === 'channels' && r.view !== 'graphics' && r.view !== 'bumpers';
   for (const id of ['projState', 'projLabel', 'projBtns', 'projClear']) $(id).hidden = !projecting;
   if (!railed || !lineup) return;
   const project = r.project;
@@ -629,12 +644,13 @@ function markRoute(r) {
     if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   $('lineupSelect').value = r.channel;
+  $('editLink').href = editHash(r.channel);
   if (r.tab === 'edit') {
     const sel = $('lineup').querySelector('[aria-current="page"]');
     if (sel) sel.scrollIntoView({ block: 'nearest' });
     return;
   }
-  for (const [id, view] of [['subSchedule', 'schedule'], ['subPattern', 'pattern'], ['subPools', 'pools'], ['subGraphics', 'graphics']]) {
+  for (const [id, view] of [['subSchedule', 'schedule'], ['subBlocks', 'blocks'], ['subBumpers', 'bumpers'], ['subPreview', 'preview'], ['subPools', 'pools'], ['subGraphics', 'graphics']]) {
     $(id).href = channelHash(r.channel, view, project, r.draft);
     if (r.view === view) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
@@ -1159,12 +1175,12 @@ async function route() {
   markRoute(r);
   stopPlayer();
   if (r.tab === 'edit') { loadSeq++; guideSeq++; poolsSeq++; healthSeq++; shown = null; current = null; loadEdit(r.channel); return; }
-  if (r.tab !== 'channels' || r.view !== 'graphics') { gSeq++; renderSeq++; }
+  if (r.tab !== 'channels' || !['graphics', 'bumpers'].includes(r.view)) { gSeq++; renderSeq++; }
   if (r.tab === 'guide') { loadSeq++; poolsSeq++; healthSeq++; shown = null; current = null; document.title = 'etv-station · Guide'; $('state').textContent = ''; $('report').classList.remove('loading'); loadGuide(); return; }
   if (r.tab === 'health') { loadSeq++; guideSeq++; poolsSeq++; shown = null; current = null; loadHealth(); return; }
   if (!r.channel) return;
   if (r.view === 'pools') { guideSeq++; healthSeq++; shown = null; await loadPools(r.channel, r.draft); return; }
-  if (r.view === 'graphics') { loadSeq++; guideSeq++; poolsSeq++; healthSeq++; shown = null; current = null; loadGraphics(r.channel); return; }
+  if (r.view === 'graphics' || r.view === 'bumpers') { loadSeq++; guideSeq++; poolsSeq++; healthSeq++; shown = null; current = null; loadGraphics(r.channel, r.view); return; }
   guideSeq++; poolsSeq++; healthSeq++;
   const key = `${r.channel}|${r.project}|${r.view === 'schedule' ? r.draft || '' : ''}`;
   if (shown === key && current) { draw(r.view); return; }
@@ -1179,9 +1195,10 @@ const GRAPHICS_POLL_MS = 2000;
 let gSeq = 0;      // a newer Graphics load or render supersedes an older one still polling
 let renderSeq = 0; // a newer render request supersedes the one still polling
 
-async function loadGraphics(channel) {
+async function loadGraphics(channel, view) {
   const seq = ++gSeq;
-  document.title = `etv-station · ${channel} · Graphics`;
+  const word = view === 'bumpers' ? 'Bumpers' : 'Graphics';
+  document.title = `etv-station · ${channel} · ${word}`;
   $('state').textContent = '';
   $('report').classList.remove('loading');
   $('report').innerHTML = '<div class="muted">Loading the channel’s scripts…</div>';
@@ -1205,10 +1222,11 @@ async function loadGraphics(channel) {
       <h2>This channel's config fails to load</h2><div class="error">${esc(data.load_error)}</div>`;
     return;
   }
-  drawGraphics(data);
+  drawGraphics(data, view);
 }
 
-function drawGraphics(d) {
+function drawGraphics(d, view) {
+  const bumpersView = view === 'bumpers';
   const canvas = d.canvas ? `${d.canvas.width}×${d.canvas.height}` : 'no overlay canvas';
   const overlayRows = d.overlays.map((o) => `<div class="grow" data-script="${esc(o.script)}">
       <div class="gname"><b>${esc(o.name)}</b><div class="muted gpath">${esc(o.script)}</div></div>
@@ -1224,10 +1242,11 @@ function drawGraphics(d) {
       <button type="button" data-kind="bumper">Render</button></div>`;
   }).join('');
   $('report').innerHTML = `<header class="mast"><div><h1>${esc(d.channel)}</h1>
-      <div class="sub">Graphics · rendered with the station's renderer at ${esc(canvas)}</div></div></header>
+      <div class="sub">${bumpersView ? 'Bumpers' : 'Graphics'} · rendered with the station's renderer at ${esc(canvas)}</div></div></header>
     <div class="layout"><div class="gscripts">
-      <section><h2>Overlays</h2>${overlayRows || '<p class="muted">This channel’s overlay names no script.</p>'}</section>
-      <section><h2>Bumpers</h2>${bumperRows || '<p class="muted">This channel’s blocks have no <code>fill:</code> bumper scripts.</p>'}</section>
+      ${bumpersView
+        ? `<section><h2>Bumpers</h2>${bumperRows || '<p class="muted">This channel’s blocks have no <code>fill:</code> bumper scripts.</p>'}</section>`
+        : `<section><h2>Overlays</h2>${overlayRows || '<p class="muted">This channel’s overlay names no script.</p>'}</section>`}
     </div><aside class="rail"><section class="insp" id="gresult"><p class="muted">Pick Still, Clip or Render. Renders run one at a time and are kept until a script or config they read changes.</p></section></aside></div>`;
   for (const btn of $('report').querySelectorAll('.grow button')) {
     btn.addEventListener('click', () => {
@@ -1334,6 +1353,28 @@ function notesHTML(d) {
   return notes.length ? `<div class="notes">${notes.join('')}</div>` : '';
 }
 
+// The tune-in samples: what is on at each sampled moment, how far in, the next two, and the frame with its overlay.
+function samplesSection(d) {
+  const tz = d.tz;
+  const samples = d.samples.map((s) => {
+    const a = d.airings[s.index];
+    const next = s.next.map((i) => d.airings[i]).map((n) => `<li>${esc(timeOf(n.start, tz))} ${esc(n.label)}</li>`).join('');
+    const pct = s.minutes_total ? Math.min(100, (s.minutes_in / s.minutes_total) * 100) : 0;
+    const still = s.still && s.still.url
+      ? `<a href="${esc(s.still.url)}" target="_blank"><img class="still" src="${esc(s.still.url)}" alt="Sample ${s.n}: ${esc(a.label)}"
+          onerror="this.parentNode.outerHTML='<div class=&quot;still-missing&quot;>Still failed to render</div>'"></a>`
+      : `<div class="still-missing" title="${esc((s.still && s.still.path) || '')}">${esc((s.still && s.still.unavailable) || 'No still')}</div>`;
+    return `<div class="sample">${still}<div class="when"><span class="pin">${s.n}</span>${esc(dayOf(s.at, tz))} ${esc(timeOf(s.at, tz))}</div>
+      <div class="what">${esc(a.label)}</div>
+      <div class="prog"><span style="width:${pct}%"></span></div>
+      <div class="muted">${s.minutes_in} of ${s.minutes_total} min in · ${esc(a.pool)}</div>
+      <ol>${next}</ol></div>`;
+  }).join('');
+  return `<section><h2>Tune-in samples</h2>
+    <p class="muted">${d.samples.length} moments drawn from ${d.seed == null ? 'the default seed' : typeof d.seed === 'object' ? `a seed that ${esc(seedLabel(d.seed))}` : `seed ${esc(seedLabel(d.seed))}`}: what is on, how far in, and the next two. Each still is the frame at that moment with the overlay as it looks when it names what is next.</p>
+    <div class="samples">${samples}</div></section>`;
+}
+
 function render(d) {
   document.title = `etv-station · ${d.number} ${d.display_name || d.name}`;
   const colors = poolColor(d);
@@ -1358,7 +1399,7 @@ function render(d) {
     <div>
       <h1>${esc(d.display_name || d.name)}</h1>
       <div class="sub">${esc(dayOf(d.start, tz))} – ${esc(dayOf(d.end - 1, tz))} · ${esc(covers)} (${esc(tz)}) · seed ${esc(seedLabel(d.seed))} · ${esc(d.config_path)}</div>
-      <div class="pattern"><button type="button" class="linkish" id="patternBtn">Pattern</button><span class="pstub" title="${esc(patternWords(d.blocks))}">${esc(patternWords(d.blocks))}</span></div>
+      <div class="pattern"><button type="button" class="linkish" id="patternBtn">Blocks</button><span class="pstub" title="${esc(patternWords(d.blocks))}">${esc(patternWords(d.blocks))}</span></div>
     </div>
     <dl class="facts">
       <div><dt>First repeat</dt><dd>${fr ? days1(fr.days) + ' d' : '&gt;' + span + ' d'}</dd>
@@ -1380,29 +1421,10 @@ function render(d) {
     <span><span class="swatch proj"></span>Projected — not scheduled</span>
     ${d.diff ? '<span><span class="swatch chg"></span>Changed by the draft</span>' : ''}
     <span><span class="swatch fl"></span>Frontier: where the published playout ends</span>
-    <span><span class="pin">1</span>tune-in sample</span></div>`);
+    <span><span class="pin">1</span>tune-in sample (Preview)</span></div>`);
 
   // 2. Guide, with the rail beside it
   html.push(`<div class="layout"><div class="gwrap" id="gwrap"><div class="wk" id="guide" style="--n:${d.day_starts.length - 1}"></div></div><aside class="rail" id="rail"><section class="insp" id="insp" hidden></section>`);
-
-  // Tune-in samples, built here and placed last in the rail (7).
-  const samples = d.samples.map((s) => {
-    const a = d.airings[s.index];
-    const next = s.next.map((i) => d.airings[i]).map((n) => `<li>${esc(timeOf(n.start, tz))} ${esc(n.label)}</li>`).join('');
-    const pct = s.minutes_total ? Math.min(100, (s.minutes_in / s.minutes_total) * 100) : 0;
-    const still = s.still && s.still.url
-      ? `<a href="${esc(s.still.url)}" target="_blank"><img class="still" src="${esc(s.still.url)}" alt="Sample ${s.n}: ${esc(a.label)}"
-          onerror="this.parentNode.outerHTML='<div class=&quot;still-missing&quot;>Still failed to render</div>'"></a>`
-      : `<div class="still-missing" title="${esc((s.still && s.still.path) || '')}">${esc((s.still && s.still.unavailable) || 'No still')}</div>`;
-    return `<div class="sample">${still}<div class="when"><span class="pin">${s.n}</span>${esc(dayOf(s.at, tz))} ${esc(timeOf(s.at, tz))}</div>
-      <div class="what">${esc(a.label)}</div>
-      <div class="prog"><span style="width:${pct}%"></span></div>
-      <div class="muted">${s.minutes_in} of ${s.minutes_total} min in · ${esc(a.pool)}</div>
-      <ol>${next}</ol></div>`;
-  }).join('');
-  const samplesSection = `<section><h2>Tune-in samples</h2>
-    <p class="muted">${d.samples.length} moments drawn from ${d.seed == null ? 'the default seed' : typeof d.seed === 'object' ? `a seed that ${esc(seedLabel(d.seed))}` : `seed ${esc(seedLabel(d.seed))}`}: what is on, how far in, and the next two. Each still is the frame at that moment with the overlay as it looks when it names what is next.</p>
-    <div class="samples">${samples}</div></section>`;
 
   // 3. Principles: graded where the schedule measures them, listed with the reason where it cannot.
   const scored = d.principles.filter((p) => p.grade != null);
@@ -1464,12 +1486,11 @@ function render(d) {
         <td class="num"><span class="old">${esc(r.old ?? '—')}</span> → <span class="new">${esc(r.new ?? '—')}</span></td></tr>`).join('')}</tbody></table>`;
   html.push(`<section><h2>Since last run</h2>${since}</section>`);
 
-  // 7. Tune-in samples, last: the rail reads numbers first, stills after.
-  html.push(`${samplesSection}</aside></div>`);
+  html.push('</aside></div>');
 
   $('report').innerHTML = html.join('');
   renderGuide(d, colors);
-  $('patternBtn').addEventListener('click', () => { location.hash = channelHash(d.channel, 'pattern', parseRoute().project); });
+  $('patternBtn').addEventListener('click', () => { location.hash = channelHash(d.channel, 'blocks', parseRoute().project); });
   const ppm = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ppm'));
   // The hour label is centred on its line, so land 10px above the line: the whole label clears the sticky day header.
   $('gwrap').scrollTop = GUIDE_OPEN_HOUR * 60 * ppm - 10;
@@ -1490,7 +1511,7 @@ function patternWords(blocks) {
   }).join('; ');
 }
 
-// The pattern, step by step, with what each pool actually aired in the span.
+// Each block's pattern, step by step, with what each pool actually aired in the span: one html string per block, in `d.blocks` order.
 function patternPanel(d, colors) {
   const aired = {};
   for (const a of d.airings) {
@@ -1515,18 +1536,101 @@ function patternPanel(d, colors) {
     else rows = `<p class="muted">${b.entries} fixed ${b.entries === 1 ? 'entry' : 'entries'}.</p>`;
     const placed = b.placed.length ? `<p class="muted">Airs ${esc(b.placed.join('; '))}.</p>` : '';
     return `<h4>${esc(b.name)}</h4>${placed}${rows}`;
-  }).join('');
+  });
   return blocks;
 }
 
-// The Pattern sub-tab: the masthead's identity line, then every block's steps with what each pool aired.
-function renderPattern(d) {
-  document.title = `etv-station · ${d.number} ${d.display_name || d.name} · Pattern`;
+// Why an airing is on, in one line, from its audit trail: the rank and draw the picker recorded and the keywords it matched.
+function whyText(a) {
+  const trail = Array.isArray(a.audit) ? a.audit : [];
+  const parts = [];
+  for (const st of trail) {
+    const det = (st.detail && typeof st.detail === 'object') ? st.detail : {};
+    if (det.rank != null && det.candidate_count != null) parts.push(`#${det.rank} of ${det.candidate_count}`);
+    if (det.draw) parts.push(`draw ${det.draw}`);
+    if (Array.isArray(det.favor_matches) && det.favor_matches.length) parts.push(`matched ${det.favor_matches.join(' · ')}`);
+  }
+  if (!parts.length && trail.length) parts.push(trail[trail.length - 1].verdict || '');
+  return parts.join(' · ');
+}
+
+const BLOCK_ROWS_SHOWN = 40;   // the rest of a block's airings sit behind a disclosure
+
+// The Blocks sub-tab: every block as a card (its schedule placements, its steps with what each pool aired,
+// then each airing with why it is on). A row opens the same selection trail the Schedule shows, plus Radarr and Sonarr.
+function renderBlocks(d) {
+  document.title = `etv-station · ${d.number} ${d.display_name || d.name} · Blocks`;
+  markRepeats(d);
   const colors = poolColor(d);
+  const tz = d.tz;
+  const panels = patternPanel(d, colors);
+  const row = (a) => `<tr class="airrow" tabindex="0" data-index="${a.index}">
+      <td class="num">${esc(dayOf(a.start, tz))} ${esc(timeOf(a.start, tz))}</td>
+      <td>${a.repeat_of != null ? '<span class="rbadge">R</span>' : ''}${esc(a.label)}</td>
+      <td><span class="swatch" style="background:${colors[a.pool] || '#ccc'}"></span>${esc(a.pool)}</td>
+      <td class="why">${esc(whyText(a)) || '<span class="muted">no selection trail</span>'}</td></tr>`;
+  // An airing belongs to the first block whose pools name its pool; the rest (a fixed-entry or
+  // sequencer block names no pool of its own) sit under "Other airings" so none is hidden.
+  const owner = (a) => d.blocks.findIndex((b) => b.pools.includes(a.pool));
+  const cards = d.blocks.map((b, i) => {
+    const mine = d.airings.filter((a) => owner(a) === i);
+    const head = `<thead><tr><th>When</th><th>Airing</th><th>Pool</th><th>Why it's on</th></tr></thead>`;
+    const shown = mine.slice(0, BLOCK_ROWS_SHOWN).map(row).join('');
+    const rest = mine.slice(BLOCK_ROWS_SHOWN);
+    const table = mine.length
+      ? `<table class="airings">${head}<tbody>${shown}</tbody></table>${rest.length
+        ? `<details><summary class="muted">${rest.length} more airing${rest.length === 1 ? '' : 's'}</summary><table class="airings"><tbody>${rest.map(row).join('')}</tbody></table></details>` : ''}`
+      : '<p class="muted">Nothing from this block aired in the span.</p>';
+    return `<section class="blockcard">${panels[i]}<h5>Airings (${mine.length})</h5>${table}</section>`;
+  }).join('');
+  const orphans = d.airings.filter((a) => owner(a) < 0);
+  const other = orphans.length
+    ? `<section class="blockcard"><h4>Other airings</h4><p class="muted">From blocks that name no pool (fixed entries or a sequencer).</p>
+        <table class="airings"><thead><tr><th>When</th><th>Airing</th><th>Pool</th><th>Why it's on</th></tr></thead><tbody>${orphans.map(row).join('')}</tbody></table></section>` : '';
   $('report').innerHTML = `<header class="mast"><div class="bug">${esc(d.number)}</div>
       <div><h1>${esc(d.display_name || d.name)}</h1>
-      <div class="sub">${esc(d.span.label)} (${esc(d.tz)}) · ${esc(d.config_path)}</div></div></header>
-    <section class="insp pattern-page">${patternPanel(d, colors)}</section>`;
+      <div class="sub">Blocks · ${esc(d.span.label)} (${esc(d.tz)}) · ${esc(d.config_path)}</div></div></header>
+    <div class="layout"><div class="gscripts">${cards || '<p class="muted">This channel has no blocks.</p>'}${other}</div>
+    <aside class="rail"><section class="insp" id="insp" hidden></section></aside></div>`;
+}
+
+// The Preview sub-tab: the tune-in samples at full width.
+function renderPreview(d) {
+  document.title = `etv-station · ${d.number} ${d.display_name || d.name} · Preview`;
+  $('report').innerHTML = `<header class="mast"><div class="bug">${esc(d.number)}</div>
+      <div><h1>${esc(d.display_name || d.name)}</h1>
+      <div class="sub">Preview · ${esc(d.span.label)} (${esc(d.tz)}) · ${esc(d.config_path)}</div></div></header>
+    <div class="preview-page gscripts">${d.samples.length ? samplesSection(d) : '<p class="muted">No published playout to sample yet.</p>'}</div>`;
+}
+
+const ARR_POLL_MS = 1000;   // the server answers 202 while it asks Radarr or Sonarr
+// Radarr's or Sonarr's record of one item, read by the dashboard server and drawn into the inspector's `#arrbox`.
+async function loadArr(id) {
+  const box = $('arrbox');
+  if (!box) return;
+  box.dataset.id = id;
+  let data;
+  for (;;) {
+    try {
+      const res = await fetch(`/api/entries/${encodeURIComponent(id)}/arr`);
+      data = await res.json();
+      if (!res.ok && res.status !== 202) data = { error: `HTTP ${res.status}: ${data.error || 'no error message'}` };
+      if (res.status === 202) { await new Promise((r) => setTimeout(r, ARR_POLL_MS)); if ($('arrbox') !== box || box.dataset.id !== id) return; continue; }
+    } catch (e) { data = { error: String(e) }; }
+    break;
+  }
+  if ($('arrbox') !== box || box.dataset.id !== id) return;   // another item was picked meanwhile
+  const name = data.service || 'Radarr and Sonarr';
+  const title = `<h4>${esc(name)}</h4>`;
+  let body;
+  if (data.error) body = `<div class="error">${esc(data.error)}</div>`;
+  else if (!data.service) body = '<div class="muted">Radarr lists films and Sonarr lists episodes; this item is neither.</div>';
+  else if (!data.configured) body = `<div class="muted">${esc(data.service)} is not set on the dashboard (${data.service.toUpperCase()}_URL and ${data.service.toUpperCase()}_API_KEY).</div>`;
+  else if (!data.found) body = `<div class="muted">${esc(data.service)} does not list this item.</div>`;
+  else body = `${data.poster ? `<img class="arrposter" src="${esc(data.poster)}" alt="" referrerpolicy="no-referrer">` : ''}
+    <dl class="kv">${data.fields.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>
+    ${data.overview ? `<div class="sum">${esc(data.overview)}</div>` : ''}`;
+  box.innerHTML = title + body;
 }
 
 const num = (v) => (typeof v === 'number' && !Number.isInteger(v) ? v.toFixed(2) : String(v));
@@ -1576,7 +1680,8 @@ function airingPanel(d, a, colors) {
     <h4>Why it's here: ${trail.length} stage${trail.length === 1 ? '' : 's'}</h4>
     ${trail.length ? trail.map((s) => stageHTML(d, s)).join('') : '<div class="muted">No selection trail was recorded for this airing.</div>'}
     <h4>Airings in ${esc(d.span.label)} (${all.length})</h4><ol class="hist">${hist}</ol>
-    <h4>Catalog</h4><div class="sum">${esc(a.id)}${cat ? ' · ' + esc(cat) : ''}${a.summary ? `<br>${esc(a.summary)}` : ''}</div>`;
+    <h4>Catalog</h4><div class="sum">${esc(a.id)}${cat ? ' · ' + esc(cat) : ''}${a.summary ? `<br>${esc(a.summary)}` : ''}</div>
+    <div id="arrbox"><h4>Radarr and Sonarr</h4><div class="muted">Asking…</div></div>`;
 }
 
 // ---- Guide: ETV-next's live XMLTV grid, read by the browser. Clicking a programme asks the station for that airing's audit record.
@@ -1818,7 +1923,7 @@ document.addEventListener('keydown', (e) => {
 function closePanel() {
   const p = $('insp');
   if (p) { p.hidden = true; p.innerHTML = ''; }
-  document.querySelectorAll('.blk.sel, .pgm.sel').forEach((b) => b.classList.remove('sel'));
+  document.querySelectorAll('.blk.sel, .pgm.sel, .airrow.sel').forEach((b) => b.classList.remove('sel'));
 }
 
 function showPanel(html) {
@@ -1831,16 +1936,23 @@ function showPanel(html) {
   p.scrollIntoView({ block: 'start' });
 }
 
-function selectBlock(b) {
-  if (!current || !b || b.dataset.index == null) return;
-  const a = current.airings[Number(b.dataset.index)];
+// Opens an airing's trail and its Radarr/Sonarr record in the panel; `el` is the guide block or table row clicked.
+function selectAiring(el) {
+  if (!current || !el || el.dataset.index == null) return;
+  const a = current.airings[Number(el.dataset.index)];
   showPanel(airingPanel(current, a, poolColor(current)));
-  document.querySelectorAll(`.blk[data-index="${a.index}"]`).forEach((x) => x.classList.add('sel'));
+  document.querySelectorAll(`.blk[data-index="${a.index}"], .airrow[data-index="${a.index}"]`).forEach((x) => x.classList.add('sel'));
+  if (a.kind === 'movie' || a.kind === 'episode') loadArr(a.id);
+  else $('arrbox').remove();
 }
-document.addEventListener('click', (e) => { const b = e.target.closest('.blk'); if (b) selectBlock(b); });
+document.addEventListener('click', (e) => { const r = e.target.closest('.airrow'); if (r) selectAiring(r); });
+document.addEventListener('keydown', (e) => {
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.airrow')) { e.preventDefault(); selectAiring(e.target.closest('.airrow')); }
+});
+document.addEventListener('click', (e) => { const b = e.target.closest('.blk'); if (b) selectAiring(b); });
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closePanel();
-  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.blk')) { e.preventDefault(); selectBlock(e.target.closest('.blk')); }
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.blk')) { e.preventDefault(); selectAiring(e.target.closest('.blk')); }
 });
 
 function renderGuide(d, colors) {

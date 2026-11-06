@@ -63,6 +63,11 @@ The preview's rewind span needs a channel with published playout: run `target/de
 Check `rewind.airings` against the chunk files in the station's output folder: an item that straddles a chunk boundary is listed in both files, so count distinct starts. The daemon's reload outcome
 (`reverted`, `channel_dropped`) needs a running daemon; without one, stub `apply/status` in the page.
 
+The Channels views `#/channels/{ch}/blocks`, `bumpers` and `preview` read the review and graphics routes. In Blocks a row opens the
+inspector (`#insp`), whose `#arrbox` fills from `GET /api/entries/{id}/arr`; with `RADARR_*`/`SONARR_*` set (source `.env`), curl it for a
+film id (`imdb:tt0098141`, answers in ~0.3 s: it asks Radarr by TMDB id, never its 91 MB library) and a series episode. A debug build takes
+about 35 s for a channel's `project=1d` review, so wait for the 200 before driving the page.
+
 The dashboard's Guide tab reads ETV-next's `/channels.m3u` and `/xmltv.xml` in the browser
 (base URL: `ETV_NEXT_URL` from `GET /api/health`'s `etv_next_url`, else the page's host on
 port 8409). Clicking a programme asks `GET /api/airings/{number}.{start unix seconds}/audit`

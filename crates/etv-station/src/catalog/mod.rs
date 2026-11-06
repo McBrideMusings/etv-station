@@ -785,6 +785,22 @@ impl Catalog {
         Ok(row)
     }
 
+    /// The value of one external id an entry carries (its TMDB number, say), if any.
+    pub fn external_id_of(
+        &self,
+        entry_id: &str,
+        namespace: ExternalNs,
+    ) -> Result<Option<String>, CatalogError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM entry_external_ids WHERE entry_id = ?1 AND namespace = ?2",
+                params![entry_id, namespace.as_str()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
     /// The `entry_id` an external GUID resolves to, if any — the GUID-first half
     /// of ingest identity: every source sharing a GUID collapses onto one entry.
     ///
