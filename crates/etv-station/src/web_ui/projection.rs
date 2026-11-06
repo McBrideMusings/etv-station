@@ -166,6 +166,8 @@ struct Inner {
     failed: HashMap<String, String>,
     queue: VecDeque<Job>,
     running: Option<String>,
+    /// When `running` started, for the page's elapsed-time line.
+    running_since: Option<std::time::Instant>,
     /// The inputs of the last finished projection per (channel, days).
     last: HashMap<(String, u32), Digests>,
     /// Why the worker stopped for good; every lookup that misses reports it.
@@ -185,6 +187,8 @@ pub struct Stats {
     pub in_memory: usize,
     pub queued: usize,
     pub running: Option<String>,
+    /// Seconds the running projection has been going.
+    pub running_secs: Option<u64>,
 }
 
 fn sha_hex(parts: &[&[u8]]) -> String {
@@ -556,6 +560,7 @@ impl SimCache {
             in_memory: g.slots.len(),
             queued: g.queue.len(),
             running: g.running.clone(),
+            running_secs: g.running_since.map(|t| t.elapsed().as_secs()),
         }
     }
 
@@ -585,6 +590,7 @@ impl SimCache {
                 loop {
                     if let Some(job) = g.queue.pop_front() {
                         g.running = Some(job.key.clone());
+                        g.running_since = Some(std::time::Instant::now());
                         break job;
                     }
                     g = self
@@ -595,7 +601,11 @@ impl SimCache {
                 }
             };
             self.execute(job, &catalog);
-            self.lock().running = None;
+            {
+                let mut g = self.lock();
+                g.running = None;
+                g.running_since = None;
+            }
         }
     }
 

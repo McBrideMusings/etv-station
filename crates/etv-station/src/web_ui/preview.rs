@@ -18,7 +18,10 @@
 //! * `schedule: true` — `valid` and `schedule`: the deployed review and the
 //!   candidate's re-simulated over `project` days (default 3d), with each
 //!   airing that differs. `schedule.pending` is true until both simulations
-//!   land; ask again to read them.
+//!   land; ask again to read them. While pending, `schedule.worker` says
+//!   what the one projection worker is doing (`queued` jobs, `running_secs` of
+//!   the job in hand, null when idle) so the page shows progress and can tell a
+//!   dead worker from a slow one.
 //!
 //! Text equal to the deployed file answers `changed: false` with nothing else:
 //! no movement and no rewind. Nothing is written.
@@ -192,6 +195,7 @@ fn schedule_answer(
     }
     let pending = deployed.0 == 202 || candidate.0 == 202;
     let days: u32 = project.trim_end_matches('d').parse().unwrap_or(0);
+    let worker = state.review.sims.stats();
     tracing::info!(
         event = "ui.preview",
         channel = key,
@@ -207,6 +211,7 @@ fn schedule_answer(
             "schedule": {
                 "pending": pending,
                 "days": days,
+                "worker": { "queued": worker.queued, "running_secs": worker.running_secs },
                 "changed_airings": if pending { Value::Null } else { changed_airings(&deployed.1, &candidate.1) },
             },
         }),

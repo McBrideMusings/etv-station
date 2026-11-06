@@ -331,6 +331,16 @@
   .eprof input.w { width: 4.5em; font-variant-numeric: tabular-nums; }
   .eprof .padd { display: flex; gap: 4px; margin-top: 4px; flex-wrap: wrap; }
   .eprof .padd input.v { flex: 1; min-width: 5em; }
+  .ebar button { white-space: nowrap; }
+  .ebar button.primary { min-width: 9.5em; }
+  /* Narrow: the page scrolls, the bar takes two fixed rows (status above, buttons below), and the preview stacks under the editor. */
+  @media (max-width: 900px) {
+    .epage { overflow: visible; }
+    .ebar { grid-template-columns: 7em 9em minmax(0, 1fr); grid-template-rows: 32px 32px; height: auto; padding: 4px 10px; row-gap: 4px; }
+    .ebar #eapply { justify-self: end; }
+    .enote { height: 6.2em; }
+    .ebody { grid-template-columns: minmax(0, 1fr); grid-template-rows: 70vh 60vh; }
+  }
   #tip { position: fixed; z-index: 10; max-width: 360px; background: var(--fg); color: var(--bg); font-size: 12px; padding: 5px 8px; border-radius: 3px; pointer-events: none; }
 </style>
 </head>
@@ -710,7 +720,7 @@ async function loadEdit(channel) {
     return;
   }
   const base = r.data.yaml;
-  editState = { channel, url, path: r.data.path, base, text: editDrafts[channel] && editDrafts[channel].base === base ? editDrafts[channel].text : base, valid: null, phase: 'edit', note: null, tab: 'schedule', preview: null, pvSeq: 0, pvTimer: null, schedSeq: -1, schedBegan: 0, seq: 0, profSeq: 0, timer: null, profTimer: null, poll: null };
+  editState = { channel, url, path: r.data.path, base, text: editDrafts[channel] && editDrafts[channel].base === base ? editDrafts[channel].text : base, valid: null, phase: 'edit', note: null, tab: 'schedule', preview: null, pvSeq: 0, pvTimer: null, schedSeq: -1, schedIdle: 0, seq: 0, profSeq: 0, timer: null, profTimer: null, poll: null };
   const stale = editDrafts[channel] && editDrafts[channel].base !== base;
   if (stale) delete editDrafts[channel];
   drawEdit();
@@ -890,17 +900,31 @@ async function editSchedule(seq, text) {
   const e = editState;
   if (!editLive(e) || seq !== e.pvSeq || !e.preview || e.preview.text !== text) return;
   if (e.schedSeq === seq && e.preview.sched !== null && !e.preview.sched.pending) return;
-  if (e.schedSeq !== seq) { e.schedSeq = seq; e.schedBegan = Date.now(); }
+  // The daemon regenerates on this fingerprint alone, so an unchanged one is the same schedule: nothing to project.
+  if (e.preview.data && e.preview.data.fingerprint && e.preview.data.fingerprint.state === 'same') { e.preview.sched = { days: 0, changed_airings: [], same: true }; paintPreview(); return; }
+  if (e.schedSeq !== seq) { e.schedSeq = seq; e.schedIdle = 0; }
   clearTimeout(e.pvTimer);
   let r;
   try { r = await editJson(`${e.url}/preview`, { yaml: text, schedule: true }); } catch (x) { r = { ok: false, status: 0, data: { error: String(x) } }; }
   if (!editLive(e) || seq !== e.pvSeq) return;
   let sched = r.ok && r.data.schedule ? r.data.schedule : { error: r.data.error || `HTTP ${r.status}` };
   if (r.ok && r.data.changed === false) sched = { days: 0, changed_airings: [] };
-  if (sched.pending && Date.now() - e.schedBegan > EDIT_POLL_DEADLINE_MS) sched = { error: `The projection has not finished in ${EDIT_POLL_DEADLINE_MS / 1000} s. Check the station's log.` };
+  // A pending projection with an idle worker on two polls in a row has no one working on it (one poll can land between a finish and the next read).
+  if (sched.pending) {
+    const idle = !!sched.worker && sched.worker.running_secs == null && !sched.worker.queued;
+    e.schedIdle = idle ? (e.schedIdle || 0) + 1 : 0;
+    if (e.schedIdle >= 2) sched = { error: 'The projection worker is idle but this projection never landed. Check the station\'s log.' };
+  }
   e.preview.sched = sched;
   paintPreview();
   if (sched.pending) e.pvTimer = setTimeout(() => editSchedule(seq, text), EDIT_PREVIEW_POLL_MS);
+}
+
+// What the projection worker is doing, in words: a projection takes seconds on a quiet machine and over a minute on a busy one.
+function workerNote(w) {
+  if (!w) return 'this takes seconds.';
+  const run = w.running_secs == null ? 'starting' : `running for ${w.running_secs} s`;
+  return `${run}${w.queued ? `, ${w.queued} queued behind it` : ''}.`;
 }
 
 function paintPreview() {
@@ -937,8 +961,8 @@ function paintPreview() {
     const sc = pv.sched;
     if (!sc) html = '<div class="muted"><span class="spinner"></span>Projecting the schedule from this text…</div>';
     else if (sc.error) html = `<div class="error">${esc(sc.error)}</div>`;
-    else if (sc.pending) html = `<div class="muted"><span class="spinner"></span>Re-projecting ${esc(sc.days)} days from this text and from the deployed file… this takes seconds.</div>`;
-    else if (!sc.changed_airings.length) html = `<div class="pvbig">No airing differs</div><div class="muted">${sc.days ? `Over the next ${esc(sc.days)} days the schedule from this text matches the deployed one at every instant.` : 'This text is the deployed file.'}</div>`;
+    else if (sc.pending) html = `<div class="muted"><span class="spinner"></span>Re-projecting ${esc(sc.days)} days from this text and from the deployed file… ${esc(workerNote(sc.worker))}</div>`;
+    else if (!sc.changed_airings.length) html = `<div class="pvbig">No airing differs</div><div class="muted">${sc.same ? 'Only comments or formatting changed: the daemon’s regeneration fingerprint is unchanged, so the schedule is the deployed one.' : sc.days ? `Over the next ${esc(sc.days)} days the schedule from this text matches the deployed one at every instant.` : 'This text is the deployed file.'}</div>`;
     else html = `<div class="pvbig">${sc.changed_airings.length} airing${sc.changed_airings.length === 1 ? '' : 's'} differ</div>` + sc.changed_airings.map((a) => {
       const was = a.deployed;
       const mv = a.rank != null && was && was.rank != null ? `<span class="mv">${was.rank === a.rank ? 'rank ' + a.rank + ' (same)' : `rank ${was.rank} → ${a.rank}`}</span>` : '';
