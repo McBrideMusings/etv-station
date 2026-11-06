@@ -95,6 +95,30 @@ impl DurationCache {
         &mut self,
         items: Vec<ResolvedItem>,
     ) -> Result<(Vec<ResolvedItem>, Vec<Duration>, ProbeStats), StationError> {
+        let (kept, durations, stats, _) = self.resolve_all_with(items, Vec::new()).await?;
+        Ok((kept, durations, stats))
+    }
+
+    /// [`Self::resolve_all`], and each list of `extra` resolved the same way in
+    /// the same pass: the fill pools a gap may draw from. One pass, because the
+    /// prune at its end keeps only the paths it was asked about, and a second
+    /// pass for the extras would evict what the first just probed.
+    ///
+    /// An extra item that cannot be read is left out of its list.
+    #[allow(clippy::type_complexity)]
+    pub async fn resolve_all_with(
+        &mut self,
+        items: Vec<ResolvedItem>,
+        extra: Vec<Vec<ResolvedItem>>,
+    ) -> Result<
+        (
+            Vec<ResolvedItem>,
+            Vec<Duration>,
+            ProbeStats,
+            Vec<Vec<(ResolvedItem, Duration)>>,
+        ),
+        StationError,
+    > {
         // Every local path this generation asked for, captured BEFORE the loop.
         // Pruning against the surviving items instead would be wrong in exactly
         // the case that matters: an item that turned into an error card is no
@@ -104,6 +128,7 @@ impl DurationCache {
         // when the share comes back.
         let requested: Vec<PathBuf> = items
             .iter()
+            .chain(extra.iter().flatten())
             .filter_map(|item| match &item.source {
                 SourceConfig::Local { path } => Some(PathBuf::from(path)),
                 SourceConfig::Lavfi { .. } | SourceConfig::Http { .. } => None,
@@ -154,8 +179,30 @@ impl DurationCache {
                 }
             }
         }
+        let mut extras = Vec::with_capacity(extra.len());
+        for list in extra {
+            let mut resolved = Vec::with_capacity(list.len());
+            for item in list {
+                match self.duration_for(&item, &mut stats).await {
+                    Ok(d) => resolved.push((item, d)),
+                    Err(err) => {
+                        let Some((path, reason)) = err.unreadable_media() else {
+                            return Err(err);
+                        };
+                        tracing::warn!(
+                            event = "fill.pool_item_unreadable",
+                            item = %item.id,
+                            path = %path.display(),
+                            reason = %reason,
+                            "a fill pool item could not be read; it will not air in a gap",
+                        );
+                    }
+                }
+            }
+            extras.push(resolved);
+        }
         self.prune_to_paths(&requested);
-        Ok((kept, durations, stats))
+        Ok((kept, durations, stats, extras))
     }
 
     /// The streams of a local file this cache has probed, for the track

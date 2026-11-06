@@ -56,24 +56,32 @@ impl Serialize for Align {
     }
 }
 
-/// One entry of a block's `fill:` list: a bumper script and when it may be
-/// drawn.
+/// One entry of a block's `fill:` list: a bumper `script`, or a `pool` of the
+/// same block whose items air as programmes, and when it may be drawn. Exactly
+/// one of `script` and `pool` is set; `capabilities` and `config` belong to a
+/// script and are refused beside a `pool`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FillEntry {
     /// The bumper script, relative to the channel config's directory.
-    pub script: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<PathBuf>,
+
+    /// A pool of this block (`pools:`) whose items fill the gap as programmes:
+    /// whole items that fit the remaining gap, in the pool's own order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
 
     /// Share of draws, relative to the other candidates. Default 1.
     #[serde(default = "one")]
     pub weight: u32,
 
-    /// CEL over `next`, `prev`, `gap_ms` and `channel`; the script is a
+    /// CEL over `next`, `prev`, `gap_ms` and `channel`; the entry is a
     /// candidate only when it is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
 
-    /// The script is a candidate only while the remaining gap is at least this.
+    /// The entry is a candidate only while the remaining gap is at least this.
     #[serde(
         default,
         with = "humantime_serde",
@@ -81,7 +89,7 @@ pub struct FillEntry {
     )]
     pub min_gap: Option<Duration>,
 
-    /// The script is a candidate only while the remaining gap is at most this.
+    /// The entry is a candidate only while the remaining gap is at most this.
     #[serde(
         default,
         with = "humantime_serde",
@@ -120,8 +128,22 @@ mod tests {
     #[test]
     fn a_fill_entry_defaults_to_weight_one_and_no_limits() {
         let e: FillEntry = serde_norway::from_str("script: bumpers/test_card.rhai").unwrap();
+        assert_eq!(
+            e.script.as_deref(),
+            Some(std::path::Path::new("bumpers/test_card.rhai"))
+        );
         assert_eq!(e.weight, 1);
         assert_eq!((e.when, e.min_gap, e.max_gap), (None, None, None));
+    }
+
+    #[test]
+    fn a_fill_entry_can_name_a_pool_with_gap_limits() {
+        let e: FillEntry =
+            serde_norway::from_str("{ pool: shorts, min_gap: 10m, weight: 2 }").unwrap();
+        assert_eq!(e.pool.as_deref(), Some("shorts"));
+        assert_eq!(e.script, None);
+        assert_eq!(e.min_gap, Some(Duration::from_secs(600)));
+        assert_eq!(e.weight, 2);
     }
 
     #[test]

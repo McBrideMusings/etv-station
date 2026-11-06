@@ -2173,6 +2173,56 @@ fn store_frozen_list(
     });
 }
 
+/// One pool's entry ids in the order a `fill:` entry naming it reads them: the
+/// pool resolved exactly as a pattern block resolves it (its source, `order`,
+/// `constraints`, and for an `advance: resume` pool the ledger's cursor), then
+/// each series' items from that cursor on, wrapping, series after series. A
+/// fill entry takes the first of these that fits a gap, so the cursor is what
+/// moves the pool on from one generation to the next once the items it drew are
+/// in the ledger.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_fill_pool_ids(
+    catalog: &Catalog,
+    pool: &Pool,
+    groups: &[ShowGroup],
+    block_constraints: Option<&Constraints>,
+    state: &GenerationState,
+    variety: &crate::variety::Variety,
+    window_start: time::OffsetDateTime,
+    score_env: crate::score::ScoreEnv<'_>,
+    score_cache: &mut crate::score::ScoreCache,
+) -> Result<Vec<String>, String> {
+    let dice = variety.dice(window_start, Some(pool));
+    let mut lists = state.resume.lists.clone();
+    let ids = resolve_pool_sources(
+        catalog,
+        std::slice::from_ref(pool),
+        groups,
+        score_cache,
+        &[dice],
+        score_env,
+        &mut lists,
+    )?
+    .pop()
+    .unwrap_or_default();
+    let runtime = pool_runtime(
+        catalog,
+        pool,
+        ids,
+        block_constraints,
+        state,
+        state.resume.pool(&pool.name),
+        dice,
+        false,
+        &score_cache.picked_extras,
+    )?;
+    Ok(runtime
+        .series
+        .iter()
+        .flat_map(|s| s.ids[s.cursor..].iter().chain(&s.ids[..s.cursor]).cloned())
+        .collect())
+}
+
 /// Every pool's *candidate* entry-id list, for the generation fingerprint
 /// (#182) — [`resolve_pool_sources`]'s pass 1 alone, with a plugin pool's
 /// candidates coming from its declared `sources()` queries

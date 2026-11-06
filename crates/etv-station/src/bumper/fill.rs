@@ -11,7 +11,9 @@
 //! Gap policy:
 //!
 //! - A gap always fills to the boundary, chaining bumpers for as long as it
-//!   takes.
+//!   takes. A `fill:` entry that names a pool instead of a script airs the
+//!   pool's own items first: whole items, in the pool's order, as many as fit
+//!   the gap while leaving `min_fill`; the bumpers fill what is left.
 //! - A gap shorter than the block's `min_fill` is one black item with the
 //!   channel's own overlay (its logo) instead of a bumper. The playout schema
 //!   has no fade filter on an item, so that black item is the dip out of the
@@ -27,6 +29,7 @@
 //! Every choice derives from the channel, the following programme and the air
 //! date, so two runs over the same inputs produce the same bumpers.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,14 +69,34 @@ pub struct FillPlan {
 
 #[derive(Debug, Clone)]
 pub struct FillCandidate {
-    pub script: PathBuf,
+    pub source: CandidateSource,
     pub weight: u32,
     pub when: Option<String>,
     pub min_gap_ms: u64,
     pub max_gap_ms: Option<u64>,
-    pub granted: Vec<String>,
-    /// The entry's `config:`, handed to the script as `ctx.config`.
-    pub config: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CandidateSource {
+    /// A bumper script.
+    Script {
+        script: PathBuf,
+        granted: Vec<String>,
+        /// The entry's `config:`, handed to the script as `ctx.config`.
+        config: Option<serde_json::Value>,
+    },
+    /// A pool of the same block, whose items air as programmes.
+    Pool(String),
+}
+
+impl FillCandidate {
+    /// What a log line calls this entry: the script's path or `pool:<name>`.
+    fn label(&self) -> String {
+        match &self.source {
+            CandidateSource::Script { script, .. } => script.display().to_string(),
+            CandidateSource::Pool(name) => format!("pool:{name}"),
+        }
+    }
 }
 
 impl FillPlan {
@@ -90,14 +113,23 @@ impl FillPlan {
             entries: block
                 .fill
                 .iter()
-                .map(|e| FillCandidate {
-                    script: crate::score::resolve_plugin_path(base_dir, &e.script),
-                    weight: e.weight,
-                    when: e.when.clone(),
-                    min_gap_ms: e.min_gap.map_or(0, |d| d.as_millis() as u64),
-                    max_gap_ms: e.max_gap.map(|d| d.as_millis() as u64),
-                    granted: e.capabilities.clone(),
-                    config: e.config.clone(),
+                .filter_map(|e| {
+                    let source = match (&e.script, &e.pool) {
+                        (Some(script), None) => CandidateSource::Script {
+                            script: crate::score::resolve_plugin_path(base_dir, script),
+                            granted: e.capabilities.clone(),
+                            config: e.config.clone(),
+                        },
+                        (None, Some(pool)) => CandidateSource::Pool(pool.clone()),
+                        _ => return None,
+                    };
+                    Some(FillCandidate {
+                        source,
+                        weight: e.weight,
+                        when: e.when.clone(),
+                        min_gap_ms: e.min_gap.map_or(0, |d| d.as_millis() as u64),
+                        max_gap_ms: e.max_gap.map(|d| d.as_millis() as u64),
+                    })
                 })
                 .collect(),
         })
@@ -116,6 +148,10 @@ pub struct FillEnv<'a> {
     /// One plan per block index (`ResolvedItem::block`); `None` for a block
     /// that does not align.
     pub plans: Vec<Option<FillPlan>>,
+    /// The items of each pool a `fill:` entry names, keyed by the defining
+    /// block's index and the pool's name, in the order entries read them, each
+    /// with its probed length.
+    pub pools: HashMap<(usize, String), Vec<(ResolvedItem, Duration)>>,
     /// The item map `ctx.next` / `ctx.prev` carry for a programme.
     pub item_map: &'a dyn Fn(&ResolvedItem) -> Map,
 }
@@ -130,6 +166,26 @@ pub struct Laid {
     /// The airings-ledger rows for the bumper segments [`fill_gaps`] inserted,
     /// for the caller to record once the generation is on disk. Empty on input.
     pub bumper_records: Vec<PlayRecord>,
+}
+
+/// Which items of each fill pool the pass has aired, by index into
+/// [`FillEnv::pools`]. An item airs once until every item that fits has aired,
+/// then the pool starts over.
+type PoolUse = HashMap<(usize, String), HashSet<usize>>;
+
+/// What the pass accumulates as it fills gap after gap: the ledger rows for the
+/// bumpers it placed, and which pool items it has aired.
+#[derive(Default)]
+struct PassState {
+    records: Vec<PlayRecord>,
+    used: PoolUse,
+}
+
+/// A bumper script entry as a draw needs it.
+struct ScriptRef<'a> {
+    script: &'a Path,
+    granted: &'a [String],
+    config: Option<&'a serde_json::Value>,
 }
 
 /// One bumper playout item, as the schedule's next entry.
@@ -170,7 +226,7 @@ pub fn fill_gaps(
     // Pass 1, over borrowed items: the pieces that lead item `skip` and the
     // ones that follow each item.
     let mut lead: Vec<Piece> = Vec::new();
-    let mut records: Vec<PlayRecord> = Vec::new();
+    let mut state = PassState::default();
     let mut after: Vec<Vec<Piece>> = (0..n).map(|_| Vec::new()).collect();
     let mut at = start;
     if fill_leading {
@@ -183,7 +239,7 @@ pub fn fill_gaps(
                 None,
                 &laid.items[skip..],
                 first.block,
-                &mut records,
+                &mut state,
             );
             at = advance(at, &lead);
         }
@@ -204,7 +260,7 @@ pub fn fill_gaps(
                 Some(item),
                 laid.items.get(i + 1..).unwrap_or_default(),
                 item.block,
-                &mut records,
+                &mut state,
             );
             at = advance(at, &after[i]);
         }
@@ -219,7 +275,7 @@ pub fn fill_gaps(
         items: Vec::with_capacity(n),
         durations: Vec::with_capacity(n),
         progress: Vec::with_capacity(n),
-        bumper_records: records,
+        bumper_records: state.records,
     };
     let push = |out: &mut Laid, pieces: Vec<Piece>, state: &Progress| {
         for piece in pieces {
@@ -272,8 +328,9 @@ fn fill_gap(
     prev: Option<&ResolvedItem>,
     ahead: &[ResolvedItem],
     block: usize,
-    records: &mut Vec<PlayRecord>,
+    state: &mut PassState,
 ) -> Vec<Piece> {
+    let PassState { records, used } = state;
     let boundary = boundary_at_or_after(at, plan.every, env.tz);
     // A generation's next start is summed in a different order than the walk
     // that landed on the line, so it can sit a few nanoseconds past it. That is
@@ -329,6 +386,12 @@ fn fill_gap(
             .iter()
             .filter(|e| remaining_ms >= e.min_gap_ms)
             .filter(|e| when_holds(e, remaining_ms, prev_map.as_ref(), next_map.as_ref(), env))
+            .filter(|e| match &e.source {
+                CandidateSource::Script { .. } => true,
+                CandidateSource::Pool(name) => !pool_picks(env, plan, block, name, remaining, used)
+                    .0
+                    .is_empty(),
+            })
             .collect();
         if admitted.is_empty() {
             tracing::warn!(
@@ -349,8 +412,33 @@ fn fill_gap(
         let pool = if last_draw { &covering } else { &admitted };
         let order = weighted_order(pool, crate::pattern::mix_seed(seed, u64::from(draw)));
 
+        // A pool entry airs whole items and leaves the rest of the gap to the
+        // next draw; the admission filter above already proved one fits.
+        if let Some(CandidateSource::Pool(name)) = order.first().map(|c| &c.source) {
+            let before = pieces.len();
+            pieces.extend(take_pool_items(
+                env, plan, block, name, remaining, cursor, draw, used,
+            ));
+            let moved = advance(cursor, &pieces[before..]);
+            if moved <= cursor {
+                pieces.push(black_piece(env, block, cursor, remaining, "empty_draw"));
+                break;
+            }
+            cursor = moved;
+            draw += 1;
+            continue;
+        }
+
         let mut chosen: Option<Drawn> = None;
         for cand in order {
+            let CandidateSource::Script {
+                script,
+                granted,
+                config,
+            } = &cand.source
+            else {
+                continue;
+            };
             let draw_ms = if last_draw {
                 remaining_ms
             } else {
@@ -358,7 +446,11 @@ fn fill_gap(
             };
             let drawn = draw_one(
                 env,
-                cand,
+                &ScriptRef {
+                    script,
+                    granted,
+                    config: config.as_ref(),
+                },
                 draw_ms,
                 draw,
                 &Around {
@@ -423,6 +515,91 @@ fn fill_gap(
     pieces
 }
 
+/// The pool items a pool entry would air in a gap of `remaining`, as indexes
+/// into the pool, and whether the pool starts over to find them. Items are
+/// taken in the pool's order while each leaves at least `min_fill` of the gap,
+/// and the scan goes on past an item that does not fit, so a short behind a long
+/// film still airs. Every item that fits the gap and has not aired in this pass
+/// comes first; when none has, the pool starts over with all of them.
+fn pool_picks(
+    env: &FillEnv<'_>,
+    plan: &FillPlan,
+    block: usize,
+    name: &str,
+    remaining: time::Duration,
+    used: &PoolUse,
+) -> (Vec<usize>, bool) {
+    let Some(items) = env.pools.get(&(block, name.to_string())) else {
+        return (Vec::new(), false);
+    };
+    let aired = used.get(&(block, name.to_string()));
+    let scan = |skip: Option<&HashSet<usize>>| {
+        let mut left = remaining;
+        let mut picks = Vec::new();
+        for (i, (_, length)) in items.iter().enumerate() {
+            if skip.is_some_and(|s| s.contains(&i)) {
+                continue;
+            }
+            let length = time::Duration::seconds_f64(length.as_secs_f64());
+            if length > time::Duration::ZERO && length + plan.min_fill <= left {
+                picks.push(i);
+                left -= length;
+            }
+        }
+        picks
+    };
+    let fresh = scan(aired);
+    if !fresh.is_empty() || aired.is_none_or(HashSet::is_empty) {
+        return (fresh, false);
+    }
+    (scan(None), true)
+}
+
+/// Air the items [`pool_picks`] chose, back to back from `cursor`.
+#[allow(clippy::too_many_arguments)]
+fn take_pool_items(
+    env: &FillEnv<'_>,
+    plan: &FillPlan,
+    block: usize,
+    name: &str,
+    remaining: time::Duration,
+    cursor: OffsetDateTime,
+    draw: u32,
+    used: &mut PoolUse,
+) -> Vec<Piece> {
+    let (picks, wrapped) = pool_picks(env, plan, block, name, remaining, used);
+    let key = (block, name.to_string());
+    let aired = used.entry(key.clone()).or_default();
+    if wrapped {
+        aired.clear();
+    }
+    let items = &env.pools[&key];
+    let mut at = cursor;
+    let mut pieces = Vec::with_capacity(picks.len());
+    for i in picks {
+        let (item, length) = &items[i];
+        aired.insert(i);
+        tracing::info!(
+            event = "bumper.fill_pool",
+            channel = %env.channel.name,
+            pool = name,
+            entry = %item.id,
+            at = %at,
+            gap_ms = round_ms(remaining),
+            draw = draw,
+            length_ms = length.as_millis() as u64,
+            wrapped = wrapped,
+            "filled part of a gap with a pool item",
+        );
+        at += time::Duration::seconds_f64(length.as_secs_f64());
+        pieces.push(Piece {
+            item: item.duplicate(),
+            duration: *length,
+        });
+    }
+    pieces
+}
+
 /// One script's built and fitted timeline.
 struct Drawn {
     script: PathBuf,
@@ -440,35 +617,40 @@ struct Around<'a> {
 
 fn draw_one(
     env: &FillEnv<'_>,
-    cand: &FillCandidate,
+    entry: &ScriptRef<'_>,
     gap_ms: u64,
     draw: u32,
     around: &Around<'_>,
     air_date: &str,
     pass: &[PlayRecord],
 ) -> Drawn {
+    let ScriptRef {
+        script,
+        granted,
+        config,
+    } = *entry;
     let input = BumperInput {
         gap_ms,
         next: around.next.cloned(),
         prev: around.prev.cloned(),
         upcoming: around.upcoming.to_vec(),
-        config: cand.config.clone(),
+        config: config.cloned(),
         channel: env.channel.clone(),
         air_date: air_date.to_string(),
         draw,
-        granted: cand.granted.clone(),
+        granted: granted.to_vec(),
         history: env.history.clone(),
         pass: pass.to_vec(),
         catalog_path: env.catalog_path.clone(),
     };
-    let (built, error) = build_or_black(&cand.script, &input);
+    let (built, error) = build_or_black(script, &input);
     let resolved = match fit(&built.timeline, gap_ms, FILL_FPS) {
         Ok(r) => Some(r),
         Err(e) => {
             tracing::warn!(
                 event = "bumper.fit_failed",
                 channel = %env.channel.name,
-                script = %cand.script.display(),
+                script = %script.display(),
                 gap_ms = gap_ms,
                 error = %e,
                 "a bumper timeline did not fit its gap; airing black for it",
@@ -477,7 +659,7 @@ fn draw_one(
         }
     };
     Drawn {
-        script: cand.script.clone(),
+        script: script.to_path_buf(),
         timeline: built.timeline,
         resolved,
         error: error.map(|e| e.to_string()),
@@ -572,7 +754,7 @@ fn when_holds(
             tracing::warn!(
                 event = "bumper.when_failed",
                 channel = %env.channel.name,
-                script = %cand.script.display(),
+                script = %cand.label(),
                 when = %src,
                 error = %e,
                 "a fill entry's `when` did not evaluate; skipping the entry",
@@ -778,13 +960,15 @@ fn build(ctx) {
 
     fn cand(script: &Path) -> FillCandidate {
         FillCandidate {
-            script: script.to_path_buf(),
+            source: CandidateSource::Script {
+                script: script.to_path_buf(),
+                granted: vec![],
+                config: None,
+            },
             weight: 1,
             when: None,
             min_gap_ms: 0,
             max_gap_ms: None,
-            granted: vec![],
-            config: None,
         }
     }
 
@@ -837,6 +1021,17 @@ fn build(ctx) {
         leading: bool,
         kind: &dyn Fn(&ResolvedItem) -> Map,
     ) -> Laid {
+        run_with_pools(plan, laid, start, leading, kind, HashMap::new())
+    }
+
+    fn run_with_pools(
+        plan: FillPlan,
+        laid: Laid,
+        start: OffsetDateTime,
+        leading: bool,
+        kind: &dyn Fn(&ResolvedItem) -> Map,
+        pools: HashMap<(usize, String), Vec<(ResolvedItem, Duration)>>,
+    ) -> Laid {
         let root = Path::new(".");
         let env = FillEnv {
             channel: ChannelInfo {
@@ -848,6 +1043,7 @@ fn build(ctx) {
             history: None,
             catalog_path: None,
             plans: vec![Some(plan)],
+            pools,
             item_map: kind,
         };
         fill_gaps(&env, laid, 0, start, leading, &Progress::default())
@@ -1095,8 +1291,11 @@ fn build(ctx) {
             .join("../../examples/plugins/trailer-bumper.rhai");
         let only_trailer = FillCandidate {
             weight: 100_000,
-            granted: vec!["http".into()],
-            config: Some(serde_json::json!({ "mode": "next" })),
+            source: CandidateSource::Script {
+                script: trailer.clone(),
+                granted: vec!["http".into()],
+                config: Some(serde_json::json!({ "mode": "next" })),
+            },
             ..cand(&trailer)
         };
         let out = run(
@@ -1186,6 +1385,7 @@ fn build(ctx) {
             history: None,
             catalog_path: None,
             plans: vec![None],
+            pools: HashMap::new(),
             item_map: &plain,
         };
         let out = fill_gaps(
@@ -1232,5 +1432,135 @@ fn build(ctx) {
         let a = out.items.iter().position(|i| i.id == "a").unwrap();
         assert_eq!(walk[a].0, datetime!(2026-10-17 20:30 UTC));
         assert!(a >= 1);
+    }
+
+    fn shorts(items: &[(&str, u64)]) -> HashMap<(usize, String), Vec<(ResolvedItem, Duration)>> {
+        HashMap::from([(
+            (0, "shorts".to_string()),
+            items
+                .iter()
+                .map(|(id, m)| (programme(id), mins(*m)))
+                .collect(),
+        )])
+    }
+
+    fn pool_entry() -> FillCandidate {
+        FillCandidate {
+            source: CandidateSource::Pool("shorts".into()),
+            // Heavy enough that the weighted draw picks the pool whenever it is
+            // a candidate, so these tests read the pool's behaviour alone.
+            weight: 1_000_000,
+            when: None,
+            min_gap_ms: 0,
+            max_gap_ms: None,
+        }
+    }
+
+    fn ids(items: &[ResolvedItem]) -> Vec<&str> {
+        items.iter().map(|i| i.id.as_str()).collect()
+    }
+
+    #[test]
+    fn a_pool_entry_airs_the_items_that_fit_then_bumpers_to_the_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let loopy = script(dir.path(), "loopy.rhai", LOOPY);
+        let start = datetime!(2026-10-17 20:00 UTC);
+        let out = run_with_pools(
+            plan(vec![pool_entry(), cand(&loopy)]),
+            laid(&[("a", mins(10)), ("b", mins(30))]),
+            start,
+            false,
+            &plain,
+            shorts(&[("long", 25), ("s12", 12), ("s6", 6)]),
+        );
+
+        let gap = between(&out, "a", "b");
+        assert_eq!(
+            ids(&gap[..2]),
+            ["s12", "s6"],
+            "the 25-minute one never fits"
+        );
+        assert!(gap[..2].iter().all(|i| i.bumper.is_none()), "programmes");
+        assert!(gap[2..].iter().all(|i| i.bumper.is_some()), "bumpers after");
+        assert_eq!(gap_length(&out, "a", "b"), mins(20));
+        let walk = spans(&out, start);
+        let (b_at, _) = walk[out.items.iter().position(|i| i.id == "b").unwrap()];
+        assert_eq!(b_at, datetime!(2026-10-17 20:30 UTC));
+        assert!(
+            out.bumper_records
+                .iter()
+                .all(|r| r.entry_id != "s12" && r.entry_id != "s6"),
+            "pool items are programmes, not bumper rows"
+        );
+    }
+
+    #[test]
+    fn a_pool_with_nothing_that_fits_falls_through_to_the_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let loopy = script(dir.path(), "loopy.rhai", LOOPY);
+        let out = run_with_pools(
+            plan(vec![pool_entry(), cand(&loopy)]),
+            laid(&[("a", mins(10)), ("b", mins(30))]),
+            datetime!(2026-10-17 20:00 UTC),
+            false,
+            &plain,
+            shorts(&[("long", 25), ("exact", 20)]),
+        );
+        let gap = between(&out, "a", "b");
+        assert!(!gap.is_empty() && gap.iter().all(|i| i.bumper.is_some()));
+        assert_eq!(gap_length(&out, "a", "b"), mins(20));
+    }
+
+    #[test]
+    fn a_pool_item_airs_once_per_pass_until_none_that_fits_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let loopy = script(dir.path(), "loopy.rhai", LOOPY);
+        let out = run_with_pools(
+            plan(vec![pool_entry(), cand(&loopy)]),
+            laid(&[
+                ("x", mins(20)),
+                ("y", mins(20)),
+                ("z", mins(20)),
+                ("w", mins(30)),
+            ]),
+            datetime!(2026-10-17 20:00 UTC),
+            false,
+            &plain,
+            shorts(&[("a", 6), ("b", 6)]),
+        );
+        let first = |from: &str, to: &str| {
+            between(&out, from, to)
+                .iter()
+                .find(|i| i.bumper.is_none())
+                .map(|i| i.id.clone())
+        };
+        assert_eq!(first("x", "y").as_deref(), Some("a"));
+        assert_eq!(first("y", "z").as_deref(), Some("b"));
+        assert_eq!(
+            first("z", "w").as_deref(),
+            Some("a"),
+            "starts over once both aired"
+        );
+    }
+
+    #[test]
+    fn a_pool_entry_below_its_min_gap_is_not_a_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let loopy = script(dir.path(), "loopy.rhai", LOOPY);
+        let out = run_with_pools(
+            plan(vec![
+                FillCandidate {
+                    min_gap_ms: 10 * 60_000,
+                    ..pool_entry()
+                },
+                cand(&loopy),
+            ]),
+            laid(&[("a", mins(22)), ("b", mins(30))]),
+            datetime!(2026-10-17 20:00 UTC),
+            false,
+            &plain,
+            shorts(&[("s6", 6)]),
+        );
+        assert!(between(&out, "a", "b").iter().all(|i| i.bumper.is_some()));
     }
 }

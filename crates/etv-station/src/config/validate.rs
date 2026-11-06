@@ -1082,7 +1082,16 @@ fn validate_fill(
         ));
     }
     for (n, entry) in include.fill.iter().enumerate() {
-        let at = format!("fill #{n} ({})", entry.script.display());
+        let at = match (&entry.script, &entry.pool) {
+            (Some(script), None) => format!("fill #{n} ({})", script.display()),
+            (None, Some(pool)) => format!("fill #{n} (pool {pool:?})"),
+            _ => {
+                return Err(bad(format!(
+                    "fill #{n}: name exactly one of `script:` (a bumper) and `pool:` (a pool of \
+                     this block)"
+                )));
+            }
+        };
         if entry.weight == 0 {
             return Err(bad(format!("{at}: weight must be at least 1")));
         }
@@ -1099,9 +1108,29 @@ fn validate_fill(
             cel::Program::compile(when)
                 .map_err(|e| bad(format!("{at}: `when` is not valid CEL: {e}")))?;
         }
-        let script = crate::score::resolve_plugin_path(base_dir, &entry.script);
-        crate::bumper::hook::validate_script(&script, &entry.capabilities)
-            .map_err(|e| bad(format!("{at}: {e}")))?;
+        if let Some(script) = &entry.script {
+            let script = crate::score::resolve_plugin_path(base_dir, script);
+            crate::bumper::hook::validate_script(&script, &entry.capabilities)
+                .map_err(|e| bad(format!("{at}: {e}")))?;
+        }
+        if let Some(pool) = &entry.pool {
+            if !entry.capabilities.is_empty() || entry.config.is_some() {
+                return Err(bad(format!(
+                    "{at}: `capabilities:` and `config:` belong to a bumper script, not a pool"
+                )));
+            }
+            if !include.pools.iter().any(|p| &p.name == pool) {
+                let defined: Vec<&str> = include.pools.iter().map(|p| p.name.as_str()).collect();
+                return Err(bad(format!(
+                    "{at}: this block defines no pool named {pool:?} (it defines: {})",
+                    if defined.is_empty() {
+                        "none".to_string()
+                    } else {
+                        defined.join(", ")
+                    }
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -3161,7 +3190,8 @@ fn capabilities() { [] }
         )
         .unwrap();
         let entry = |script: &str| FillEntry {
-            script: script.into(),
+            script: Some(script.into()),
+            pool: None,
             weight: 1,
             when: None,
             min_gap: None,
@@ -3211,6 +3241,48 @@ fn capabilities() { [] }
             check(half_hour, vec![backwards])
                 .unwrap_err()
                 .contains("exceeds max_gap")
+        );
+        let pool_entry = |name: &str| FillEntry {
+            script: None,
+            pool: Some(name.into()),
+            ..entry("bumper.rhai")
+        };
+        let with_pool = |entry: FillEntry| -> Result<(), String> {
+            let mut block = inline_block(vec![]);
+            block.align = half_hour;
+            block.fill = vec![entry];
+            block.pools = vec![pool("movie")];
+            let bad = |message: String| ConfigError::Validation {
+                path: PathBuf::from("c.yaml"),
+                message,
+            };
+            validate_fill(&block, dir.path(), &bad).map_err(|e| e.to_string())
+        };
+        assert!(with_pool(pool_entry("movie")).is_ok());
+        let missing = with_pool(pool_entry("shorts")).unwrap_err();
+        assert!(
+            missing.contains("pool \"shorts\"")
+                && missing.contains("defines no pool named")
+                && missing.contains("movie"),
+            "msg = {missing}"
+        );
+        let mut both = pool_entry("movie");
+        both.script = Some("bumper.rhai".into());
+        assert!(with_pool(both).unwrap_err().contains("exactly one"));
+        assert!(
+            with_pool(FillEntry {
+                script: None,
+                ..entry("bumper.rhai")
+            })
+            .unwrap_err()
+            .contains("exactly one")
+        );
+        let mut scripted = pool_entry("movie");
+        scripted.config = Some(serde_json::json!({}));
+        assert!(
+            with_pool(scripted)
+                .unwrap_err()
+                .contains("belong to a bumper script")
         );
         let mut broken = entry("bumper.rhai");
         broken.when = Some("next.type ==".into());

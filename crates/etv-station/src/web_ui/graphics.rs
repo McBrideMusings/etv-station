@@ -313,7 +313,10 @@ fn bumper_scripts(lc: &config::LoadedChannel) -> Vec<(PathBuf, config::FillEntry
     let mut out: Vec<(PathBuf, config::FillEntry)> = Vec::new();
     for block in lc.config.rule.all_blocks() {
         for entry in &block.fill {
-            let script = dir.join(&entry.script);
+            let Some(script) = &entry.script else {
+                continue;
+            };
+            let script = dir.join(script);
             if !out.iter().any(|(p, _)| *p == script) {
                 out.push((script, entry.clone()));
             }

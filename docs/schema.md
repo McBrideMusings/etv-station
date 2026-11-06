@@ -108,6 +108,8 @@ fill:
     max_gap: 15s                     # optional: only while the remaining gap is at most this
     capabilities: []                 # what the script's capabilities() declares, exactly
     config: { mode: next }           # optional: handed to the script verbatim as ctx.config
+  - pool: shorts                     # a pool of this same block; its items air as programmes
+    min_gap: 10m                     # weight, when, min_gap and max_gap work as on a script
 ```
 
 After a generation's programmes are laid out and probed, and before they are cut
@@ -125,6 +127,19 @@ evenly and needs a `fill` list; `fill` and `min_fill` need an `align`.
   segment, or flex room up to the gap) is chosen over one that would leave a black
   filler. If none covers it, the draw is any admitted entry, fitted to its
   `max_gap`. An entry with no `max_gap` covers any gap.
+- An entry names exactly one of `script:` and `pool:`. A `pool:` entry names a pool
+  the same block defines under `pools:` (a block that defines no such pool fails
+  the load, naming the block and the pool), resolved like any other pool (`expr`,
+  `plugin`, `groups`, with its own `order` and `constraints`), and it needs no
+  `pattern` step. Drawn for a gap, it airs whole pool items in the pool's order:
+  each item that is no longer than the remaining gap less `min_fill`, scanning on
+  past one that does not fit, until none fits. The scripts fill the rest. A pool
+  with no item that fits is not a candidate for that draw, so the draw falls to the
+  script entries. An item airs once per generation until no unaired item fits,
+  then the pool starts over; an `advance: resume` pool also continues from the
+  airings ledger across generations. These items are programmes: no `bumper:`
+  prefix, a ledger row each, counted by programme no-repeat, and listed in XMLTV.
+  Each logs `event="bumper.fill_pool"`.
 - Each draw logs `event="bumper.fill"` with the channel, script, remaining gap,
   each segment's fitted length and source, and the fallback taken (`none`, or why
   black aired).

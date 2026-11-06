@@ -150,6 +150,169 @@ impl ResolvedItem {
     }
 }
 
+impl ResolvedItem {
+    /// A second copy of this item, for a fill pool item that airs more than
+    /// once. `ProgramMetadata` is an ETV-next type with no `Clone`, so it goes
+    /// through its serde form.
+    pub fn duplicate(&self) -> ResolvedItem {
+        ResolvedItem {
+            id: self.id.clone(),
+            block: self.block,
+            source: self.source.clone(),
+            in_point: self.in_point,
+            out_point: self.out_point,
+            program: self
+                .program
+                .as_ref()
+                .and_then(|p| serde_json::to_value(p).ok())
+                .and_then(|v| serde_json::from_value(v).ok()),
+            catalog_duration: self.catalog_duration,
+            error_card: self.error_card,
+            metadata: self.metadata.clone(),
+            guide: self.guide.clone(),
+            guide_fields: self.guide_fields.clone(),
+            tracks: self.tracks.clone(),
+            selected: self.selected.clone(),
+            bumper: self.bumper.clone(),
+        }
+    }
+}
+
+/// A pool a block's `fill:` entry names, resolved into the items it may air in a
+/// gap, in the order the entry reads them ([`crate::bumper::fill`]).
+#[derive(Debug)]
+pub struct FillPool {
+    /// The `rule` block index (`ResolvedItem::block`) that defines the pool.
+    pub block: usize,
+    pub name: String,
+    pub items: Vec<ResolvedItem>,
+}
+
+/// Resolve every pool a `fill:` entry names. A channel whose fill entries all
+/// name scripts, or that has no catalog, resolves nothing and reads nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_fill_pools(
+    config: &ChannelConfig,
+    path: &Path,
+    catalog: Option<&Catalog>,
+    state: &GenerationState,
+    scoring: &crate::score::ScoreInputs,
+    window_start: OffsetDateTime,
+    score_cache: &mut crate::score::ScoreCache,
+) -> Result<Vec<FillPool>, ConfigError> {
+    let Some(cat) = catalog else {
+        if config
+            .rule
+            .all_blocks()
+            .any(|b| b.fill.iter().any(|e| e.pool.is_some()))
+        {
+            tracing::warn!(
+                event = "fill.pool_no_catalog",
+                channel = %config.name,
+                "a fill entry names a pool but there is no catalog; its gaps fill from the script entries",
+            );
+        }
+        return Ok(Vec::new());
+    };
+    let unsupported = |message: String| ConfigError::Unsupported {
+        path: path.to_path_buf(),
+        message,
+    };
+    let tz = scoring.tz.unwrap_or(time_tz::timezones::db::UTC);
+    let variety = crate::variety::Variety::new(config, tz);
+    let score_env = crate::score::ScoreEnv {
+        inputs: scoring,
+        base_dir: path.parent().unwrap_or_else(|| Path::new(".")),
+    };
+    let channel_guide = config.guide.as_ref().map(|g| &g.text);
+    let mut out = Vec::new();
+    for (idx, block) in config.rule.all_blocks().enumerate() {
+        let mut named: Vec<&str> = block
+            .fill
+            .iter()
+            .filter_map(|e| e.pool.as_deref())
+            .collect();
+        for name in named {
+            if out
+                .iter()
+                .any(|p: &FillPool| p.block == idx && p.name == name)
+            {
+                continue;
+            }
+            let label = config.rule.block_label(idx);
+            let pool = block.pools.iter().find(|p| p.name == name).ok_or_else(|| {
+                unsupported(format!("{label}: fill pool {name:?} is not defined"))
+            })?;
+            let step = block.align.and_then(|a| a.every());
+            // A pool that cannot be read costs its own gap fill, not the
+            // channel's generation: the scripts fill those gaps instead.
+            let ids = match crate::pattern::resolve_fill_pool_ids(
+                cat,
+                pool,
+                &config.groups,
+                block.constraints.as_ref(),
+                state,
+                &variety,
+                window_start,
+                score_env,
+                score_cache,
+            ) {
+                Ok(ids) => ids,
+                Err(m) => {
+                    tracing::warn!(
+                        event = "fill.pool_unresolved",
+                        block = %label,
+                        pool = name,
+                        error = %m,
+                        "a fill pool could not be resolved; its gaps fill from the script entries",
+                    );
+                    continue;
+                }
+            };
+            let guide = GuideConfig::cascade(None, block.guide(), channel_guide);
+            let mut items = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let item = match catalog_item(cat, id, block.program(), guide.as_ref()) {
+                    Ok(item) => item,
+                    Err(m) => {
+                        tracing::warn!(
+                            event = "fill.pool_item_unresolved",
+                            block = %label,
+                            pool = name,
+                            entry = %id,
+                            error = %m,
+                            "a fill pool item could not be read from the catalog; it will not air in a gap",
+                        );
+                        continue;
+                    }
+                };
+                // An item longer than the grid step can never fit a gap, so it
+                // is not probed.
+                let fits = |i: &ResolvedItem| match (i.catalog_duration, step) {
+                    (Some(d), Some(step)) => d <= step,
+                    _ => true,
+                };
+                items.extend(item.filter(|i| !i.error_card && fits(i)).map(|mut i| {
+                    i.block = idx;
+                    i
+                }));
+            }
+            stamp_select(
+                &mut items,
+                "fill:pool",
+                &format!("drawn from pool {name:?} to fill a gap before the next grid line"),
+                None,
+            );
+            out.push(FillPool {
+                block: idx,
+                name: name.to_string(),
+                items,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Flatten a channel's blocks into an ordered item list. `path` is the channel
 /// config path, used only for error messages. `catalog` resolves `query`
 /// entries and non-`manual` order; it may be `None` for a channel that is
@@ -4100,6 +4263,64 @@ mod tests {
         assert!(resume.pool("shows").is_some());
         let next = advance_state(&cat, &GenerationState::empty(), resume, &items);
         assert_eq!(next.cursor.get("show:got").unwrap(), "got-e2");
+    }
+
+    /// A `fill:` entry naming a pool reads that pool's items in its own order,
+    /// from where the ledger says each series stopped, tagged with the block
+    /// that defines it. A script entry resolves nothing.
+    #[test]
+    fn a_fill_pool_resolves_in_pool_order_from_the_ledger_cursor() {
+        use crate::config::{Align, FillEntry};
+        let cat = interleave_catalog();
+        let entry = |pool: Option<&str>, script: Option<&str>| FillEntry {
+            script: script.map(Into::into),
+            pool: pool.map(Into::into),
+            weight: 1,
+            when: None,
+            min_gap: None,
+            max_gap: None,
+            capabilities: vec![],
+            config: None,
+        };
+        let mut block = interleave_block(crate::config::Advance::Resume);
+        block.align = Some(Align::Every(Duration::from_secs(1800)));
+        block.fill = vec![entry(Some("shows"), None), entry(None, Some("b.rhai"))];
+        let cfg = channel(vec![block]);
+        let resolve = |state: &GenerationState| {
+            resolve_fill_pools(
+                &cfg,
+                path(),
+                Some(&cat),
+                state,
+                &Default::default(),
+                t0(),
+                &mut crate::score::ScoreCache::default(),
+            )
+            .unwrap()
+        };
+
+        let fresh = resolve(&GenerationState::empty());
+        assert_eq!(fresh.len(), 1, "only the pool entry names a pool");
+        assert_eq!((fresh[0].block, fresh[0].name.as_str()), (0, "shows"));
+        let ids = |p: &FillPool| p.items.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&fresh[0]),
+            ["got-e1", "got-e2", "got-e3", "got-e4", "inv-e1", "inv-e2"]
+        );
+        assert!(
+            fresh[0]
+                .items
+                .iter()
+                .all(|i| i.block == 0 && i.bumper.is_none())
+        );
+
+        let mut state = GenerationState::empty();
+        state.cursor.insert("show:got".into(), "got-e1".into());
+        assert_eq!(
+            ids(&resolve(&state)[0]),
+            ["got-e2", "got-e3", "got-e4", "got-e1", "inv-e1", "inv-e2"],
+            "the series that aired got-e1 continues at got-e2"
+        );
     }
 
     /// Window continuation with no live cursor: window 2 is generated from

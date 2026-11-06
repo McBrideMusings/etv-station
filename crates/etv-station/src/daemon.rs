@@ -2977,6 +2977,10 @@ fn align_fill(
     channel: &LoadedChannel,
     ctx: StationContext<'_>,
     catalog: Option<&Catalog>,
+    fill_pools: std::collections::HashMap<
+        (usize, String),
+        Vec<(crate::resolve::ResolvedItem, Duration)>,
+    >,
     laid: crate::bumper::fill::Laid,
     skip: usize,
     start: OffsetDateTime,
@@ -3022,6 +3026,7 @@ fn align_fill(
         history: Some(Arc::clone(ctx.history_db)),
         catalog_path: ctx.catalog.map(|c| c.path.clone()),
         plans,
+        pools: fill_pools,
         item_map: &item_map,
     };
     // The state after the last item, which the bumpers after it carry.
@@ -3209,6 +3214,7 @@ async fn pattern_catch_up(
             resume: resume_out,
             progress,
             show_ids,
+            fill_pools,
             ..
         } = generate(
             &env,
@@ -3228,7 +3234,13 @@ async fn pattern_catch_up(
         // Takes the list and hands one back: an unreadable file becomes an
         // on-screen error card of the same length, so the channel keeps its
         // shape instead of failing over one bad file.
-        let (mut items, durations, probe_stats) = cache.resolve_all(items).await?;
+        let pool_keys: Vec<(usize, String)> = fill_pools
+            .iter()
+            .map(|p| (p.block, p.name.clone()))
+            .collect();
+        let (mut items, durations, probe_stats, pool_items) = cache
+            .resolve_all_with(items, fill_pools.into_iter().map(|p| p.items).collect())
+            .await?;
         // A dropped item still counts as consumed: the state entering the next
         // kept item already includes it, so only its own entry goes.
         let progress: Vec<crate::resume::Progress> = progress
@@ -3250,21 +3262,28 @@ async fn pattern_catch_up(
         // Choose each probed file's audio and subtitle streams from the
         // `tracks:` rules (#261). Needs the streams `resolve_all` just read, so
         // it cannot happen at resolve time.
-        let tally = crate::tracks::assign(
-            &mut items,
-            &cache,
-            &crate::tracks::Levels {
-                station: ctx.station_tracks,
-                channel: channel.config.tracks.as_ref(),
-                blocks: channel
-                    .config
-                    .rule
-                    .all_blocks()
-                    .map(|b| b.tracks())
-                    .collect(),
-            },
-            &channel.name,
-        );
+        let levels = crate::tracks::Levels {
+            station: ctx.station_tracks,
+            channel: channel.config.tracks.as_ref(),
+            blocks: channel
+                .config
+                .rule
+                .all_blocks()
+                .map(|b| b.tracks())
+                .collect(),
+        };
+        let tally = crate::tracks::assign(&mut items, &cache, &levels, &channel.name);
+        // A fill pool's items air as programmes, so they choose their audio and
+        // subtitle streams the same way.
+        let fill_pools: std::collections::HashMap<(usize, String), Vec<_>> = pool_keys
+            .into_iter()
+            .zip(pool_items)
+            .map(|(key, list)| {
+                let (mut pool, lengths): (Vec<_>, Vec<_>) = list.into_iter().unzip();
+                crate::tracks::assign(&mut pool, &cache, &levels, &channel.name);
+                (key, pool.into_iter().zip(lengths).collect())
+            })
+            .collect();
         if tally.items > 0 {
             tracing::info!(
                 event = "tracks.assigned",
@@ -3318,6 +3337,7 @@ async fn pattern_catch_up(
             channel,
             ctx,
             catalog.as_ref(),
+            fill_pools,
             crate::bumper::fill::Laid {
                 items,
                 durations,

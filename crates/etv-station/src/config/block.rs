@@ -177,7 +177,7 @@ entries:
         let entry = &block.fill[0];
         assert_eq!(
             entry.script,
-            std::path::PathBuf::from("bumpers/test_card.rhai")
+            Some(std::path::PathBuf::from("bumpers/test_card.rhai"))
         );
         assert_eq!(entry.weight, 3);
         assert_eq!(entry.when.as_deref(), Some(r#"next.type == "movie""#));

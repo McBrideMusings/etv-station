@@ -20,7 +20,7 @@ use crate::catalog::Catalog;
 use crate::config::{ChannelConfig, ScoringConfig};
 use crate::errors::StationError;
 use crate::history::HistoryDb;
-use crate::resolve::{ResolvedItem, resolve_channel_with_cache};
+use crate::resolve::{FillPool, ResolvedItem, resolve_channel_with_cache, resolve_fill_pools};
 use crate::resume::{GenerationState, Progress, ResumeMap};
 use crate::score::ScoreInputs;
 
@@ -88,6 +88,9 @@ pub struct Generation {
     pub show_ids: HashMap<String, String>,
     /// The `ctx.target_count` the scorer was handed.
     pub target_count: usize,
+    /// The pools the blocks' `fill:` entries name, resolved for the align/fill
+    /// pass. Empty for a channel with no pool fill entry.
+    pub fill_pools: Vec<FillPool>,
 }
 
 /// Run one generation covering `from` toward `target`, continuing from
@@ -147,11 +150,25 @@ pub fn generate(
         from,
         score_cache,
     )?;
+    let fill_pools = resolve_fill_pools(
+        config,
+        env.config_path,
+        catalog,
+        &state,
+        &scoring,
+        from,
+        score_cache,
+    )?;
     // The ledger needs each airing's show, and only the catalog knows it. One
-    // query for the whole generation rather than one per item.
+    // query for the whole generation rather than one per item. A fill pool's
+    // items can air in a gap, so they are asked for too.
     let show_ids = match catalog {
         Some(cat) => {
-            let ids: Vec<String> = items.iter().map(|i| i.id.clone()).collect();
+            let ids: Vec<String> = items
+                .iter()
+                .chain(fill_pools.iter().flat_map(|p| &p.items))
+                .map(|i| i.id.clone())
+                .collect();
             cat.show_ids_for(&ids)?
         }
         None => HashMap::new(),
@@ -162,6 +179,7 @@ pub fn generate(
         progress,
         show_ids,
         target_count: scoring.target_count,
+        fill_pools,
     })
 }
 
