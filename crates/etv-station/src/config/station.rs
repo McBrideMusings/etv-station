@@ -139,6 +139,15 @@ pub struct StationConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artwork_cache_dir: Option<String>,
 
+    /// Base URL of a Plex DB-EX server whose released extras the catalog
+    /// ingests (`GET {extras_url}/api/extras/items`). Written as a `${VAR}`
+    /// reference, expanded at load like a pool's datastore path, so the host
+    /// lives in the environment and not in the file. Unset (or blank) means no
+    /// extras: nothing is fetched and no extras entry exists. Each refresh
+    /// follows `catalog_refresh_secs` / `full_sweep_after_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extras_url: Option<String>,
+
     /// Where the chapter renderer's queue and cache live and how large the
     /// cache may grow (`renderer:` in the station config). Unset leaves the
     /// renderer unconfigured: `enqueue` refuses, `render-sidecar` exits, and the

@@ -49,6 +49,13 @@ const META_LAST_PLEX_INGEST: &str = "last_plex_ingest";
 /// forever.
 const META_LAST_PLEX_FULL_INGEST: &str = "last_plex_full_ingest";
 
+/// `catalog_meta` keys for the extras ingest: the unix-seconds start of the last
+/// completed pass, of the last completed *full* pass (the only one that marks
+/// removals), and the opaque cursor Plex DB-EX returned with its last answer.
+const META_LAST_EXTRAS_INGEST: &str = "last_extras_ingest";
+const META_LAST_EXTRAS_FULL_INGEST: &str = "last_extras_full_ingest";
+const META_EXTRAS_CURSOR: &str = "extras_cursor";
+
 /// How many ids may ride in one statement's `IN (…)` list.
 ///
 /// SQLite refuses a statement with more bound variables than its compiled-in
@@ -1570,6 +1577,45 @@ impl Catalog {
     /// Record that a full Plex pass started at `unix_secs`.
     pub fn set_last_plex_full_ingest(&self, unix_secs: i64) -> Result<(), CatalogError> {
         self.set_meta(META_LAST_PLEX_FULL_INGEST, &unix_secs.to_string())
+    }
+
+    /// Unix seconds at which the last completed extras pass started.
+    pub fn last_extras_ingest(&self) -> Result<Option<i64>, CatalogError> {
+        Ok(self
+            .meta(META_LAST_EXTRAS_INGEST)?
+            .and_then(|s| s.parse::<i64>().ok()))
+    }
+
+    /// Unix seconds at which the last completed *full* extras pass started.
+    pub fn last_extras_full_ingest(&self) -> Result<Option<i64>, CatalogError> {
+        Ok(self
+            .meta(META_LAST_EXTRAS_FULL_INGEST)?
+            .and_then(|s| s.parse::<i64>().ok()))
+    }
+
+    /// The cursor Plex DB-EX returned with its last answer, to send back as
+    /// `since`.
+    pub fn extras_cursor(&self) -> Result<Option<String>, CatalogError> {
+        self.meta(META_EXTRAS_CURSOR)
+    }
+
+    /// Record a completed extras pass: when it started, whether it was full,
+    /// and the cursor its answer carried (kept as it was when the answer had
+    /// none).
+    pub fn record_extras_pass(
+        &self,
+        started: i64,
+        full: bool,
+        cursor: Option<&str>,
+    ) -> Result<(), CatalogError> {
+        self.set_meta(META_LAST_EXTRAS_INGEST, &started.to_string())?;
+        if full {
+            self.set_meta(META_LAST_EXTRAS_FULL_INGEST, &started.to_string())?;
+        }
+        if let Some(cursor) = cursor {
+            self.set_meta(META_EXTRAS_CURSOR, cursor)?;
+        }
+        Ok(())
     }
 
     /// Run a query whose rows are a single TEXT column, collecting them in order.

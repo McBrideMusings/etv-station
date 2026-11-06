@@ -4,6 +4,7 @@
 //! [`super::identity`] with ingest-time **path-match inherit**, and writes
 //! `entries` + `entry_sources` (+ external ids / tags) rows.
 
+pub mod extras;
 pub mod fs;
 pub mod plex;
 

@@ -16,6 +16,8 @@ pub enum Source {
     #[default]
     Plex,
     LocalFs,
+    /// A released extra read from Plex DB-EX's HTTP routes.
+    Extras,
 }
 
 impl Source {
@@ -23,6 +25,7 @@ impl Source {
         match self {
             Source::Plex => "plex",
             Source::LocalFs => "local_fs",
+            Source::Extras => "extras",
         }
     }
 }
@@ -39,6 +42,7 @@ impl FromStr for Source {
         match s {
             "plex" => Ok(Source::Plex),
             "local_fs" => Ok(Source::LocalFs),
+            "extras" => Ok(Source::Extras),
             other => Err(format!("unknown source {other:?}")),
         }
     }

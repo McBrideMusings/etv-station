@@ -269,7 +269,8 @@ what it is. The cost: renaming the library in Plex breaks every expression namin
 the old name, with no error — the expression resolves to nothing and the channel
 goes quiet. Items from a source with no library concept (everything the
 filesystem scan writes) have no `library`, so no `item.library == "…"` matches
-them.
+them. A released extra's `library` is the name of its Plex DB-EX extras library
+(`item.library == "Music Videos"`), from the station's [`extras_url`](#station-file).
 
 `fs_dir` is the immediate folder a file sits in — `item.fs_dir == "bumpers"`
 selects everything under a folder named `bumpers`, which is how a filesystem-only
@@ -728,6 +729,7 @@ identity_roots:
 catalog_path: /var/lib/etv-station/catalog.db   # optional — enables query channels
 catalog_refresh_secs: 900      # optional — trust the catalog this long without asking Plex
 full_sweep_after_secs: 86400   # optional — force a full (deletion-catching) re-read this often
+extras_url: "${PLEXDB_EX_URL}" # optional — Plex DB-EX server whose released extras the catalog ingests
 seed: 1138                     # optional — every channel with no seed: of its own inherits this, salted per channel
 temperature: 0                 # optional — every channel with no temperature: of its own inherits this
 ```
@@ -750,6 +752,7 @@ temperature: 0                 # optional — every channel with no temperature:
 | `hooks` | no — default empty | list of [event hooks](#event-hooks) that run for the whole station |
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
+| `extras_url` | no — default unset | base URL of a Plex DB-EX server, written as a `${VAR}` reference expanded at load (an unset variable fails the load, as a datastore path does). Each catalog refresh reads `GET {extras_url}/api/extras/items` — the whole listing on a full pass, `?since=<cursor>` on a delta — and writes every released extra with a live primary file as an entry: `entry_id` is the store's `item_id`, `library` its library's name, `type` the library's declared type, plus `title`, `year`, `duration_ms` and one `extras` source holding the primary path. The pass follows `catalog_refresh_secs` and `full_sweep_after_secs`, aged from its own last pass. Only a full read marks an extra that stopped being listed (or lost its file) missing; a Plex DB-EX that cannot be reached leaves the catalog as it is. Nothing of Plex DB-EX is compiled in. Unset fetches nothing. |
 | `idle_grace_seconds` | no — default `90` | seconds a channel's worker stays warm after its last viewer leaves, so surfing back to it skips the cold start. Written into every `channelN.json`; ETV-next's worker reads it. `90` is also the floor — a smaller value is raised to it, because the overlay renderer exits after 60s without a reader and must stay under the worker's lifetime. A warm channel keeps its ffmpeg encoding for nobody, so raise it only as far as the encoder has headroom. |
 | `prewarm` | no — default `false` | when `true`, ETV-next starts every channel's worker within about 20s of startup and respawns any that exit (a channel in failure backoff waits for it to clear), and the worker never idles out — `idle_grace_seconds` is overridden, so the first tune of an unwatched channel returns at once instead of after the ~15s cold start (Plex's Live TV transcoder gives up at ~12.8s). Written as `server.prewarm` in the rendered `lineup.json`. Costs one continuous transcode per channel regardless of viewers, so leave it off unless the encoder has headroom for every channel at once. |
 | `ffmpeg_profiles` | no | map of name → encoding picture — see [FFmpeg profiles](#ffmpeg-profiles) |

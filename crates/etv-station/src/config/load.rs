@@ -236,6 +236,9 @@ fn load_with(
         overrides("ETV_STATION_IDENTITY_ROOTS"),
         overrides("ETV_STATION_ARTWORK_CACHE"),
     );
+    if let Some(url) = &mut station.extras_url {
+        *url = expand_env(url, station_path, refs)?;
+    }
     validate::validate_station(station_path, &station)?;
 
     let base = station_path
@@ -1645,6 +1648,7 @@ mod tests {
             identity_roots: vec![],
             catalog_path: None,
             artwork_cache_dir: None,
+            extras_url: None,
             renderer: Default::default(),
             catalog_refresh_secs: 900,
             full_sweep_after_secs: 86_400,

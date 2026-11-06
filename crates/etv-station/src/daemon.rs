@@ -649,7 +649,7 @@ async fn refresh_catalog(
     Ok(())
 }
 
-/// Run one ingest pass — local filesystem, then Plex, then the artwork-cache
+/// Run one ingest pass — local filesystem, Plex, released extras, then the artwork-cache
 /// reconcile — over `catalog`, and hand the handle back.
 ///
 /// Takes and returns the handle rather than borrowing it because the Plex
@@ -662,7 +662,7 @@ async fn refresh_catalog(
 /// by [`refresh_catalog`]. It is the only thing in this process that writes the
 /// catalog.
 ///
-/// Returns `None` when `cancel` fired while the Plex pass was running: the
+/// Returns `None` when `cancel` fired while the Plex or extras pass was running: the
 /// blocking thread still owns the handle and is abandoned, not waited for (a
 /// stalled response would otherwise hold shutdown for the whole HTTP timeout).
 /// Nothing it wrote is partial — the write pass is one transaction — and the
@@ -809,6 +809,85 @@ async fn ingest_catalog(
                     }
                     Err(e) => {
                         tracing::error!(event = "catalog.ingest.plex_failed", error = %e, "plex catalog ingest failed; continuing")
+                    }
+                }
+            }
+        }
+    }
+
+    // Released extras from Plex DB-EX, when `extras_url` names one. Same
+    // schedule as the Plex pass (own timestamps: the two sources age apart),
+    // same failure rule: an unreachable server is logged and the catalog keeps
+    // what it has.
+    if let Some(extras_url) = station
+        .station
+        .extras_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let plan = match kind {
+            RefreshKind::Forced => PlexIngestPlan::Full,
+            RefreshKind::Scheduled => plex_ingest_plan(
+                catalog.last_extras_ingest()?,
+                catalog.last_extras_full_ingest()?,
+                now,
+                station.station.catalog_refresh_secs,
+                station.station.full_sweep_after_secs,
+            ),
+        };
+        match plan {
+            PlexIngestPlan::Skip { age_secs } => tracing::info!(
+                event = "catalog.ingest.extras_skipped",
+                age_secs = age_secs,
+                refresh_secs = station.station.catalog_refresh_secs,
+                "extras are younger than catalog_refresh_secs; reusing them without contacting plex-db-ex",
+            ),
+            plan => {
+                let full = plan.since().is_none();
+                let mode = if full { "full" } else { "delta" };
+                let url = extras_url.to_string();
+                let started = std::time::Instant::now();
+                let thread_cancel = cancel.clone();
+                let mut task = tokio::task::spawn_blocking(move || {
+                    let result = crate::catalog::ingest::extras::ingest(
+                        &catalog,
+                        &url,
+                        full,
+                        &thread_cancel,
+                    );
+                    (catalog, result)
+                });
+                let (returned, ingested) = select! {
+                    joined = &mut task => joined.expect("extras ingest task panicked"),
+                    _ = cancel.cancelled() => {
+                        tracing::warn!(
+                            event = "catalog.ingest.extras_cancelled",
+                            mode,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "shutdown during the extras ingest; abandoning the pass without waiting for it",
+                        );
+                        return Ok(None);
+                    }
+                };
+                catalog = returned;
+                match ingested {
+                    Ok(stats) => tracing::info!(
+                        event = "catalog.ingest.extras",
+                        mode,
+                        entries = stats.entries_written,
+                        sources = stats.sources_written,
+                        skipped_missing = stats.skipped_missing,
+                        sources_marked_missing = stats.sources_marked_missing,
+                        entries_marked_missing = stats.entries_marked_missing,
+                        "extras catalog ingest complete",
+                    ),
+                    Err(crate::catalog::ingest::extras::ExtrasIngestError::Cancelled) => {
+                        tracing::warn!(event = "catalog.ingest.extras_cancelled", mode)
+                    }
+                    Err(e) => {
+                        tracing::error!(event = "catalog.ingest.extras_failed", error = %e, "extras catalog ingest failed; the catalog keeps what it has")
                     }
                 }
             }
