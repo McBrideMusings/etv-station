@@ -104,6 +104,18 @@ impl ReadRate {
     }
 }
 
+/// The read rate for the live overlay pipe: always wall-clock paced, and with
+/// the main input's initial burst when it has one so the two inputs of the
+/// overlay filter fill their first segments in the same window.
+fn overlay_read_rate(main: ReadRate) -> ReadRate {
+    ReadRate::Realtime {
+        initial_burst: match main {
+            ReadRate::Realtime { initial_burst } => initial_burst,
+            ReadRate::Unthrottled => Duration::ZERO,
+        },
+    }
+}
+
 #[derive(Debug, Copy, Clone)]
 pub struct PtsOffset {
     pub duration: Duration,
@@ -593,9 +605,15 @@ impl Pipeline {
                 // could never repay a shortfall. The writer can keep up, because
                 // it paces to its own wall-clock schedule and writes without
                 // sleeping whenever a slow reader has put it behind.
-                read_rate: ReadRate::Realtime {
-                    initial_burst: Duration::ZERO,
-                },
+                //
+                // The initial burst is the main input's: the overlay filter
+                // emits a frame only once both inputs have one, so a pipe
+                // throttled from its first frame held a cold start's first
+                // segment to 4 s of wall clock even while the main input read
+                // 28 s ahead (a cold `/channel/N.m3u8` of 6.3 s against 2.4 s
+                // without an overlay). The overlay writer fills the same window
+                // unpaced at start, so the pipe holds frames for the burst.
+                read_rate: overlay_read_rate(final_output_settings.read_rate),
             });
 
             let secondary_initial_state = FrameState {
@@ -1128,6 +1146,20 @@ mod tests {
         .as_args();
 
         assert_eq!(args, vec!["-readrate", "1.0", "-readrate_catchup", "1.05"]);
+    }
+
+    #[test]
+    fn overlay_pipe_takes_the_main_inputs_burst_and_is_paced_without_one() {
+        let burst = ReadRate::Realtime {
+            initial_burst: Duration::from_secs(28),
+        };
+        assert_eq!(overlay_read_rate(burst), burst);
+        assert_eq!(
+            overlay_read_rate(ReadRate::Unthrottled),
+            ReadRate::Realtime {
+                initial_burst: Duration::ZERO
+            }
+        );
     }
 
     #[test]
