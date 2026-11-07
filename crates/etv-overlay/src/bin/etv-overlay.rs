@@ -954,6 +954,94 @@ fn die_with_parent() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How much of the overlay stream is written unpaced when a channel is first
+/// tuned: three 4 s HLS segments. ffmpeg encodes no faster than this pipe
+/// supplies frames, so a pipe paced at wall-clock speed from frame one made the
+/// first segment take 4 s of wall clock (a cold `/channel/N.m3u8` of 6.4 s,
+/// past Plex's ~7 s wait once its own startup is counted). Writing this much
+/// ahead lets the encoder run at its own speed through the first segments.
+const START_BURST: Duration = Duration::from_secs(12);
+
+/// Frame clock for the overlay pipe: when each frame is due on the wall clock,
+/// and which moment of the schedule it depicts.
+///
+/// A frame is drawn for the moment it will be seen, not the moment it is
+/// written, so after the start burst the stream stays `lead` ahead of the wall
+/// clock and every frame's time (animation clock, airing program, block) is
+/// `anchor_utc + lead + written / framerate`. The video it is composited onto
+/// is ahead by the same amount, since the encoder reads ahead of wall clock
+/// too.
+struct FramePacer {
+    start: std::time::Instant,
+    anchor: std::time::Instant,
+    anchor_utc: OffsetDateTime,
+    /// How far ahead of `anchor_utc` frame 0 of this reader's stream is drawn.
+    lead: Duration,
+    /// Frames written to this reader since `anchor`, not counting the first.
+    written: u64,
+    /// Frames still allowed through unpaced.
+    burst_frames: u64,
+    framerate: f64,
+}
+
+impl FramePacer {
+    fn new(start: std::time::Instant, now_utc: OffsetDateTime, framerate: f64) -> Self {
+        Self {
+            start,
+            anchor: start,
+            anchor_utc: now_utc,
+            lead: Duration::ZERO,
+            written: 0,
+            burst_frames: (START_BURST.as_secs_f64() * framerate) as u64,
+            framerate,
+        }
+    }
+
+    /// Seconds from the frame clock's zero to the frame about to be drawn.
+    fn offset(&self) -> Duration {
+        self.lead + Duration::from_secs_f64(self.written as f64 / self.framerate)
+    }
+
+    /// The animation clock for the frame about to be drawn.
+    fn time_seconds(&self) -> f64 {
+        (self.anchor - self.start).as_secs_f64() + self.offset().as_secs_f64()
+    }
+
+    /// The schedule moment the frame about to be drawn depicts.
+    fn utc(&self) -> OffsetDateTime {
+        self.anchor_utc + self.offset()
+    }
+
+    fn advance(&mut self) {
+        self.written += 1;
+    }
+
+    /// When the frame just counted by [`Self::advance`] may be written. The
+    /// burst frames are due at once; later ones are due as if the stream had
+    /// started that many frames earlier.
+    fn due(&self) -> std::time::Instant {
+        let paced = self.written.saturating_sub(self.burst_frames);
+        self.anchor + Duration::from_secs_f64(paced as f64 / self.framerate)
+    }
+
+    /// A new reader attached after a gap of unknown length. Pace from now
+    /// without a burst (the channel is already warm), keep whatever lead the
+    /// stream still has so the frame clock never steps back, and drop it
+    /// when the gap was longer than the lead.
+    fn reopened(&mut self, now: std::time::Instant, now_utc: OffsetDateTime) {
+        let next = self.utc();
+        self.lead = if next > now_utc {
+            (next - now_utc).unsigned_abs()
+        } else {
+            Duration::ZERO
+        };
+        self.anchor = now;
+        self.anchor_utc = now_utc;
+        self.written = 0;
+        self.burst_frames = 0;
+    }
+}
+
 fn pipe_to_fifo(
     fifo_path: PathBuf,
     create_fifo: bool,
@@ -1016,7 +1104,7 @@ fn pipe_to_fifo(
     let watch = PhaseWatch::new();
     let heartbeat_path = fifo.path().with_file_name("overlay.heartbeat");
     let watchdog = phase_watchdog::spawn(Arc::clone(&watch), heartbeat_path);
-    let initial_ctx = current_context(program_source.as_mut());
+    let initial_ctx = current_context(program_source.as_mut(), OffsetDateTime::now_utc());
     let first_frame = renderer.render_frame(&engine.evaluate(0.0, 0, &initial_ctx))?;
     tracing::info!(
         warmup_ms = start.elapsed().as_millis() as u64,
@@ -1049,8 +1137,7 @@ fn pipe_to_fifo(
     // so that a multi-second blocking reopen between playout items doesn't make
     // the loop dump a burst of unpaced frames at the freshly-attached reader. On
     // a reopen we re-anchor, resuming at the real frame rate.
-    let mut pace_start = start;
-    let mut paced_frames: u64 = 0;
+    let mut pacer = FramePacer::new(start, OffsetDateTime::now_utc(), framerate);
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             tracing::info!("shutdown requested; stopping overlay pipe");
@@ -1068,7 +1155,7 @@ fn pipe_to_fifo(
         if let Err(e) = timeline_source.refresh() {
             tracing::warn!(error = %e, "overlay timeline refresh failed; keeping the last good config");
         }
-        let wanted = timeline_source.spec_at(OffsetDateTime::now_utc());
+        let wanted = timeline_source.spec_at(pacer.utc());
         if wanted != active_spec.as_ref() {
             match wanted {
                 Some(spec) if spec.geometry() != base.geometry() => {
@@ -1096,9 +1183,9 @@ fn pipe_to_fifo(
             }
         }
 
-        let time_seconds = start.elapsed().as_secs_f64();
+        let time_seconds = pacer.time_seconds();
         watch.enter(Phase::ProgramContext);
-        let ctx = current_context(program_source.as_mut());
+        let ctx = current_context(program_source.as_mut(), pacer.utc());
         watch.enter(Phase::Evaluate);
         // An item that names its own overlay replaces the channel's for as long
         // as it airs; an item that names none leaves the channel overlay alone.
@@ -1112,8 +1199,7 @@ fn pipe_to_fifo(
         match write_frame_resilient(&mut fifo, &frame, &SHUTDOWN, IDLE_TIMEOUT, &watch)? {
             FrameWrite::Written => {}
             FrameWrite::Reopened => {
-                pace_start = std::time::Instant::now();
-                paced_frames = 0;
+                pacer.reopened(std::time::Instant::now(), OffsetDateTime::now_utc());
             }
             FrameWrite::Shutdown => {
                 tracing::info!("shutdown requested; stopping overlay pipe");
@@ -1131,9 +1217,8 @@ fn pipe_to_fifo(
             }
         }
         frame_index += 1;
-        paced_frames += 1;
-        // f64-based offset so a 24/7 daemon doesn't truncate at u32 wrap (~1657 days at 30 fps).
-        let target = pace_start + Duration::from_secs_f64(paced_frames as f64 / framerate);
+        pacer.advance();
+        let target = pacer.due();
         let now = std::time::Instant::now();
         watch.enter(Phase::Pacing);
         if target > now {
@@ -1201,7 +1286,10 @@ fn write_frame_resilient(
 /// stale. Returns [`ProgramContext::unknown`] when no source is configured
 /// or when the refresh itself errors — a transient schedule problem must not
 /// kill the overlay loop.
-fn current_context(source: Option<&mut ProgramContextSource>) -> ProgramContext {
+fn current_context(
+    source: Option<&mut ProgramContextSource>,
+    at: OffsetDateTime,
+) -> ProgramContext {
     let Some(source) = source else {
         return ProgramContext::unknown();
     };
@@ -1212,7 +1300,7 @@ fn current_context(source: Option<&mut ProgramContextSource>) -> ProgramContext 
             "program_context refresh failed; using last-known schedule",
         );
     }
-    source.current_at(OffsetDateTime::now_utc())
+    source.current_at(at)
 }
 
 fn touch(path: &std::path::Path) -> std::io::Result<()> {
@@ -1400,6 +1488,66 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: &[u8]) -> an
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FPS: f64 = 30.0;
+
+    fn pacer() -> (FramePacer, std::time::Instant, OffsetDateTime) {
+        let start = std::time::Instant::now();
+        let utc = OffsetDateTime::UNIX_EPOCH;
+        (FramePacer::new(start, utc, FPS), start, utc)
+    }
+
+    #[test]
+    fn start_burst_frames_are_due_at_once_then_paced_at_the_frame_rate() {
+        let (mut p, start, _) = pacer();
+        for _ in 0..360 {
+            p.advance();
+            assert_eq!(p.due(), start, "burst frame not due immediately");
+        }
+        for _ in 0..30 {
+            p.advance();
+        }
+        assert_eq!(p.due(), start + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn frames_depict_the_moment_they_are_seen_not_the_moment_they_are_written() {
+        let (mut p, _, utc) = pacer();
+        assert_eq!(p.utc(), utc);
+        for _ in 0..360 {
+            p.advance();
+        }
+        assert_eq!(p.utc(), utc + Duration::from_secs(12));
+        assert!((p.time_seconds() - 12.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_new_reader_keeps_the_lead_so_the_frame_clock_never_steps_back() {
+        let (mut p, start, utc) = pacer();
+        for _ in 0..360 {
+            p.advance();
+        }
+        let next = p.utc();
+        p.reopened(start + Duration::from_secs(2), utc + Duration::from_secs(2));
+        assert_eq!(p.utc(), next, "frame clock stepped at the reopen");
+        p.advance();
+        assert_eq!(
+            p.due(),
+            start + Duration::from_secs(2) + Duration::from_secs_f64(1.0 / FPS),
+            "a reopened reader got a second burst",
+        );
+    }
+
+    #[test]
+    fn a_gap_longer_than_the_lead_drops_it() {
+        let (mut p, start, utc) = pacer();
+        for _ in 0..360 {
+            p.advance();
+        }
+        let now_utc = utc + Duration::from_secs(60);
+        p.reopened(start + Duration::from_secs(60), now_utc);
+        assert_eq!(p.utc(), now_utc);
+    }
     use nix::sys::stat::Mode;
     use nix::unistd::mkfifo;
     use std::fs::OpenOptions;
