@@ -195,6 +195,21 @@ impl Reader {
         draw(&results.shots, n, seed)
     }
 
+    /// [`Reader::search_shots`], then [`Reader::draw`] when `draw` names a count: what
+    /// `plexdb-read search` and `plexdb search` both print.
+    pub fn search_drawn(
+        &self,
+        q: &Search<'_>,
+        draw: Option<usize>,
+        seed: u64,
+    ) -> Result<ShotSearch, ReaderError> {
+        let mut found = self.search_shots(q)?;
+        if let Some(n) = draw {
+            found.shots = self.draw(&found, n, seed);
+        }
+        Ok(found)
+    }
+
     /// Every Cut of a title, ascending: scene changes and chapter marks together.
     pub fn cuts(&self, item_id: &str) -> Result<Vec<u64>, ReaderError> {
         self.cut_times(item_id, false)

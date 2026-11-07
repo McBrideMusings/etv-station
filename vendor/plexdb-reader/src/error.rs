@@ -92,4 +92,11 @@ pub enum ReaderError {
 
     #[error("invalid search: {0}")]
     InvalidSearch(String),
+
+    #[error("the stored audio facts for item {item_id} are not valid JSON: {source}")]
+    AudioFacts {
+        item_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
 }

@@ -58,7 +58,7 @@ mod phrase;
 mod schema;
 mod search;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Row};
@@ -281,6 +281,86 @@ impl Reader {
             }
         }
 
+        Ok(by_item)
+    }
+
+    /// The audio facts the analyzer stored for `item_id`, parsed, or `None` when
+    /// no part of the item has been analyzed.
+    ///
+    /// The value is the analyzer's JSON object exactly as `audio_facts.facts`
+    /// holds it; the store never interprets it, and neither does this crate.
+    /// Facts are found through `media_part`, so a part Plex no longer lists is
+    /// never read even while its `audio_part` row lingers. When several parts
+    /// of the item are analyzed, the one with the highest `part_id` (Plex's
+    /// newest) answers.
+    ///
+    /// A stored row that is not valid JSON is a [`ReaderError::AudioFacts`]
+    /// naming the item, never a panic and never a silent `None`.
+    pub fn audio_facts_for(&self, item_id: &str) -> Result<Option<serde_json::Value>, ReaderError> {
+        let facts: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT af.facts \
+                 FROM media_part mp \
+                 JOIN audio_part ap ON ap.part_id = mp.part_id \
+                 JOIN audio_facts af ON af.file_hash = ap.file_hash \
+                 WHERE mp.item_id = ?1 \
+                 ORDER BY mp.part_id DESC \
+                 LIMIT 1",
+                [item_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        facts
+            .map(|text| parse_audio_facts(item_id, &text))
+            .transpose()
+    }
+
+    /// [`Self::audio_facts_for`] for a set of items: a map holding only the
+    /// items that have facts, each resolved exactly as the single-item accessor
+    /// resolves it.
+    ///
+    /// One `SELECT ... WHERE mp.item_id IN (...)` per chunk of ids, chunked
+    /// against this connection's own `SQLITE_LIMIT_VARIABLE_NUMBER` as
+    /// [`Self::enrichment_for_many`] is. A repeated id counts once.
+    pub fn audio_facts_for_many<'a>(
+        &self,
+        item_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<HashMap<String, serde_json::Value>, ReaderError> {
+        let item_ids: Vec<&str> = item_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let max_vars = self
+            .conn
+            .limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER);
+        let chunk_size = usize::try_from(max_vars).unwrap_or(1).max(1);
+
+        let mut by_item = HashMap::new();
+        for chunk in item_ids.chunks(chunk_size) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            // Ascending part_id, so inserting in row order leaves the highest
+            // part's facts in the map.
+            let sql = format!(
+                "SELECT mp.item_id, af.facts \
+                 FROM media_part mp \
+                 JOIN audio_part ap ON ap.part_id = mp.part_id \
+                 JOIN audio_facts af ON af.file_hash = ap.file_hash \
+                 WHERE mp.item_id IN ({placeholders}) \
+                 ORDER BY mp.item_id, mp.part_id"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            for (item_id, text) in rows {
+                let value = parse_audio_facts(&item_id, &text)?;
+                by_item.insert(item_id, value);
+            }
+        }
         Ok(by_item)
     }
 
@@ -762,6 +842,13 @@ impl Reader {
             observed_at: row.get(8)?,
         })
     }
+}
+
+fn parse_audio_facts(item_id: &str, text: &str) -> Result<serde_json::Value, ReaderError> {
+    serde_json::from_str(text).map_err(|source| ReaderError::AudioFacts {
+        item_id: item_id.to_string(),
+        source,
+    })
 }
 
 #[cfg(test)]

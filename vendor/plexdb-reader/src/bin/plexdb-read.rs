@@ -245,15 +245,12 @@ fn search(reader: &Reader, args: &Args) -> Result<String, Failure> {
         weight: args.number("--weight")?,
         temperature: args.number("--temperature")?,
     };
-    let mut found = reader.search_shots(&q)?;
-    match (
-        args.number::<usize>("--draw")?,
-        args.number::<u64>("--seed")?,
-    ) {
-        (Some(n), seed) => found.shots = reader.draw(&found, n, seed.unwrap_or(0)),
-        (None, Some(_)) => return Err(Failure::Usage("--seed needs --draw".into())),
-        (None, None) => {}
+    let draw = args.number::<usize>("--draw")?;
+    let seed = args.number::<u64>("--seed")?;
+    if draw.is_none() && seed.is_some() {
+        return Err(Failure::Usage("--seed needs --draw".into()));
     }
+    let found = reader.search_drawn(&q, draw, seed.unwrap_or(0))?;
     json(&found)
 }
 
