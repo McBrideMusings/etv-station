@@ -614,7 +614,10 @@ fn an_extra_is_searched_by_its_entry_id_and_found_by_it() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    assert!(pool.contains(&"mv-unsteady") && pool.contains(&"mv-weak"), "{pool:?}");
+    assert!(
+        pool.contains(&"mv-unsteady") && pool.contains(&"mv-weak"),
+        "{pool:?}"
+    );
     let (_, plan) = only_plan(&f);
     let ids: Vec<&str> = plan.broll.iter().map(|b| b.entry_id.as_str()).collect();
     assert_eq!(ids, ["mv-unsteady", "mv-weak"]);
