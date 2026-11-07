@@ -100,6 +100,7 @@ pub fn preview(req: &PreviewRequest<'_>) -> Result<Preview, String> {
             history: None,
             pass: Vec::new(),
             catalog_path: None,
+            plexdb_path: None,
         },
     )
     .map_err(|e| e.to_string())?;

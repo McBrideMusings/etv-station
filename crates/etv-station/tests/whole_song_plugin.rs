@@ -64,6 +64,25 @@ fn flat(id: &'static str, bpm: f64) -> Song {
     }
 }
 
+#[path = "support/audio_snapshot.rs"]
+mod audio_snapshot;
+
+/// The plex-db-ex snapshot holding `songs`' audio facts.
+fn snapshot_file(dir: &Path, songs: &[Song]) -> PathBuf {
+    let path = dir.join("plexdb.snapshot.db");
+    let rows: Vec<(&str, Option<String>)> = songs
+        .iter()
+        .map(|s| {
+            let (intro, body) = (s.intro, s.body);
+            let f = facts(s.bpm, s.confidence, |i| if i < 16 { intro } else { body });
+            (s.id, Some(f.to_string()))
+        })
+        .collect();
+    let refs: Vec<(&str, Option<&str>)> = rows.iter().map(|(i, f)| (*i, f.as_deref())).collect();
+    audio_snapshot::write(&path, &refs);
+    path
+}
+
 fn catalog_file(dir: &Path, songs: &[Song]) -> PathBuf {
     let path = dir.join("catalog.db");
     let cat = Catalog::open(&path).unwrap();
@@ -84,16 +103,6 @@ fn catalog_file(dir: &Path, songs: &[Song]) -> PathBuf {
             missing_since: None,
             unairable_reason: None,
         })
-        .unwrap();
-        let (intro, body) = (s.intro, s.body);
-        cat.set_audio_fact(
-            s.id,
-            &playback,
-            "2026-10-25T00:00:00Z",
-            Ok(&facts(s.bpm, s.confidence, |i| {
-                if i < 16 { intro } else { body }
-            })),
-        )
         .unwrap();
     }
     path
@@ -164,6 +173,7 @@ impl Fixture {
             granted: vec!["probe".into(), "catalog_read".into(), "exec".into()],
             history: None,
             catalog_path: Some(catalog_file(self.dir.path(), songs)),
+            plexdb_path: Some(snapshot_file(self.dir.path(), songs)),
         }
     }
 

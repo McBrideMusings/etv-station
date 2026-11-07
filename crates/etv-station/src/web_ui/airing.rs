@@ -207,6 +207,7 @@ mod tests {
             ),
             mcp: None,
             arr: super::arr::ArrEnv::default(),
+            plexdb: None,
             options: Options {
                 station: station_path,
                 catalog: PathBuf::from("/nonexistent/catalog.db"),

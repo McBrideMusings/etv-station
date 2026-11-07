@@ -88,17 +88,6 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         );
         return Ok(());
     }
-    // The audio-fact queue runs on its own thread against the catalog file, so a
-    // library backfill never delays a generation. It runs only when the station
-    // config sets `audio_analysis: true`.
-    if !station.station.audio_analysis {
-        tracing::info!(
-            event = "audio.disabled",
-            "audio analysis is off (station audio_analysis)"
-        );
-    } else if let Some(path) = &station.station.catalog_path {
-        crate::audio::spawn_queue(PathBuf::from(path), signals.cancel.clone());
-    }
     // What the catalog was opened against — the catalog is opened once and NOT
     // reopened on reload (#96), so a later reload that changes these diverges.
     let opened_catalog_path = station.station.catalog_path.clone();
@@ -3016,6 +3005,7 @@ fn align_fill(
         overlay_root: &overlay_root,
         history: Some(Arc::clone(ctx.history_db)),
         catalog_path: ctx.catalog.map(|c| c.path.clone()),
+        plexdb_path: crate::audio_facts::snapshot_path_from_env(),
         plans,
         pools: fill_pools,
         item_map: &item_map,

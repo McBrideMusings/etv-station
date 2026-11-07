@@ -113,6 +113,8 @@ struct AppState {
     mcp: Option<mcp::Mcp>,
     /// Radarr and Sonarr, for the item inspector.
     arr: arr::ArrEnv,
+    /// The plex-db-ex snapshot audio facts are read from (`PLEXDB_SNAPSHOT_PATH`).
+    plexdb: Option<PathBuf>,
 }
 
 /// Listen on `options.bind:options.port` and serve until the process ends.
@@ -165,6 +167,7 @@ pub fn serve(options: Options) -> Result<(), String> {
         options,
         mcp: Some(mcp),
         arr: arr::ArrEnv::from_env(),
+        plexdb: crate::audio_facts::snapshot_path_from_env(),
     };
     run(&server, &mut state);
     Ok(())
@@ -553,6 +556,7 @@ mod tests {
             review: ReviewState::new(station.clone(), PathBuf::from("/nonexistent/catalog.db")),
             mcp: None,
             arr: arr::ArrEnv::default(),
+            plexdb: None,
             options: Options {
                 station,
                 catalog: PathBuf::from("/nonexistent/catalog.db"),
@@ -601,27 +605,27 @@ mod tests {
         assert_eq!(status, 404, "{body}");
     }
 
-    /// `GET /api/audio/{id}` is what `admin facts` prints, and the Health tab's
-    /// audio line counts analyzed entries of the live total.
+    /// `GET /api/audio/{id}` is what `admin facts` prints, and `/api/health/audio`
+    /// is the Health tab's coverage line: entries the snapshot knows, with and
+    /// without facts.
     #[test]
     fn audio_facts_are_served_per_entry_and_counted_for_health() {
         use crate::catalog::{Entry, Source};
         let mut state = example_state();
-        for id in ["a", "b"] {
+        for id in ["a", "b", "c"] {
             state
                 .catalog
                 .upsert_entry(&Entry::new(id, "movie", id, Source::LocalFs))
                 .unwrap();
         }
-        state
-            .catalog
-            .set_audio_fact(
-                "a",
-                "/m/a.mp4",
-                "2026-01-01T00:00:00Z",
-                Ok(&json!({"bpm": 120.0})),
-            )
-            .unwrap();
+        // `c` is in the catalog only.
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("plexdb.snapshot.db");
+        crate::audio_facts::fixture::write(
+            &snapshot,
+            &[("a", Some(r#"{"bpm":120.0}"#)), ("b", None)],
+        );
+        state.plexdb = Some(snapshot.clone());
 
         let (status, body) = get_json(&mut state, "/api/audio/a");
         assert_eq!((status, body["facts"]["bpm"].clone()), (200, json!(120.0)));
@@ -631,9 +635,25 @@ mod tests {
 
         let (_, body) = get_json(&mut state, "/api/health/audio");
         assert_eq!(
-            (body["analyzed"].clone(), body["total"].clone()),
-            (json!(1), json!(2))
+            (
+                body["entries"].clone(),
+                body["in_snapshot"].clone(),
+                body["with_facts"].clone(),
+                body["without_facts"].clone(),
+                body["snapshot"]["path"].clone(),
+            ),
+            (
+                json!(3),
+                json!(2),
+                json!(1),
+                json!(1),
+                json!(snapshot.display().to_string())
+            )
         );
+
+        state.plexdb = None;
+        let (_, body) = get_json(&mut state, "/api/health/audio");
+        assert!(body["problem"].as_str().is_some(), "{body}");
     }
 
     /// `/api/health/renders` reports a queued plan under `queued`, and names
@@ -890,6 +910,7 @@ mod tests {
             review: ReviewState::new(station.clone(), catalog_path.clone()),
             mcp: None,
             arr: arr::ArrEnv::default(),
+            plexdb: None,
             options: Options {
                 station,
                 catalog: catalog_path,

@@ -89,6 +89,7 @@ impl Fixture {
             granted: granted.iter().map(|s| s.to_string()).collect(),
             history: None,
             catalog_path: None,
+            plexdb_path: None,
         }
     }
 

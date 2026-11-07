@@ -65,10 +65,30 @@ const SONGS: &[(&str, f64, &str, &str, f64, i64)] = &[
     ("mv-weak", 120.0, "8A", "A", 1.2, 64),
 ];
 
+#[path = "support/audio_snapshot.rs"]
+mod audio_snapshot;
+
+/// The plex-db-ex snapshot holding the songs' audio facts.
+fn snapshot_file(dir: &Path) -> PathBuf {
+    let path = dir.join("plexdb.snapshot.db");
+    let rows: Vec<(&str, Option<String>)> = SONGS
+        .iter()
+        .enumerate()
+        .map(|(i, (id, bpm, camelot, key, confidence, beats))| {
+            let landing = 8 * (1 + i % 3);
+            let f = facts(*bpm, camelot, key, *confidence, *beats, landing);
+            (*id, Some(f.to_string()))
+        })
+        .collect();
+    let refs: Vec<(&str, Option<&str>)> = rows.iter().map(|(i, f)| (*i, f.as_deref())).collect();
+    audio_snapshot::write(&path, &refs);
+    path
+}
+
 fn catalog_file(dir: &Path) -> PathBuf {
     let path = dir.join("catalog.db");
     let cat = Catalog::open(&path).unwrap();
-    for (i, (id, bpm, camelot, key, confidence, beats)) in SONGS.iter().enumerate() {
+    for (i, (id, ..)) in SONGS.iter().enumerate() {
         let mut e = Entry::new(*id, "movie", format!("Song {id}"), Source::LocalFs);
         e.show = Some(format!("Artist {id}"));
         e.year = Some(1990 + i as i64);
@@ -95,14 +115,6 @@ fn catalog_file(dir: &Path) -> PathBuf {
             missing_since: None,
             unairable_reason: None,
         })
-        .unwrap();
-        let landing = 8 * (1 + i % 3);
-        cat.set_audio_fact(
-            id,
-            &playback,
-            "2026-10-25T00:00:00Z",
-            Ok(&facts(*bpm, camelot, key, *confidence, *beats, landing)),
-        )
         .unwrap();
     }
     path
@@ -178,6 +190,7 @@ impl Fixture {
             history: None,
             pass: Vec::new(),
             catalog_path: Some(catalog_file(self.dir.path())),
+            plexdb_path: Some(snapshot_file(self.dir.path())),
         }
     }
 

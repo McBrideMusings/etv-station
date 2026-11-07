@@ -5,8 +5,8 @@
 #
 # Reads the dashboard's GET /api/audio/{entry_id} through tools/ui-get.sh, so it
 # needs the dashboard running (tools/station-ui.sh locally, the deployed one
-# with --prod). `analyzed: false` means the analyzer has not run on the entry;
-# `error` says why a run failed.
+# with --prod). `analyzed: false` means the plex-db-ex snapshot holds no audio
+# facts for the entry (`harvest-audio` has not analyzed its file).
 set -euo pipefail
 
 [ $# -ge 1 ] || { echo "usage: tools/audio-facts.sh <entry_id> [--prod]" >&2; exit 2; }

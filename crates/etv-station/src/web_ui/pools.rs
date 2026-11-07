@@ -1121,26 +1121,35 @@ pub(super) fn api_search_item(state: &AppState, query: &str) -> Result<(u16, Val
         .catalog
         .search_titles(&q, 30)
         .map_err(|e| e.to_string())?;
+    let ids: Vec<String> = rows.iter().map(|(id, _, _)| id.clone()).collect();
+    let mut facts = match &state.plexdb {
+        Some(snapshot) => crate::audio_facts::facts_for_entries(snapshot, &ids).unwrap_or_default(),
+        None => Default::default(),
+    };
     let results: Vec<Value> = rows
         .into_iter()
         .map(|(id, title, year)| {
-            let audio = audio_facts(state, &id);
+            let audio = facts.remove(&id).unwrap_or(Value::Null);
             json!({ "id": id, "title": title, "year": year, "audio": audio })
         })
         .collect();
     Ok((200, json!({ "results": results })))
 }
 
-/// An entry's stored audio facts (`null` when it has none).
+/// An entry's audio facts from the plex-db-ex snapshot (`null` when it has none
+/// or the snapshot cannot be read).
 fn audio_facts(state: &AppState, entry_id: &str) -> Value {
-    match state.catalog.audio_fact(entry_id) {
-        Ok(Some(row)) => row.facts.unwrap_or(Value::Null),
-        _ => Value::Null,
-    }
+    let Some(snapshot) = &state.plexdb else {
+        return Value::Null;
+    };
+    crate::audio_facts::facts_for_entries(snapshot, &[entry_id.to_string()])
+        .ok()
+        .and_then(|mut facts| facts.remove(entry_id))
+        .unwrap_or(Value::Null)
 }
 
-/// `GET /api/audio/{entry_id}`: the entry's audio row — the same JSON
-/// `admin facts <entry>` prints. 404 when the entry is unknown.
+/// `GET /api/audio/{entry_id}`: the entry's audio facts from the snapshot — the
+/// same JSON `admin facts <entry>` prints. 404 when the entry is unknown.
 pub(super) fn api_audio_fact(state: &AppState, entry_id: &str) -> Result<(u16, Value), String> {
     if state
         .catalog
@@ -1153,44 +1162,19 @@ pub(super) fn api_audio_fact(state: &AppState, entry_id: &str) -> Result<(u16, V
             json!({"error": format!("no catalog entry {entry_id:?}")}),
         ));
     }
-    let row = state
-        .catalog
-        .audio_fact(entry_id)
-        .map_err(|e| e.to_string())?;
+    let facts = audio_facts(state, entry_id);
     Ok((
         200,
-        match row {
-            Some(r) => json!({
-                "entry_id": entry_id,
-                "analyzed": r.facts.is_some(),
-                "source_path": r.source_path,
-                "analyzed_at": r.analyzed_at,
-                "error": r.error,
-                "facts": r.facts,
-            }),
-            None => json!({"entry_id": entry_id, "analyzed": false, "facts": null}),
-        },
+        json!({"entry_id": entry_id, "analyzed": !facts.is_null(), "facts": facts}),
     ))
 }
 
-/// `GET /api/health/audio`: analyzed-of-total and whether the analyzer exists.
+/// `GET /api/health/audio`: how many catalog entries the plex-db-ex snapshot
+/// holds audio facts for, and which snapshot answered.
 pub(super) fn api_health_audio(state: &AppState) -> Result<(u16, Value), String> {
-    let counts = state.catalog.audio_counts().map_err(|e| e.to_string())?;
-    let analyzer = crate::audio::analyzer_status();
-    let missing = analyzer["found"] == json!(false);
     Ok((
         200,
-        json!({
-            "analyzed": counts.analyzed,
-            "failed": counts.failed,
-            "total": counts.total,
-            "analyzer": analyzer,
-            "problem": missing.then(|| format!(
-                "audio analyzer `{}` not found; set {} or install it on PATH",
-                analyzer["program"].as_str().unwrap_or(""),
-                crate::audio::ANALYZER_ENV
-            )),
-        }),
+        crate::audio_facts::coverage(&state.catalog, state.plexdb.as_deref())?,
     ))
 }
 
@@ -1337,6 +1321,7 @@ mod tests {
             review: ReviewState::new(station.clone(), catalog_path.clone()),
             mcp: None,
             arr: super::arr::ArrEnv::default(),
+            plexdb: None,
             options: Options {
                 station,
                 catalog: catalog_path,

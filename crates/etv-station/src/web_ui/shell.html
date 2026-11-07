@@ -1113,7 +1113,9 @@ function audioHint(a) {
 
 function drawAudioHealth(a) {
   if (!a || a.error) return '';
-  const line = `Audio facts: ${esc(a.analyzed)} of ${esc(a.total)} entries analyzed${a.failed ? `, ${esc(a.failed)} failed` : ''}.`;
+  const s = a.snapshot || {};
+  const where = s.path ? ` Snapshot ${esc(s.path)}${s.mtime ? `, written ${bothClocks(s.mtime)}` : ''}.` : '';
+  const line = `Audio facts: ${esc(a.with_facts)} of ${esc(a.in_snapshot)} snapshot entries have them, ${esc(a.without_facts)} do not (${esc(a.entries)} live catalog entries).${where}`;
   return a.problem ? `<div class="notice">${line} ${esc(a.problem)}</div>` : `<p class="muted">${line}</p>`;
 }
 

@@ -261,6 +261,10 @@ pub const MIGRATIONS: &[&str] = &[
     r#"
     DROP TABLE entry_shots;
     "#,
+    // Audio facts come from the plex-db-ex snapshot, not the catalog.
+    r#"
+    DROP TABLE entry_audio;
+    "#,
 ];
 
 /// The version the current binary's schema corresponds to.

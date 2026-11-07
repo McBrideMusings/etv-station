@@ -15,7 +15,6 @@
 //! assert!(cat.entry("imdb:tt0076759").unwrap().is_some());
 //! ```
 
-pub mod audio;
 pub mod error;
 pub mod fields;
 pub mod identity;
@@ -1312,6 +1311,31 @@ impl Catalog {
     /// Every entry id, ascending — a stable enumeration for callers that scan.
     pub fn all_entry_ids(&self) -> Result<Vec<String>, CatalogError> {
         self.query_strings("SELECT entry_id FROM entries ORDER BY entry_id ASC", [])
+    }
+
+    /// Every live entry id (not marked missing), ascending.
+    pub fn live_entry_ids(&self) -> Result<Vec<String>, CatalogError> {
+        self.query_strings(
+            "SELECT entry_id FROM entries WHERE missing_since IS NULL ORDER BY entry_id ASC",
+            [],
+        )
+    }
+
+    /// The entry that plays from `playback_path` (the lowest `entry_id` when
+    /// several do); `None` when no source has that path.
+    pub fn entry_id_for_playback_path(
+        &self,
+        playback_path: &str,
+    ) -> Result<Option<String>, CatalogError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT entry_id FROM entry_sources WHERE playback_path = ?1 \
+                 ORDER BY entry_id LIMIT 1",
+                params![playback_path],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Provenance rows for every requested entry, each list ordered as

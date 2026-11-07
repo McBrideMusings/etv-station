@@ -1,7 +1,7 @@
 # station-align.yaml's twin for the megamix bumper. Run it from the repo root
-# with a catalog that holds analyzed music videos:
-#   ETV_STATION_AUDIO_ANALYZER=tools/audio-analyze.py \
-#     ./target/debug/etv-station --config examples/station-megamix.yaml
+# with a catalog and a plex-db-ex snapshot (PLEXDB_SNAPSHOT_PATH) whose music
+# videos carry audio facts:
+#   ./target/debug/etv-station --config examples/station-megamix.yaml
 # or `STATION_CONFIG=examples/station-megamix.yaml ./tools/dev-run.sh`.
 tz: "America/Chicago"
 

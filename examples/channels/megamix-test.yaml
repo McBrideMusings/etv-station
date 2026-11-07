@@ -4,7 +4,7 @@ name: megamix-test
 # megamix chapters (megamix.rhai). Each music video airs whole, then three or four
 # chapters of 3 to 5 hooks play back to back until the line. A chapter airs its
 # stand-in until the renderer's file lands, so the channel never goes dark.
-# Needs a catalog with audio facts (`ETV_STATION_AUDIO_ANALYZER`) for the pool's
+# Needs a plex-db-ex snapshot with audio facts (`harvest-audio`) for the pool's
 # videos, and the renderer named in station-megamix.yaml. Run it with
 # `STATION_CONFIG=examples/station-megamix.yaml ./tools/dev-run.sh`.
 display_name: "Megamix Test Channel"

@@ -59,4 +59,4 @@ Never ask pierce to paste a prod log; read it over SSH. `UNRAID_HOST` and `UNRAI
 
 Filter one channel or event with `jq` on this machine: `… docker logs --since 1h etv-station 2>&1 | jq -c 'select(.fields.channel=="003-for-madi")'`.
 
-The megamix plugin logs `bumper.catalog` (the pool it read: `expr`, `entries`, `analyzed`), `bumper.catalog_truncated`, `bumper.exec` for each `enqueue` and `ffmpeg` call, and `score.log` lines starting `megamix:` (`pool=… candidates=…`, `chapter=… bpm=… queued=…`, one `seam=` line per hook, `idle …` when no chapter fits). `ui.chapters` is the dashboard's chapter list.
+The megamix plugin logs `bumper.catalog` (the pool it read: `expr`, `entries`, `analyzed`, the entries with audio facts from the snapshot), `audio.snapshot_unset` and `audio.snapshot_unreadable` (a snapshot `audio` could not come from), `bumper.catalog_truncated`, `bumper.exec` for each `enqueue` and `ffmpeg` call, and `score.log` lines starting `megamix:` (`pool=… candidates=…`, `chapter=… bpm=… queued=…`, one `seam=` line per hook, `idle …` when no chapter fits). `ui.chapters` is the dashboard's chapter list.
