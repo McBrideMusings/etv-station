@@ -971,8 +971,11 @@ async fn run_generation(
     // which only wakes already-parked waiters.
     let mut stops: Vec<Arc<Notify>> = Vec::new();
     // The shot-analysis queue: its own catalog handle and its own task, so a
-    // backfill of the whole library never delays a channel's generation.
-    if let Some(info) = catalog {
+    // backfill of the whole library never delays a channel's generation. It
+    // runs only when the station config sets `shot_analysis: true`.
+    if !station.station.shot_analysis {
+        tracing::info!(event = "shots.disabled", "shot analysis is off (station shot_analysis)");
+    } else if let Some(info) = catalog {
         let stop = Arc::new(Notify::new());
         stops.push(stop.clone());
         let path = info.path.clone();

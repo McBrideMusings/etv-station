@@ -255,6 +255,13 @@ pub struct StationConfig {
     #[serde(default)]
     pub guide: StationGuide,
 
+    /// Whether the daemon runs the shot-analysis queue (`crate::shots`), which
+    /// decodes every catalog entry's video to fill `entry_shots`. Unset means
+    /// off: no plugin reads the stored shots, and the pass decodes the whole
+    /// library on every core.
+    #[serde(default)]
+    pub shot_analysis: bool,
+
     /// Seconds a channel's worker stays warm after its last viewer leaves, so
     /// channel-surfing back skips the cold start. Written to every rendered
     /// `channelN.json`. Unset means ETV-next's own 90s, which is also the

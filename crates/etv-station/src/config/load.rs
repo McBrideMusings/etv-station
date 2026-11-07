@@ -1657,6 +1657,7 @@ mod tests {
             ffmpeg: crate::config::station::default_ffmpeg(),
             normalization: crate::config::station::empty_normalization_for_test(),
             guide: Default::default(),
+            shot_analysis: false,
             idle_grace_seconds: None,
             prewarm: false,
             fonts: vec![],
