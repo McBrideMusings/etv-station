@@ -5,8 +5,9 @@ use std::path::Path;
 
 /// Build a plex-db-ex snapshot at `path` holding `items`, each
 /// `(item_id, facts)`: every item gets a `media_part`, and one with `Some`
-/// facts also an `audio_part` and an `audio_facts` row (the v23/v28/v29
-/// shape `Reader::audio_facts_for_many` joins).
+/// facts also an `audio_part` and an `audio_facts` row (the shape
+/// `Reader::audio_facts_for_many` joins), plus the empty extras tables its extras
+/// half reads (v25 `extra_file`, v30 `audio_extra`).
 pub fn write(path: &Path, items: &[(&str, Option<&str>)]) {
     let _ = std::fs::remove_file(path);
     let conn = rusqlite::Connection::open(path).unwrap();
@@ -21,6 +22,10 @@ pub fn write(path: &Path, items: &[(&str, Option<&str>)]) {
          CREATE TABLE audio_facts (file_hash TEXT PRIMARY KEY, facts TEXT NOT NULL,
              analyzed_at TEXT NOT NULL);
          CREATE TABLE audio_part (part_id INTEGER PRIMARY KEY, item_id TEXT NOT NULL,
+             file_hash TEXT NOT NULL);
+         CREATE TABLE extra_file (path TEXT PRIMARY KEY, item_id TEXT NOT NULL,
+             primary_file INTEGER NOT NULL, missing_since TEXT);
+         CREATE TABLE audio_extra (path TEXT PRIMARY KEY, item_id TEXT NOT NULL,
              file_hash TEXT NOT NULL);",
         shape = plexdb_reader::SUPPORTED_READER_SHAPE,
     ))

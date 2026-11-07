@@ -278,6 +278,9 @@ mod tests {
         let body = coverage(&cat, Some(&wrong)).unwrap();
         let problem = body["problem"].as_str().unwrap();
         assert!(problem.contains("reader shape"), "{problem}");
-        assert_eq!(body["snapshot"]["reader_shape"], json!(29));
+        assert_eq!(
+            body["snapshot"]["reader_shape"],
+            json!(plexdb_reader::SUPPORTED_READER_SHAPE)
+        );
     }
 }

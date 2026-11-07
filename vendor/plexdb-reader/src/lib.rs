@@ -294,19 +294,28 @@ impl Reader {
     /// of the item are analyzed, the one with the highest `part_id` (Plex's
     /// newest) answers.
     ///
+    /// An extra (`fs:` item, no Plex part) is found through its primary
+    /// `extra_file` row that is not missing, then `audio_extra`.
+    ///
     /// A stored row that is not valid JSON is a [`ReaderError::AudioFacts`]
     /// naming the item, never a panic and never a silent `None`.
     pub fn audio_facts_for(&self, item_id: &str) -> Result<Option<serde_json::Value>, ReaderError> {
         let facts: Option<String> = self
             .conn
             .query_row(
-                "SELECT af.facts \
-                 FROM media_part mp \
-                 JOIN audio_part ap ON ap.part_id = mp.part_id \
-                 JOIN audio_facts af ON af.file_hash = ap.file_hash \
-                 WHERE mp.item_id = ?1 \
-                 ORDER BY mp.part_id DESC \
-                 LIMIT 1",
+                "SELECT facts FROM ( \
+                   SELECT af.facts AS facts, mp.part_id AS ord \
+                   FROM media_part mp \
+                   JOIN audio_part ap ON ap.part_id = mp.part_id \
+                   JOIN audio_facts af ON af.file_hash = ap.file_hash \
+                   WHERE mp.item_id = ?1 \
+                   UNION ALL \
+                   SELECT af.facts, 0 \
+                   FROM extra_file ef \
+                   JOIN audio_extra ae ON ae.path = ef.path \
+                   JOIN audio_facts af ON af.file_hash = ae.file_hash \
+                   WHERE ef.item_id = ?1 AND ef.primary_file = 1 AND ef.missing_since IS NULL \
+                 ) ORDER BY ord DESC LIMIT 1",
                 [item_id],
                 |row| row.get(0),
             )
@@ -335,7 +344,8 @@ impl Reader {
         let max_vars = self
             .conn
             .limit(rusqlite::limits::Limit::SQLITE_LIMIT_VARIABLE_NUMBER);
-        let chunk_size = usize::try_from(max_vars).unwrap_or(1).max(1);
+        // The query binds each id twice (Plex parts, then extras).
+        let chunk_size = (usize::try_from(max_vars).unwrap_or(2) / 2).max(1);
 
         let mut by_item = HashMap::new();
         for chunk in item_ids.chunks(chunk_size) {
@@ -343,18 +353,27 @@ impl Reader {
             // Ascending part_id, so inserting in row order leaves the highest
             // part's facts in the map.
             let sql = format!(
-                "SELECT mp.item_id, af.facts \
-                 FROM media_part mp \
-                 JOIN audio_part ap ON ap.part_id = mp.part_id \
-                 JOIN audio_facts af ON af.file_hash = ap.file_hash \
-                 WHERE mp.item_id IN ({placeholders}) \
-                 ORDER BY mp.item_id, mp.part_id"
+                "SELECT item_id, facts FROM ( \
+                   SELECT mp.item_id AS item_id, af.facts AS facts, mp.part_id AS ord \
+                   FROM media_part mp \
+                   JOIN audio_part ap ON ap.part_id = mp.part_id \
+                   JOIN audio_facts af ON af.file_hash = ap.file_hash \
+                   WHERE mp.item_id IN ({placeholders}) \
+                   UNION ALL \
+                   SELECT ef.item_id, af.facts, 0 \
+                   FROM extra_file ef \
+                   JOIN audio_extra ae ON ae.path = ef.path \
+                   JOIN audio_facts af ON af.file_hash = ae.file_hash \
+                   WHERE ef.item_id IN ({placeholders}) AND ef.primary_file = 1 \
+                     AND ef.missing_since IS NULL \
+                 ) ORDER BY item_id, ord"
             );
             let mut stmt = self.conn.prepare(&sql)?;
             let rows = stmt
-                .query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
+                .query_map(
+                    rusqlite::params_from_iter(chunk.iter().chain(chunk.iter()).copied()),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             for (item_id, text) in rows {
                 let value = parse_audio_facts(&item_id, &text)?;

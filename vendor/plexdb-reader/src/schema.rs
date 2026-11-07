@@ -34,9 +34,12 @@ use crate::error::ReaderError;
 /// `audio_part` and `media_part` (schema versions 23 and 28), so an older store
 /// is refused at open rather than failing at the accessor.
 ///
+/// Shape 30 makes those accessors also resolve an extra's facts, so the store must
+/// carry `extra_file` and `audio_extra` (schema versions 25 and 30).
+///
 /// This crate's tests do not compile while this constant differs from
 /// `plexdb_schema::READER_SHAPE` (`tests/common/mod.rs`).
-pub const SUPPORTED_READER_SHAPE: i64 = 29;
+pub const SUPPORTED_READER_SHAPE: i64 = 30;
 
 /// Confirm `conn` is a plexdb store whose `reader_shape` is exactly
 /// [`SUPPORTED_READER_SHAPE`].
