@@ -1205,10 +1205,6 @@ exits 1 with "no armed reburst check".
 Run it through the swarm lock in a worker (`swarm heavy -- tools/verify-reburst.sh`): like
 `dev-run.sh` it refuses beside another dev stack. The log is `tmp/verify-reburst.log`.
 
-## Verifying the shot list
-
-Run `cargo test -p etv-station --lib shots::` (needs ffmpeg on PATH; four synthetic-frame tests and three real-file tests). Then, against a running daemon, run `tools/facts.sh <entry_id>` and look for a `shots.shots` array whose first shot has `card: true` on a file with a black lead-in. The log events are `shots.analyzed`, `shots.failed` and `shots.deferred`.
-
 ## Verifying the megamix plugin
 
 Run `cargo test -p etv-station --test megamix_plugin` (seven fixture songs; stub `enqueue` and `ffmpeg`), `cargo test -p etv-station --lib chapters_list` and `cargo test -p etv-station --lib a_chapter_prints_the_seam_notes`. The first expects a plan of 3 to 5 hooks with every semitone shift within 3, every landing within Camelot distance 1 of the chapter key, every hook starting on an 8-bar boundary, `mv-unsteady` and `mv-weak` never chosen, and `enqueue` called with `--air-at 2027-01-15T07:50:00Z`.

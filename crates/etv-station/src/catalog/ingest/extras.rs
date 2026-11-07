@@ -258,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn a_query_on_the_library_name_resolves_released_extras_and_analysis_sees_them() {
+    fn a_query_on_the_library_name_resolves_released_extras() {
         let cat = Catalog::open_in_memory().unwrap();
         write_items(
             &cat,
@@ -273,13 +273,6 @@ mod tests {
             cat.resolve_query(r#"item.library == "Music Videos""#)
                 .unwrap(),
             vec!["x1".to_string(), "x2".to_string()]
-        );
-        assert_eq!(
-            cat.entries_needing_shots().unwrap(),
-            vec![
-                ("x1".to_string(), "/m/a.mkv".to_string()),
-                ("x2".to_string(), "/m/b.mkv".to_string())
-            ]
         );
     }
 

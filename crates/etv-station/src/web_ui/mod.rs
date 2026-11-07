@@ -79,8 +79,8 @@ use health::api_health_channels;
 use lineup::api_lineup;
 use pools::{
     PoolState, api_audio_fact, api_draft_discard, api_draft_edit, api_draft_open, api_health_audio,
-    api_health_shots, api_plex_accounts, api_pools, api_search_item, api_search_keyword,
-    api_search_tag, draft_yaml, scored_channel_count,
+    api_plex_accounts, api_pools, api_search_item, api_search_keyword, api_search_tag, draft_yaml,
+    scored_channel_count,
 };
 use preview::api_preview;
 use rusqlite::{Connection, OpenFlags};
@@ -344,19 +344,6 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
     if *method == Method::Get
         && let Some(id) = path
             .strip_prefix("/api/entries/")
-            .and_then(|rest| rest.strip_suffix("/facts"))
-    {
-        return match crate::shots::entry_facts(&state.catalog, &percent_decode(id)) {
-            Ok(body) => Reply::Json(200, body),
-            Err(e @ crate::shots::FactsError::UnknownEntry(_)) => {
-                Reply::Json(404, json!({ "error": e.to_string() }))
-            }
-            Err(e) => Reply::Json(500, json!({ "error": e.to_string() })),
-        };
-    }
-    if *method == Method::Get
-        && let Some(id) = path
-            .strip_prefix("/api/entries/")
             .and_then(|rest| rest.strip_suffix("/arr"))
     {
         return match state.catalog.entry(&percent_decode(id)) {
@@ -452,7 +439,6 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
         (Method::Get, "/api/health") => Ok(api_health(state)),
         (Method::Get, "/api/health/channels") => api_health_channels(state),
         (Method::Get, "/api/health/audio") => api_health_audio(state),
-        (Method::Get, "/api/health/shots") => api_health_shots(state),
         (Method::Get, "/api/health/renders") => health::api_health_renders(state),
         (Method::Get, "/api/lineup") => api_lineup(state),
         (Method::Get, "/api/search/keyword") => api_search_keyword(state, query),
@@ -607,20 +593,12 @@ mod tests {
         }
     }
 
-    /// An id the catalog lacks is a 404; `/api/health/shots` names the ffmpeg
-    /// the station config selects and whether it exists.
+    /// An id the catalog lacks is a 404.
     #[test]
-    fn entry_facts_and_arr_404_for_an_unknown_entry_and_health_shots_names_both_programs() {
+    fn entry_arr_404s_for_an_unknown_entry() {
         let mut state = example_state();
-        let (status, body) = get_json(&mut state, "/api/entries/nope/facts");
-        assert_eq!(status, 404, "{body}");
         let (status, body) = get_json(&mut state, "/api/entries/nope/arr");
         assert_eq!(status, 404, "{body}");
-        let (status, body) = get_json(&mut state, "/api/health/shots");
-        assert_eq!(status, 200, "{body}");
-        assert_eq!(body["ffmpeg"]["program"], json!("ffmpeg"));
-        assert!(body["ffprobe"]["found"].is_boolean(), "{body}");
-        assert!(body["problems"].is_array(), "{body}");
     }
 
     /// `GET /api/audio/{id}` is what `admin facts` prints, and the Health tab's

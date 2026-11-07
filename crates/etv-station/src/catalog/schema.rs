@@ -228,7 +228,7 @@ pub const MIGRATIONS: &[&str] = &[
     ALTER TABLE entry_sources ADD COLUMN unairable_reason TEXT;
     "#,
     // v12 — the shot list of an entry's video: scene boundaries with mean
-    // luma, motion and a card flag, computed from ffmpeg alone (`crate::shots`).
+    // luma, motion and a card flag, computed from ffmpeg alone.
     // `shots` is a JSON array of `{start, end, luma, motion, card}`. The row
     // records which file it was computed from (`source_path`), so an entry whose
     // live file moved is analyzed again; a file that could not be analyzed
@@ -256,6 +256,10 @@ pub const MIGRATIONS: &[&str] = &[
         error       TEXT,
         facts       TEXT
     );
+    "#,
+    // v16 — the station no longer analyzes shots; plex-db-ex owns them.
+    r#"
+    DROP TABLE entry_shots;
     "#,
 ];
 

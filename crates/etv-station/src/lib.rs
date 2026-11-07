@@ -43,7 +43,6 @@ pub mod rule;
 pub mod scan;
 pub mod score;
 pub mod sequence;
-pub mod shots;
 pub mod simulate;
 pub mod suggest;
 #[cfg(test)]

@@ -92,7 +92,10 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     // library backfill never delays a generation. It runs only when the station
     // config sets `audio_analysis: true`.
     if !station.station.audio_analysis {
-        tracing::info!(event = "audio.disabled", "audio analysis is off (station audio_analysis)");
+        tracing::info!(
+            event = "audio.disabled",
+            "audio analysis is off (station audio_analysis)"
+        );
     } else if let Some(path) = &station.station.catalog_path {
         crate::audio::spawn_queue(PathBuf::from(path), signals.cancel.clone());
     }
@@ -973,24 +976,6 @@ async fn run_generation(
     // (duration probing, catch-up emit) is never lost — unlike `notify_waiters`,
     // which only wakes already-parked waiters.
     let mut stops: Vec<Arc<Notify>> = Vec::new();
-    // The shot-analysis queue: its own catalog handle and its own task, so a
-    // backfill of the whole library never delays a channel's generation. It
-    // runs only when the station config sets `shot_analysis: true`.
-    if !station.station.shot_analysis {
-        tracing::info!(event = "shots.disabled", "shot analysis is off (station shot_analysis)");
-    } else if let Some(info) = catalog {
-        let stop = Arc::new(Notify::new());
-        stops.push(stop.clone());
-        let path = info.path.clone();
-        let ffmpeg = crate::shots::ffmpeg_program(station.station.ffmpeg.ffmpeg_path.as_deref());
-        tracing::info!(
-            event = "shots.ffmpeg",
-            program = %ffmpeg.to_string_lossy(),
-            found = crate::shots::ffmpeg_found(&ffmpeg),
-            "shot analysis will run this ffmpeg",
-        );
-        supervisor_handles.push(tokio::spawn(crate::shots::run_queue(path, ffmpeg, stop)));
-    }
     for idx in 0..station.channels.len() {
         if let Some(ctx) = build_overlay_context(&station.channels[idx], &station.station.fonts) {
             let stop = Arc::new(Notify::new());

@@ -255,13 +255,6 @@ pub struct StationConfig {
     #[serde(default)]
     pub guide: StationGuide,
 
-    /// Whether the daemon runs the shot-analysis queue (`crate::shots`), which
-    /// decodes every catalog entry's video to fill `entry_shots`. Unset means
-    /// off: no plugin reads the stored shots, and the pass decodes the whole
-    /// library on every core.
-    #[serde(default)]
-    pub shot_analysis: bool,
-
     /// Whether the daemon runs the audio-facts queue (`crate::audio`), which
     /// runs `audio-analyze` over each catalog entry to fill `entry_audio`.
     /// Unset means off.
