@@ -89,8 +89,11 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         return Ok(());
     }
     // The audio-fact queue runs on its own thread against the catalog file, so a
-    // library backfill never delays a generation.
-    if let Some(path) = &station.station.catalog_path {
+    // library backfill never delays a generation. It runs only when the station
+    // config sets `audio_analysis: true`.
+    if !station.station.audio_analysis {
+        tracing::info!(event = "audio.disabled", "audio analysis is off (station audio_analysis)");
+    } else if let Some(path) = &station.station.catalog_path {
         crate::audio::spawn_queue(PathBuf::from(path), signals.cancel.clone());
     }
     // What the catalog was opened against — the catalog is opened once and NOT

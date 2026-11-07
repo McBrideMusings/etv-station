@@ -262,6 +262,12 @@ pub struct StationConfig {
     #[serde(default)]
     pub shot_analysis: bool,
 
+    /// Whether the daemon runs the audio-facts queue (`crate::audio`), which
+    /// runs `audio-analyze` over each catalog entry to fill `entry_audio`.
+    /// Unset means off.
+    #[serde(default)]
+    pub audio_analysis: bool,
+
     /// Seconds a channel's worker stays warm after its last viewer leaves, so
     /// channel-surfing back skips the cold start. Written to every rendered
     /// `channelN.json`. Unset means ETV-next's own 90s, which is also the
