@@ -35,19 +35,20 @@
 //!   probed. `tags` is the container's metadata (ComfyUI writes `prompt` and
 //!   `workflow` there), keys lower-cased; each stream map has `index`, `kind`,
 //!   `codec`, `lang`, `width`, `height`, `channels` and its own lower-cased
-//!   `tags`. When the plex-db-ex snapshot holds audio facts for the file, the map also
-//!   has `audio` (`bpm`, `beat_grid`, `downbeat_phase`, `landing_bar`, `key`,
-//!   `scale`, `camelot`, `key_strength`, `beat_confidence`, `bar_energy`,
-//!   `rms_mean`; plex-db-ex's `harvest-audio` writes them); it is absent
-//!   otherwise.
+//!   `tags`. When the plex-db-ex snapshot holds audio facts for the file, the
+//!   map also has `audio` (`bpm`, `beat_grid`, `downbeat_phase`, `landing_bar`,
+//!   `key`, `scale`, `camelot`, `key_strength`, `beat_confidence`,
+//!   `bar_energy`, `rms_mean`; plex-db-ex's `harvest-audio` writes them); it is
+//!   absent otherwise.
 //! - `read` — `ctx.read(path)` returns a UTF-8 text file from the plugin's own
 //!   folder (up to [`READ_LIMIT_BYTES`]), or `()` when it does not exist. A path
 //!   that resolves outside that folder is an error.
 //! - `catalog_read` — `ctx.catalog(expr)` returns the live catalog entries a CEL
 //!   expression matches (the language a pool's `expr` uses) as item maps, the
 //!   ones `ctx.sets` carries, each with `path` (the file it plays from) and
-//!   `audio` (its audio facts from the plex-db-ex snapshot, `()` when it has none), up to
-//!   [`CATALOG_LIMIT`] of them. It reads the catalog and nothing else.
+//!   `audio` (its audio facts from the plex-db-ex snapshot, `()` when it has
+//!   none), up to [`CATALOG_LIMIT`] of them. It reads the catalog and nothing
+//!   else.
 //! - `http` — `ctx.http(url, method, body)` makes one HTTP call through
 //!   [`crate::plugin_http::call`] and returns the response body as text.
 //!   `{{PLEX_URL}}` and `{{PLEX_TOKEN}}` in the URL are filled from the
@@ -243,7 +244,10 @@ pub fn build(script: &Path, input: &BumperInput) -> Result<BuiltTimeline, Bumper
         history: input.history.clone(),
         pass: input.pass.clone(),
         catalog_path: input.catalog_path.clone(),
-        plexdb_path: input.plexdb_path.clone(),
+        snapshot: input
+            .plexdb_path
+            .clone()
+            .map(|p| Arc::new(crate::audio_facts::SnapshotReader::new(p))),
         channel: input.channel.name.clone(),
         budget: crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET),
         tz: input.channel.tz.unwrap_or(time_tz::timezones::db::UTC),
@@ -697,7 +701,8 @@ struct Host {
     history: Option<Arc<HistoryDb>>,
     pass: Vec<PlayRecord>,
     catalog_path: Option<PathBuf>,
-    plexdb_path: Option<PathBuf>,
+    /// Opened on first use and kept for this build's calls.
+    snapshot: Option<Arc<crate::audio_facts::SnapshotReader>>,
     /// The channel `ctx.airings` queries unless the filter names another.
     channel: String,
     /// What this `build()` call has left for `ctx.http` and `ctx.exec`.
@@ -717,7 +722,7 @@ impl Host {
     fn probe(&self, path: &str) -> RhaiResult<Dynamic> {
         self.require("probe")?;
         let mut probed = probe_media(Path::new(path)).map_err(|e| format!("ctx.probe(): {e}"))?;
-        let audio = match (&probed, &self.catalog_path, &self.plexdb_path) {
+        let audio = match (&probed, &self.catalog_path, &self.snapshot) {
             (Some(_), Some(catalog), Some(snapshot)) => {
                 crate::audio_facts::facts_for_path(catalog, snapshot, path)
             }
@@ -741,10 +746,10 @@ impl Host {
     /// `ctx.catalog(expr)`: the live catalog entries a CEL expression matches
     /// (the language a pool's `expr` uses), as item maps, in `entry_id` order.
     /// Each map is the one `ctx.sets` carries, plus `source_ids` (each live
-    /// source's own id for the entry), `path` (the file the entry
-    /// plays from, `()` when it has no source) and `audio` (the audio
-    /// facts from the plex-db-ex snapshot, `()` when it has none for the entry). At most [`CATALOG_LIMIT`]
-    /// entries come back.
+    /// source's own id for the entry), `path` (the file the entry plays from,
+    /// `()` when it has no source) and `audio` (the audio facts from the
+    /// plex-db-ex snapshot, `()` when it has none for the entry). At most
+    /// [`CATALOG_LIMIT`] entries come back.
     fn catalog(&self, expr: &str) -> RhaiResult<Dynamic> {
         self.require("catalog_read")?;
         let Some(path) = &self.catalog_path else {
@@ -814,7 +819,7 @@ impl Host {
     /// snapshot gives none and logs one warning, so a missing snapshot leaves
     /// `audio` empty rather than failing the hook.
     fn audio_facts(&self, ids: &[String]) -> std::collections::HashMap<String, serde_json::Value> {
-        let Some(snapshot) = &self.plexdb_path else {
+        let Some(snapshot) = &self.snapshot else {
             tracing::warn!(
                 event = "audio.snapshot_unset",
                 channel = %self.channel,
@@ -823,11 +828,11 @@ impl Host {
             );
             return Default::default();
         };
-        crate::audio_facts::facts_for_entries(snapshot, ids).unwrap_or_else(|e| {
+        snapshot.facts_for_entries(ids).unwrap_or_else(|e| {
             tracing::warn!(
                 event = "audio.snapshot_unreadable",
                 channel = %self.channel,
-                snapshot = %snapshot.display(),
+                snapshot = %snapshot.path().display(),
                 error = %e,
                 "ctx.catalog could not read the plex-db-ex snapshot; `audio` is empty"
             );

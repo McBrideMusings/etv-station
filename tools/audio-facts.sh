@@ -6,7 +6,9 @@
 # Reads the dashboard's GET /api/audio/{entry_id} through tools/ui-get.sh, so it
 # needs the dashboard running (tools/station-ui.sh locally, the deployed one
 # with --prod). `analyzed: false` means the plex-db-ex snapshot holds no audio
-# facts for the entry (`harvest-audio` has not analyzed its file).
+# facts for the entry (`harvest-audio` has not analyzed its file). HTTP 503 with
+# an `error` means the snapshot is unset or unreadable, which says nothing about
+# the entry.
 set -euo pipefail
 
 [ $# -ge 1 ] || { echo "usage: tools/audio-facts.sh <entry_id> [--prod]" >&2; exit 2; }

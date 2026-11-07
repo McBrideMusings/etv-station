@@ -1122,10 +1122,15 @@ pub(super) fn api_search_item(state: &AppState, query: &str) -> Result<(u16, Val
         .search_titles(&q, 30)
         .map_err(|e| e.to_string())?;
     let ids: Vec<String> = rows.iter().map(|(id, _, _)| id.clone()).collect();
-    let mut facts = match &state.plexdb {
-        Some(snapshot) => crate::audio_facts::facts_for_entries(snapshot, &ids).unwrap_or_default(),
-        None => Default::default(),
-    };
+    let mut facts = snapshot_facts(state, &ids).unwrap_or_else(|e| {
+        tracing::warn!(
+            event = "audio.search_hint_unavailable",
+            error = %e,
+            "item search carries no audio hints"
+        );
+        Default::default()
+    });
+
     let results: Vec<Value> = rows
         .into_iter()
         .map(|(id, title, year)| {
@@ -1136,20 +1141,29 @@ pub(super) fn api_search_item(state: &AppState, query: &str) -> Result<(u16, Val
     Ok((200, json!({ "results": results })))
 }
 
-/// An entry's audio facts from the plex-db-ex snapshot (`null` when it has none
-/// or the snapshot cannot be read).
-fn audio_facts(state: &AppState, entry_id: &str) -> Value {
-    let Some(snapshot) = &state.plexdb else {
-        return Value::Null;
-    };
-    crate::audio_facts::facts_for_entries(snapshot, &[entry_id.to_string()])
-        .ok()
-        .and_then(|mut facts| facts.remove(entry_id))
-        .unwrap_or(Value::Null)
+/// The audio facts the snapshot holds for `ids`, or why it cannot say.
+fn snapshot_facts(
+    state: &AppState,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, Value>, String> {
+    let snapshot = state.plexdb.as_deref().ok_or_else(|| {
+        format!(
+            "{} is not set, so no entry has audio facts",
+            crate::audio_facts::SNAPSHOT_ENV
+        )
+    })?;
+    crate::audio_facts::facts_for_entries(snapshot, ids).map_err(|e| {
+        format!(
+            "cannot read the plex-db-ex snapshot {}: {e}",
+            snapshot.display()
+        )
+    })
 }
 
-/// `GET /api/audio/{entry_id}`: the entry's audio facts from the snapshot — the
-/// same JSON `admin facts <entry>` prints. 404 when the entry is unknown.
+/// `GET /api/audio/{entry_id}`: the entry's audio facts from the snapshot, the
+/// same JSON `admin facts <entry>` prints. 404 when the entry is unknown; 503
+/// with an `error` string when the snapshot is unset or cannot be read, so a
+/// broken snapshot never reads as "not analyzed".
 pub(super) fn api_audio_fact(state: &AppState, entry_id: &str) -> Result<(u16, Value), String> {
     if state
         .catalog
@@ -1162,11 +1176,16 @@ pub(super) fn api_audio_fact(state: &AppState, entry_id: &str) -> Result<(u16, V
             json!({"error": format!("no catalog entry {entry_id:?}")}),
         ));
     }
-    let facts = audio_facts(state, entry_id);
-    Ok((
-        200,
-        json!({"entry_id": entry_id, "analyzed": !facts.is_null(), "facts": facts}),
-    ))
+    Ok(match snapshot_facts(state, &[entry_id.to_string()]) {
+        Ok(mut facts) => {
+            let facts = facts.remove(entry_id).unwrap_or(Value::Null);
+            (
+                200,
+                json!({"entry_id": entry_id, "analyzed": !facts.is_null(), "facts": facts}),
+            )
+        }
+        Err(error) => (503, json!({"entry_id": entry_id, "error": error})),
+    })
 }
 
 /// `GET /api/health/audio`: how many catalog entries the plex-db-ex snapshot

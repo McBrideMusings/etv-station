@@ -1321,8 +1321,9 @@ impl Catalog {
         )
     }
 
-    /// The entry that plays from `playback_path` (the lowest `entry_id` when
-    /// several do); `None` when no source has that path.
+    /// The live entry that plays from `playback_path` through a source not
+    /// marked missing (the lowest `entry_id` when several do); `None` when no
+    /// such entry exists.
     pub fn entry_id_for_playback_path(
         &self,
         playback_path: &str,
@@ -1330,8 +1331,11 @@ impl Catalog {
         Ok(self
             .conn
             .query_row(
-                "SELECT entry_id FROM entry_sources WHERE playback_path = ?1 \
-                 ORDER BY entry_id LIMIT 1",
+                "SELECT s.entry_id FROM entry_sources s \
+                   JOIN entries e ON e.entry_id = s.entry_id \
+                  WHERE s.playback_path = ?1 AND s.missing_since IS NULL \
+                    AND e.missing_since IS NULL \
+                  ORDER BY s.entry_id LIMIT 1",
                 params![playback_path],
                 |r| r.get(0),
             )
@@ -1723,6 +1727,50 @@ mod tests {
     /// ids than one statement can bind, and SQLite refuses the statement rather
     /// than truncating it — which took a channel off the air with "too many SQL
     /// variables". The large path must answer exactly what the small one would.
+    /// A path resolves to a live entry through a live source: a retired entry
+    /// or a missing source on the same path never wins, even with a lower id.
+    #[test]
+    fn a_path_maps_to_the_live_entry_not_a_retired_or_missing_one() {
+        let c = cat();
+        let source = |entry: &str, path: &str, missing: Option<&str>| EntrySource {
+            source: Source::LocalFs,
+            source_id: format!("{entry}-{path}"),
+            entry_id: entry.into(),
+            playback_path: path.into(),
+            last_seen: None,
+            missing_since: missing.map(String::from),
+            unairable_reason: None,
+        };
+        for id in ["a-retired", "b-gone-source", "c-live", "d-live"] {
+            c.upsert_entry(&Entry::new(id, "movie", id, Source::LocalFs))
+                .unwrap();
+        }
+        c.add_source(&source("a-retired", "/m/x.mkv", None))
+            .unwrap();
+        c.add_source(&source(
+            "b-gone-source",
+            "/m/x.mkv",
+            Some("2026-01-01T00:00:00Z"),
+        ))
+        .unwrap();
+        c.add_source(&source("d-live", "/m/x.mkv", None)).unwrap();
+        c.add_source(&source("c-live", "/m/x.mkv", None)).unwrap();
+        c.conn
+            .execute_batch(
+                "UPDATE entries SET missing_since = '2026-01-01T00:00:00Z' \
+                 WHERE entry_id = 'a-retired'; \
+                 UPDATE entry_sources SET missing_since = '2026-01-01T00:00:00Z' \
+                 WHERE entry_id = 'b-gone-source';",
+            )
+            .unwrap();
+        assert_eq!(
+            c.entry_id_for_playback_path("/m/x.mkv").unwrap().as_deref(),
+            Some("c-live"),
+            "lowest id among live entries on live sources",
+        );
+        assert_eq!(c.entry_id_for_playback_path("/m/none.mkv").unwrap(), None);
+    }
+
     #[test]
     fn ordering_more_ids_than_one_statement_can_bind_matches_the_small_path() {
         let c = cat();

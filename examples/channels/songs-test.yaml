@@ -4,8 +4,9 @@ name: songs-test
 # set of whole songs (whole_song.rhai), each pair joined by a seam recipe chosen by
 # rule. `entry: landing` starts every song at its landing bar; `entry: start` plays
 # it whole. A set airs its stand-in until the renderer's file lands.
-# Needs a catalog with audio facts (`ETV_STATION_AUDIO_ANALYZER`) and the renderer
-# named in station-megamix.yaml. Run it with
+# Needs audio facts from the plex-db-ex snapshot (`PLEXDB_SNAPSHOT_PATH`,
+# harvested by plex-db-ex's `harvest-audio`) and the renderer named in
+# station-megamix.yaml. Run it with
 # `STATION_CONFIG=examples/station-megamix.yaml ./tools/dev-run.sh`.
 display_name: "Songs Test Channel"
 window_days: 1

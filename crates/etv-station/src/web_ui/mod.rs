@@ -654,6 +654,22 @@ mod tests {
         state.plexdb = None;
         let (_, body) = get_json(&mut state, "/api/health/audio");
         assert!(body["problem"].as_str().is_some(), "{body}");
+
+        // A snapshot that cannot be read is an error, never "not analyzed".
+        let (status, body) = get_json(&mut state, "/api/audio/a");
+        assert_eq!(status, 503, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("not set"),
+            "{body}"
+        );
+        state.plexdb = Some(dir.path().join("missing.db"));
+        let (status, body) = get_json(&mut state, "/api/audio/a");
+        assert_eq!(status, 503, "{body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("cannot read"),
+            "{body}"
+        );
+        assert!(body.get("analyzed").is_none(), "{body}");
     }
 
     /// `/api/health/renders` reports a queued plan under `queued`, and names

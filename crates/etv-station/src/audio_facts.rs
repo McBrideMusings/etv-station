@@ -45,16 +45,67 @@ pub fn facts_for_entries(
         .map_err(|e| e.to_string())
 }
 
+/// A snapshot opened at most once, on first use, and held for as long as the
+/// holder lives (one hook build). An open failure is kept and returned by every
+/// later read, so N reads cost one open attempt.
+pub struct SnapshotReader {
+    path: PathBuf,
+    reader: std::sync::Mutex<Option<Result<plexdb_reader::Reader, String>>>,
+}
+
+impl std::fmt::Debug for SnapshotReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotReader")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SnapshotReader {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            reader: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The facts held for each of `entry_ids`; an entry with none is absent.
+    pub fn facts_for_entries(
+        &self,
+        entry_ids: &[String],
+    ) -> Result<HashMap<String, Value>, String> {
+        let mut slot = self.reader.lock().unwrap_or_else(|e| e.into_inner());
+        let reader = slot.get_or_insert_with(|| {
+            plexdb_reader::Reader::open(&self.path, None, None).map_err(|e| e.to_string())
+        });
+        match reader {
+            Ok(r) => r
+                .audio_facts_for_many(entry_ids.iter().map(String::as_str))
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.clone()),
+        }
+    }
+}
+
 /// The facts for the entry that plays from `playback_path`, read through the
-/// catalog at `catalog` and the snapshot at `snapshot`; `None` when the file
-/// has no entry, the entry has no facts, or either file cannot be read (logged).
-/// `ctx.probe` returns it under `audio`.
-pub fn facts_for_path(catalog: &Path, snapshot: &Path, playback_path: &str) -> Option<Value> {
+/// catalog at `catalog` and `snapshot`; `None` when the file has no live entry,
+/// the entry has no facts, or either file cannot be read (logged). `ctx.probe`
+/// returns it under `audio`.
+pub fn facts_for_path(
+    catalog: &Path,
+    snapshot: &SnapshotReader,
+    playback_path: &str,
+) -> Option<Value> {
     let found = Catalog::open_readonly(catalog)
         .and_then(|c| c.entry_id_for_playback_path(playback_path))
         .map_err(|e| e.to_string())
         .and_then(|id| match id {
-            Some(id) => facts_for_entries(snapshot, std::slice::from_ref(&id))
+            Some(id) => snapshot
+                .facts_for_entries(std::slice::from_ref(&id))
                 .map(|mut facts| facts.remove(&id)),
             None => Ok(None),
         });
@@ -64,7 +115,7 @@ pub fn facts_for_path(catalog: &Path, snapshot: &Path, playback_path: &str) -> O
             tracing::warn!(
                 event = "audio.snapshot_unreadable",
                 path = playback_path,
-                snapshot = %snapshot.display(),
+                snapshot = %snapshot.path().display(),
                 error = %e,
                 "ctx.probe could not read audio facts from the plex-db-ex snapshot"
             );
@@ -153,6 +204,29 @@ mod tests {
                 .unwrap();
         }
         cat
+    }
+
+    /// The snapshot is opened on the first read and the outcome kept: a file
+    /// that appears afterwards does not change an earlier failure, and a held
+    /// reader answers every read.
+    #[test]
+    fn a_snapshot_reader_opens_once_and_keeps_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let snap = dir.path().join("late.db");
+        let reader = SnapshotReader::new(snap.clone());
+        let ids = vec!["a".to_string()];
+        assert!(reader.facts_for_entries(&ids).is_err());
+        fixture::write(&snap, &[("a", Some(r#"{"bpm":1.0}"#))]);
+        assert!(reader.facts_for_entries(&ids).is_err(), "failure is kept");
+
+        let reader = SnapshotReader::new(snap.clone());
+        assert_eq!(reader.facts_for_entries(&ids).unwrap().len(), 1);
+        std::fs::remove_file(&snap).unwrap();
+        assert_eq!(
+            reader.facts_for_entries(&ids).unwrap().len(),
+            1,
+            "the held connection answers without reopening"
+        );
     }
 
     #[test]
