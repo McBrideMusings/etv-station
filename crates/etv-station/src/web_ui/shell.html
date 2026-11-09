@@ -792,6 +792,15 @@ function editChanged(first) {
   paintEdit();
 }
 
+function goToLine(line) {
+  const ta = $('etext'), starts = ta.value.split('\n');
+  let from = 0;
+  for (let i = 0; i < line - 1 && i < starts.length; i++) from += starts[i].length + 1;
+  ta.focus();
+  ta.setSelectionRange(from, from + (starts[line - 1] || '').length);
+  ta.scrollTop = Math.max(0, (line - 3) * 18);
+  $('egut').scrollTop = ta.scrollTop;
+}
 function paintEdit() {
   const e = editState;
   if (!e || !$('etext') || !$('etext').isConnected) return;
@@ -810,7 +819,9 @@ function paintEdit() {
   $('eapply').disabled = !dirty || busy || !(e.valid && e.valid.ok);
   const note = $('enote');
   if (e.note) { note.className = `enote ${e.note.kind}`; note.innerHTML = e.note.html; }
-  else if (dirty && e.valid && !e.valid.ok) { note.className = 'enote bad'; note.innerHTML = `<b>The loader rejects this text, so Apply is off.</b> ${esc(e.valid.error)}`; }
+  else if (dirty && e.valid && !e.valid.ok) { note.className = 'enote bad'; note.innerHTML = `<b>The loader rejects this text, so Apply is off.</b> ${esc(e.valid.error)}${e.valid.line ? ` <button type="button" id="enotego">Go to line ${esc(e.valid.line)}</button>` : ''}`;
+    const go = $('enotego');
+    if (go) go.addEventListener('click', () => goToLine(e.valid.line)); }
   else { note.className = 'enote'; note.innerHTML = `<span class="muted">${esc(e.path)} · ${d.lines} lines · edits are marked in the gutter against the deployed file</span>`; }
   const errLine = dirty && e.valid && !e.valid.ok ? e.valid.line : null;
   let rows = '';
@@ -988,16 +999,7 @@ function paintPreview() {
   }
   body.innerHTML = html;
   const go = $('pvgo');
-  if (go) go.addEventListener('click', () => {
-    const ta = $('etext'), line = e.valid.line;
-    const starts = ta.value.split('\n');
-    let from = 0;
-    for (let i = 0; i < line - 1 && i < starts.length; i++) from += starts[i].length + 1;
-    ta.focus();
-    ta.setSelectionRange(from, from + (starts[line - 1] || '').length);
-    ta.scrollTop = Math.max(0, (line - 3) * 18);
-    $('egut').scrollTop = ta.scrollTop;
-  });
+  if (go) go.addEventListener('click', () => goToLine(e.valid.line));
 }
 
 // The profile panel: the plugin pools of the text as it stands, and edits that are spliced back into the text.
