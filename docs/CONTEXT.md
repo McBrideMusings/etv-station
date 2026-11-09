@@ -142,11 +142,19 @@ A random moment in a channel's simulated schedule: what is playing, how far in, 
 
 ## Draft
 
-A set of profile edits for one channel, held in server memory under an id the dashboard page keeps in its URL; nothing writes a file and two drafts never share edits.
+A set of profile edits for one channel, held in server memory under an id the dashboard page keeps in its URL; a draft writes no file and two drafts never share edits. The Edit page's own draft is different: the channel's whole `channel.yaml` text, held in the browser.
 
 ## Dashboard
 
-The single web page at `/` served by `etv-station --serve-ui`: tabs (Channels, Guide, Health) and, on Channels, a lineup rail with Schedule, Pattern, Pools and Graphics views.
+The single web page at `/` served by `etv-station --serve-ui`: tabs (Channels, Edit, Guide, Health, and a disabled Watch slot) and, on Channels, a lineup rail with Schedule, Blocks, Bumpers, Preview, Pools and Graphics views.
+
+## Inspector
+
+The Channels tab: a read-only view of every channel's schedule, blocks, bumpers, previews and pools. It writes nothing.
+
+## Editor
+
+The Edit tab: one channel's deployed `channel.yaml` as text, with the taste-profile panel beside it, a preview against the deployed schedule, and Apply. Apply validates with the daemon's loader, backs up the old file, writes the new one atomically and signals the daemon to reload; the page reports applied or reverted from the daemon's own record.
 
 ## Frontier
 
