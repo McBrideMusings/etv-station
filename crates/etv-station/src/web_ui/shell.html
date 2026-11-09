@@ -1927,6 +1927,7 @@ document.addEventListener('keydown', (e) => {
 
 const narrow = window.matchMedia('(max-width: 900px)');
 function closePanel() {
+  hideTip();
   const p = $('insp');
   if (p) { p.hidden = true; p.innerHTML = ''; }
   document.querySelectorAll('.blk.sel, .pgm.sel, .airrow.sel').forEach((b) => b.classList.remove('sel'));
@@ -2057,17 +2058,23 @@ function showTip(el) {
   tip.style.top = `${top}px`;
 }
 const hideTip = () => { $('tip').hidden = true; };
-document.addEventListener('mouseover', (e) => { const b = e.target.closest('.blk'); if (b) showTip(b); });
+// The tip belongs to a pointer that can hover and to keyboard focus. A tap fires an emulated mouseover and never a mouseout, so a touch-only device gets none.
+const canHover = window.matchMedia('(hover: hover)');
+const focusedBlock = () => {
+  const b = document.activeElement && document.activeElement.closest && document.activeElement.closest('.blk');
+  return b && b.matches(':focus-visible') && !b.classList.contains('sel') ? b : null;
+};
+document.addEventListener('mouseover', (e) => { const b = e.target.closest('.blk'); if (b && canHover.matches) showTip(b); });
 document.addEventListener('mouseout', (e) => {
   if (!e.target.closest('.blk')) return;
-  const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('.blk');
+  const focused = focusedBlock();
   if (focused) showTip(focused); else hideTip();
 });
-document.addEventListener('focusin', (e) => { const b = e.target.closest('.blk'); if (b) showTip(b); else hideTip(); });
+document.addEventListener('focusin', (e) => { const b = e.target.closest('.blk'); if (b && b.matches(':focus-visible') && !b.classList.contains('sel')) showTip(b); else hideTip(); });
 document.addEventListener('focusout', (e) => { if (e.target.closest('.blk')) hideTip(); });
-// Focusing a block scrolls it into view; keep its tip attached instead of dropping it.
+// Focusing a block scrolls it into view; keep a keyboard-focused block's tip attached instead of dropping it. A clicked block is selected, not keyboard-focused, so its tip stays hidden.
 document.addEventListener('scroll', () => {
-  const focused = document.activeElement && document.activeElement.closest && document.activeElement.closest('.blk');
+  const focused = focusedBlock();
   if (focused) showTip(focused); else hideTip();
 }, true);
 
