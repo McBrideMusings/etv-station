@@ -52,6 +52,21 @@
   .lineup a:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   .lineup .lstate { padding: 4px 14px; }
   #lineupSelect { display: none; }
+  /* The channel switcher: a chip beside the view tabs on a phone (the rail does the job on a wide screen), opening a sheet with a search and the lineup. */
+  .chip { display: none; align-items: center; gap: 8px; min-height: 44px; padding: 4px 10px; font-weight: 700; white-space: nowrap; flex: none; }
+  .chip .chipn { border: 2px solid var(--fg); border-radius: 3px; padding: 0 5px; font-variant-numeric: tabular-nums; }
+  .chip .chipname { max-width: 9em; overflow: hidden; text-overflow: ellipsis; }
+  .chback { position: fixed; inset: 0; z-index: 29; background: rgba(0, 0, 0, .45); }
+  .chsheet { position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; max-height: 80dvh; display: flex; flex-direction: column; background: var(--panel); border-radius: 12px 12px 0 0; box-shadow: 0 -6px 18px rgba(0, 0, 0, .35); padding: 8px 0 calc(8px + env(safe-area-inset-bottom)); }
+  .chsheet .grab { width: 36px; height: 4px; border-radius: 2px; background: var(--line); margin: 0 auto 8px; flex: none; }
+  .chsheet input { margin: 0 12px 6px; padding: 10px 12px; min-height: 44px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); flex: none; }
+  .chsheet #chCount { padding: 0 14px 6px; flex: none; }
+  .chsheet #chList { overflow-y: auto; overscroll-behavior: contain; }
+  .chsheet #chList a { display: flex; gap: 12px; align-items: center; min-height: 44px; padding: 0 16px; color: var(--fg); text-decoration: none; }
+  .chsheet #chList a .n { color: var(--muted); min-width: 2.2em; text-align: right; font-variant-numeric: tabular-nums; }
+  .chsheet #chList a[aria-current="page"] { background: var(--accent); color: var(--bg); }
+  .chsheet #chList a[aria-current="page"] .n { color: inherit; }
+  .chsheet #chList a.broken .nm { color: var(--err-fg); }
   main { min-width: 0; min-height: 0; display: flex; flex-direction: column; padding: 10px 20px 12px; }
   .subtabs { display: flex; gap: 2px; }
   .subtabs a { padding: 3px 10px; color: var(--muted); text-decoration: none; border-bottom: 2px solid transparent; font-weight: 600; }
@@ -246,6 +261,23 @@
     .app { display: block; }
     .lineup { display: none; }
     #lineupSelect { display: block; margin: 10px 20px 0; max-width: calc(100% - 40px); }
+    /* One strip: the switcher chip, then the view tabs scrolling sideways with a fade on the right edge. */
+    .chip { display: inline-flex; }
+    .toolbar { flex-wrap: wrap; row-gap: 4px; }
+    .subtabs { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; scrollbar-width: none; padding-right: 28px; -webkit-mask-image: linear-gradient(to right, #000 88%, transparent); mask-image: linear-gradient(to right, #000 88%, transparent); }
+    .subtabs a { display: inline-flex; align-items: center; min-height: 44px; padding: 3px 12px; }
+    /* The top row: 44px targets, no brand, so the five entries fit 390px. The Edit tab opens the channel on screen, so the strip's own Edit link is not repeated. */
+    .tabs { padding: 0 12px; gap: 0; overflow-x: auto; scrollbar-width: none; }
+    .tabs .brand { display: none; }
+    .tabs a, .tabs .soon { display: inline-flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 0; flex: none; }
+    #editLink { display: none; }
+    /* Project ahead and Real only as one full-width segmented control. */
+    #projCtl:not([hidden]) { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); width: 100%; gap: 0; margin-top: 4px !important; }
+    #projCtl #projState, #projCtl #projLabel { grid-column: 1 / -1; }
+    #projCtl #projBtns { display: contents; }
+    #projCtl #projClear { grid-column: 1; grid-row: 3; }
+    #projCtl #projBtns button { grid-row: 3; }
+    #projCtl button { min-height: 44px; border-radius: 0; }
     main { padding: 10px 16px; }
     #report { display: block; overflow: visible; }
     .layout { grid-template-columns: minmax(0, 1fr); }
@@ -399,11 +431,19 @@
   <a id="tabHealth" href="#/health">Health</a>
   <span id="tabWatch" class="soon" aria-disabled="true" title="Watch: the viewer is planned">Watch</span>
 </nav>
+<div id="chBack" class="chback" hidden></div>
+<div id="chSheet" class="chsheet" role="dialog" aria-modal="true" aria-label="Channels" hidden>
+  <div class="grab" aria-hidden="true"></div>
+  <input id="chSearch" type="search" placeholder="Find a channel" aria-label="Find a channel" autocomplete="off">
+  <div id="chCount" class="muted"></div>
+  <div id="chList"></div>
+</div>
 <div class="app" id="app">
   <nav class="lineup" id="lineup" aria-label="Channels"><div class="lstate muted">Loading the lineup…</div></nav>
   <main>
     <select id="lineupSelect" aria-label="Channel"></select>
     <div class="toolbar" id="toolbar">
+      <button type="button" class="chip" id="chipBtn" aria-haspopup="dialog" aria-expanded="false" aria-controls="chSheet"><span class="chipn" id="chipN"></span><span class="chipname" id="chipName"></span><span aria-hidden="true">▾</span></button>
       <nav class="subtabs" aria-label="Channel views">
         <a id="subSchedule" href="#">Schedule</a>
         <a id="subBlocks" href="#">Blocks</a>
@@ -412,7 +452,6 @@
         <a id="subPools" href="#">Pools</a>
         <a id="subGraphics" href="#">Graphics</a>
       </nav>
-      <span id="position" class="muted"></span>
       <a id="editLink" href="#">Edit this channel</a>
       <span class="spacer"></span>
       <span id="projCtl" class="toolbar" style="margin:0">
@@ -659,30 +698,69 @@ async function loadLineup() {
     `<option value="${esc(c.channel)}">${esc(c.number == null ? c.channel : `${c.number} · ${c.display_name || c.channel}`)}</option>`).join('');
 }
 
+
+// ---- The channel switcher sheet (phone): a search, the lineup in station.yaml order, the current channel marked.
+function drawSwitcher(r) {
+  const q = $('chSearch').value.trim().toLowerCase();
+  const rows = lineup.filter((c) => !q || `${c.number ?? ''} ${c.display_name || ''} ${c.channel}`.toLowerCase().includes(q));
+  $('chCount').textContent = q ? `${rows.length} of ${lineup.length} channels` : `${lineup.length} channels, in station.yaml order`;
+  $('chList').innerHTML = rows.map((c) => `<a data-key="${esc(c.channel)}" class="${c.error ? 'broken' : ''}" href="${channelHash(c.channel, r.view, r.project, null, r.layout)}"${c.channel === r.channel ? ' aria-current="page"' : ''}><span class="n">${esc(c.number ?? '—')}</span><span class="nm">${esc(c.display_name || c.channel)}</span></a>`).join('');
+}
+function openSwitcher() {
+  if (!lineup) return;
+  $('chSearch').value = '';
+  drawSwitcher(parseRoute());
+  $('chBack').hidden = false;
+  $('chSheet').hidden = false;
+  for (const e of [document.querySelector('.tabs'), $('app')]) e.inert = true;
+  $('chipBtn').setAttribute('aria-expanded', 'true');
+  const cur = $('chList').querySelector('[aria-current="page"]');
+  if (cur) cur.scrollIntoView({ block: 'center' });
+  $('chSearch').focus({ preventScroll: true });
+}
+function closeSwitcher(refocus) {
+  if ($('chSheet').hidden) return;
+  $('chBack').hidden = true;
+  $('chSheet').hidden = true;
+  for (const e of [document.querySelector('.tabs'), $('app')]) e.inert = false;
+  $('chipBtn').setAttribute('aria-expanded', 'false');
+  if (refocus) $('chipBtn').focus();
+}
+$('chipBtn').addEventListener('click', () => ($('chSheet').hidden ? openSwitcher() : closeSwitcher(true)));
+$('chBack').addEventListener('click', () => closeSwitcher(true));
+$('chSearch').addEventListener('input', () => drawSwitcher(parseRoute()));
+$('chList').addEventListener('click', (e) => { if (e.target.closest('a')) closeSwitcher(true); });
+const chNarrow = window.matchMedia('(max-width: 900px)');
+chNarrow.addEventListener('change', () => { if (!chNarrow.matches) closeSwitcher(false); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('chSheet').hidden) { e.stopPropagation(); closeSwitcher(true); } }, true);
+
 // Marks where the page is: the tab, the channel in the lineup, the sub-tab, and the links that keep the days.
 function markRoute(r) {
+  closeSwitcher(false);
   routeWithDraftWindow(r);
   for (const [id, tab] of [['tabChannels', 'channels'], ['tabEdit', 'edit'], ['tabGuide', 'guide'], ['tabHealth', 'health']]) {
     if (r.tab === tab) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
+  $('chipBtn').disabled = !lineup;
   const railed = r.tab === 'channels' || r.tab === 'edit';
   $('app').classList.toggle('wide', !railed);
   $('lineup').hidden = !railed;
-  $('lineupSelect').hidden = !railed;
+  $('lineupSelect').hidden = !railed || r.tab === 'channels';   // on a channel's page the chip beside the view tabs is the narrow switcher
   $('toolbar').hidden = r.tab !== 'channels';
   setControls(r.project, false);
   // Project ahead belongs to the schedule; Graphics has no projection to ask for.
-  const projecting = r.tab === 'channels' && r.view !== 'graphics' && r.view !== 'bumpers';
+  const projecting = r.tab === 'channels' && r.view === 'schedule';
   for (const id of ['projState', 'projLabel', 'projBtns', 'projClear']) $(id).hidden = !projecting;
   if (!railed || !lineup) return;
   const project = r.project;
-  $('projCtl').hidden = r.view === 'pools';
+  $('projCtl').hidden = r.view !== 'schedule';
   for (const a of $('lineup').querySelectorAll('a')) {
     a.href = r.tab === 'edit' ? editHash(a.dataset.key) : channelHash(a.dataset.key, r.view, project, null, r.layout);   // a draft belongs to one channel, so the rail drops it
     if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   $('lineupSelect').value = r.channel;
   $('editLink').href = editHash(r.channel);
+  $('tabEdit').href = editHash(r.channel);
   if (r.tab === 'edit') {
     const sel = $('lineup').querySelector('[aria-current="page"]');
     if (sel) sel.scrollIntoView({ block: 'nearest' });
@@ -692,8 +770,10 @@ function markRoute(r) {
     $(id).href = channelHash(r.channel, view, project, r.draft, r.layout);
     if (r.view === view) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
-  const i = lineup.findIndex((c) => c.channel === r.channel);
-  $('position').textContent = i < 0 ? '' : `${i + 1} of ${lineup.length} in station.yaml order`;
+  const cur = lineup.find((c) => c.channel === r.channel);
+  $('chipN').textContent = cur ? (cur.number ?? '—') : '';
+  $('chipName').textContent = cur ? (cur.display_name || cur.channel) : '';
+  $('chipBtn').setAttribute('aria-label', cur ? `Channel ${cur.number ?? ''} ${cur.display_name || cur.channel}. Change channel` : 'Change channel');
   const sel = $('lineup').querySelector('[aria-current="page"]');
   if (sel) sel.scrollIntoView({ block: 'nearest' });
 }
