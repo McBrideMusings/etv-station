@@ -223,6 +223,12 @@
     #report { display: block; overflow: visible; }
     .layout { grid-template-columns: minmax(0, 1fr); }
     .gwrap { height: 70vh; }
+    /* The airing inspector is a sheet pinned to the bottom, at most half the viewport, with its own scroll; the page keeps room under the schedule so the selected block can scroll above it. */
+    .rail section#insp:not([hidden]) { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; max-height: 50vh; overflow-y: auto; overscroll-behavior: contain;
+      margin: 0; padding: 14px 16px calc(12px + env(safe-area-inset-bottom)); border-radius: 12px 12px 0 0; box-shadow: 0 -6px 18px rgba(0, 0, 0, .35); }
+    .rail section#insp:not([hidden])::before { content: ""; display: block; width: 36px; height: 4px; border-radius: 2px; background: var(--line); margin: -8px auto 8px; }
+    .insp .x { position: sticky; top: 0; min-width: 44px; min-height: 44px; margin: -10px -10px 0 8px; font-size: 22px; background: var(--panel); }
+    body:has(.rail section#insp:not([hidden])) { padding-bottom: 50vh; }
     .rail { overflow: visible; }
   }
   /* Pools: one section per pool; the draft bar sits above them. */
@@ -1888,6 +1894,7 @@ async function selectProgramme(el) {
     <div class="meta"><span>${esc(dayOf(Number(start)))} ${esc(timeOf(Number(start)))}–${esc(timeOf(Number(stop)))}</span><span>${Math.round((stop - start) / 60)} min</span><span>${esc(number)} ${esc(channel)}</span></div>`;
   showPanel(`${head}<div class="muted"><span class="spinner"></span>Reading the audit for airing ${esc(airing)}…</div>`);
   el.classList.add('sel');
+  revealSelected();
   let data; let status = 0;
   try {
     const res = await fetch(`/api/airings/${encodeURIComponent(airing)}/audit`);
@@ -1918,6 +1925,7 @@ document.addEventListener('keydown', (e) => {
   if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.pgm')) { e.preventDefault(); selectProgramme(e.target.closest('.pgm')); }
 });
 
+const narrow = window.matchMedia('(max-width: 900px)');
 function closePanel() {
   const p = $('insp');
   if (p) { p.hidden = true; p.innerHTML = ''; }
@@ -1930,9 +1938,42 @@ function showPanel(html) {
   p.innerHTML = html;
   p.hidden = false;
   p.querySelector('.x').addEventListener('click', closePanel);
-  // Wide, this scrolls the rail to its top; narrow, where the rail sits below the guide, it scrolls the page to the panel.
-  p.scrollIntoView({ block: 'start' });
+  p.scrollTop = 0;
+  if (!narrow.matches) p.scrollIntoView({ block: 'start' }); // wide: scrolls the rail to its top
 }
+
+// Narrow, the panel is a sheet over the bottom half: bring the selected block into the top half.
+function revealSelected() {
+  if (!narrow.matches) return;
+  const sel = document.querySelector('.blk.sel, .airrow.sel, .pgm.sel');
+  if (!sel) return;
+  sel.scrollIntoView({ block: 'nearest' });
+  const limit = window.innerHeight * 0.5 - 8;
+  const bottom = sel.getBoundingClientRect().bottom;
+  if (bottom > limit) window.scrollBy(0, bottom - limit + 16);
+}
+
+// A tap on the schedule outside the sheet closes it; a tap on another block replaces its content instead.
+document.addEventListener('click', (e) => {
+  const sheet = $('insp');
+  if (!narrow.matches || !sheet || sheet.hidden || !e.target.closest) return;
+  if (e.target.closest('#insp, .blk, .airrow, .pgm, #tip')) return;
+  closePanel();
+});
+// A swipe down on the sheet, from its top edge of scroll, closes it.
+let swipeY = null;
+let swipeFromTop = false;
+document.addEventListener('touchstart', (e) => {
+  const sheet = e.target.closest && e.target.closest('#insp');
+  swipeY = narrow.matches && sheet ? e.touches[0].clientY : null;
+  swipeFromTop = !!sheet && sheet.scrollTop === 0;
+}, { passive: true });
+document.addEventListener('touchend', (e) => {
+  if (swipeY == null) return;
+  const dy = e.changedTouches[0].clientY - swipeY;
+  swipeY = null;
+  if (dy > 80 && swipeFromTop) closePanel();
+}, { passive: true });
 
 // Opens an airing's trail and its Radarr/Sonarr record in the panel; `el` is the guide block or table row clicked.
 function selectAiring(el) {
@@ -1940,6 +1981,7 @@ function selectAiring(el) {
   const a = current.airings[Number(el.dataset.index)];
   showPanel(airingPanel(current, a, poolColor(current)));
   document.querySelectorAll(`.blk[data-index="${a.index}"], .airrow[data-index="${a.index}"]`).forEach((x) => x.classList.add('sel'));
+  revealSelected();
   if (a.kind === 'movie' || a.kind === 'episode') loadArr(a.id);
   else $('arrbox').remove();
 }
@@ -1949,7 +1991,7 @@ document.addEventListener('keydown', (e) => {
 });
 document.addEventListener('click', (e) => { const b = e.target.closest('.blk'); if (b) selectAiring(b); });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closePanel();
+  if (e.key === 'Escape' && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) closePanel();
   if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.blk')) { e.preventDefault(); selectAiring(e.target.closest('.blk')); }
 });
 
