@@ -127,9 +127,9 @@
   .colhead { position: sticky; top: 0; z-index: 3; background: var(--bg); border-bottom: 2px solid var(--fg); border-left: 1px solid var(--line);
     font-weight: 700; font-size: 12px; padding: 4px 6px; white-space: nowrap; }
   .corner { position: sticky; top: 0; left: 0; z-index: 4; background: var(--bg); border-bottom: 2px solid var(--fg); }
-  .gutter { position: sticky; left: 0; z-index: 2; background: var(--bg); height: calc(1440 * var(--ppm)); }
+  .gutter { position: sticky; left: 0; z-index: 2; background: var(--bg); height: calc(var(--gmin, 1440) * var(--ppm)); }
   .gutter span { position: absolute; right: 4px; font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; transform: translateY(-50%); }
-  .col { position: relative; height: calc(1440 * var(--ppm)); border-left: 1px solid var(--line);
+  .col { position: relative; height: calc(var(--gmin, 1440) * var(--ppm)); border-left: 1px solid var(--line);
     background-image: repeating-linear-gradient(to bottom, var(--line) 0 1px, transparent 1px calc(60 * var(--ppm))); }
   .blk { position: absolute; left: 2px; right: 2px; border-radius: 2px; overflow: hidden; color: #111; font-size: 11px; line-height: 1.2;
     padding: 2px 4px; border: 1px solid rgba(0,0,0,.2); outline: none; }
@@ -158,6 +158,24 @@
 
   /* The selected-item panel at the top of the rail: an airing's selection trail, or the channel's pattern. */
   .blk { cursor: pointer; }
+  /* Schedule as an agenda: a heading per day with airings, one row per airing, the frontier as a labelled divider. */
+  .layoutctl { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; }
+  .ag-now { border: 1px solid var(--line); border-left: 3px solid var(--fg); background: var(--panel); padding: 8px 12px; margin: 0 0 10px; }
+  .ag-now .k { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  .ag-now .t { font-size: 17px; font-weight: 700; margin: 2px 0 4px; }
+  .ag-now .bar { height: 4px; background: var(--track); margin: 6px 0; }
+  .ag-now .bar span { display: block; height: 100%; background: var(--fg); }
+  .ag-day { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; border-bottom: 2px solid var(--fg); font-weight: 700; padding: 12px 4px 4px; }
+  .ag-day .n { font-weight: 400; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .agrow { display: grid; grid-template-columns: 78px minmax(0, 1fr) auto; gap: 2px 12px; align-items: baseline; padding: 8px 4px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .agrow:focus-visible, .agrow:hover { outline: 2px solid var(--fg); outline-offset: -2px; }
+  .agrow.sel { background: var(--panel); outline: 3px solid var(--fg); outline-offset: -3px; }
+  .agrow .tm { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .agrow .ep { color: var(--muted); font-size: 12px; }
+  .agrow .meta { display: flex; gap: 6px; align-items: baseline; font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .agrow .tagx { border: 1px solid var(--fg); border-radius: 2px; padding: 0 4px; font-size: 10.5px; font-weight: 700; }
+  .agrow .tagx.proj { border-style: dashed; }
+  .ag-frontier { display: flex; align-items: center; gap: 8px; color: var(--err-fg); border-top: 2px solid var(--err-fg); font-size: 11.5px; font-weight: 700; padding: 3px 4px; }
   .blk.sel { outline: 3px solid var(--fg); outline-offset: -3px; }
   .rail section.insp { border-top: 2px solid var(--fg); background: var(--panel); padding: 8px 10px 12px; margin-bottom: 4px; }
   .insp h3 { font-size: 15px; margin: 0; }
@@ -223,6 +241,9 @@
     #report { display: block; overflow: visible; }
     .layout { grid-template-columns: minmax(0, 1fr); }
     .gwrap { height: 70vh; }
+    .gwrap.agendawrap { height: auto; overflow: visible; border: 0; }
+    .agrow { grid-template-columns: 70px minmax(0, 1fr); }
+    .agrow .meta { grid-column: 2; }
     /* The airing inspector is a sheet pinned to the bottom, at most half the viewport, with its own scroll; the page keeps room under the schedule so the selected block can scroll above it. */
     .rail section#insp:not([hidden]) { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; max-height: 50vh; overflow-y: auto; overscroll-behavior: contain;
       margin: 0; padding: 14px 16px calc(12px + env(safe-area-inset-bottom)); border-radius: 12px 12px 0 0; box-shadow: 0 -6px 18px rgba(0, 0, 0, .35); }
@@ -431,6 +452,7 @@ function parseRoute() {
     view: ['blocks', 'bumpers', 'preview', 'pools', 'graphics'].includes(parts[2]) ? parts[2] : 'schedule',
     project: ['1d', '3d', '7d', '14d'].includes(q.get('project')) ? q.get('project') : null,
     draft: q.get('draft'),
+    layout: q.get('layout') === 'grid' ? 'grid' : 'agenda',
   };
 }
 // With a draft open the Schedule projects 3 days unless the address names a length: a draft re-simulation is slow.
@@ -439,8 +461,9 @@ function routeWithDraftWindow(r) {
   return r;
 }
 function editHash(channel) { return channel ? `#/edit/${encodeURIComponent(channel)}` : '#/edit'; }
-function channelHash(channel, view, project, draft) {
+function channelHash(channel, view, project, draft, layout) {
   const q = [];
+  if (layout === 'grid' && (!view || view === 'schedule')) q.push('layout=grid');
   if (project && view !== 'pools') q.push(`project=${project}`);
   if (draft && !['blocks', 'bumpers', 'preview'].includes(view)) q.push(`draft=${encodeURIComponent(draft)}`);
   return `#/channels/${encodeURIComponent(channel)}/${view || 'schedule'}${q.length ? `?${q.join('&')}` : ''}`;
@@ -561,7 +584,7 @@ async function loadDraft(channel, project, draft, view) {
     current = null;
     $('report').innerHTML = `<header class="mast"><h1>${esc(channel)}</h1></header>
       <h2>The draft review could not be built</h2><div class="error">${esc(data.error)}</div>
-      <p><a href="${channelHash(channel, 'schedule', project)}">Show the deployed schedule</a></p>`;
+      <p><a href="${channelHash(channel, 'schedule', project, null, parseRoute().layout)}">Show the deployed schedule</a></p>`;
     return;
   }
   if (data.deployed && data.deployed.load_error) { show(data.deployed, view); return; }
@@ -646,7 +669,7 @@ function markRoute(r) {
   const project = r.project;
   $('projCtl').hidden = r.view === 'pools';
   for (const a of $('lineup').querySelectorAll('a')) {
-    a.href = r.tab === 'edit' ? editHash(a.dataset.key) : channelHash(a.dataset.key, r.view, project);   // a draft belongs to one channel, so the rail drops it
+    a.href = r.tab === 'edit' ? editHash(a.dataset.key) : channelHash(a.dataset.key, r.view, project, null, r.layout);   // a draft belongs to one channel, so the rail drops it
     if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   $('lineupSelect').value = r.channel;
@@ -657,7 +680,7 @@ function markRoute(r) {
     return;
   }
   for (const [id, view] of [['subSchedule', 'schedule'], ['subBlocks', 'blocks'], ['subBumpers', 'bumpers'], ['subPreview', 'preview'], ['subPools', 'pools'], ['subGraphics', 'graphics']]) {
-    $(id).href = channelHash(r.channel, view, project, r.draft);
+    $(id).href = channelHash(r.channel, view, project, r.draft, r.layout);
     if (r.view === view) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
   const i = lineup.findIndex((c) => c.channel === r.channel);
@@ -1173,7 +1196,7 @@ async function route() {
   if (!lineup) await loadLineup();
   if (r.tab === 'channels' && !r.channel) {
     // A bare `#/channels` (or no hash) opens the first channel in the lineup.
-    if (lineup && lineup.length) { location.replace(channelHash(lineup[0].channel, 'schedule', r.project)); return; }
+    if (lineup && lineup.length) { location.replace(channelHash(lineup[0].channel, 'schedule', r.project, null, r.layout)); return; }
   }
   if (r.tab === 'edit' && !r.channel && lineup && lineup.length) { location.replace(editHash(lineup[0].channel)); return; }
   markRoute(r);
@@ -1428,7 +1451,11 @@ function render(d) {
     <span><span class="pin">1</span>tune-in sample (Preview)</span></div>`);
 
   // 2. Guide, with the rail beside it
-  html.push(`<div class="layout"><div class="gwrap" id="gwrap"><div class="wk" id="guide" style="--n:${d.day_starts.length - 1}"></div></div><aside class="rail" id="rail"><section class="insp" id="insp" hidden></section>`);
+  const grid = parseRoute().layout === 'grid';
+  html.push(`<div class="layoutctl"><span class="seg" role="group" aria-label="Schedule layout" id="layoutBtns">
+    <button type="button" data-layout="agenda" aria-pressed="${!grid}">Agenda</button>
+    <button type="button" data-layout="grid" aria-pressed="${grid}">Grid</button></span></div>`);
+  html.push(`<div class="layout"><div class="gwrap${grid ? '' : ' agendawrap'}" id="gwrap">${grid ? '<div class="wk" id="guide"></div>' : '<div class="agenda" id="agenda"></div>'}</div><aside class="rail" id="rail"><section class="insp" id="insp" hidden></section>`);
 
   // 3. Principles: graded where the schedule measures them, listed with the reason where it cannot.
   const scored = d.principles.filter((p) => p.grade != null);
@@ -1493,11 +1520,27 @@ function render(d) {
   html.push('</aside></div>');
 
   $('report').innerHTML = html.join('');
-  renderGuide(d, colors);
+  if (grid) renderGuide(d, colors); else renderAgenda(d, colors);
+  for (const b of $('layoutBtns').querySelectorAll('button')) {
+    b.addEventListener('click', () => {
+      const r = parseRoute();
+      const open = document.querySelector('.blk.sel, .agrow.sel, .airrow.sel');
+      const index = open && open.dataset.index;
+      history.replaceState(null, '', channelHash(r.channel, 'schedule', r.project, r.draft, b.dataset.layout));
+      render(current);
+      const again = index != null && document.querySelector(`.agrow[data-index="${index}"], .blk[tabindex][data-index="${index}"]`);
+      if (again) selectAiring(again);
+    });
+  }
   $('patternBtn').addEventListener('click', () => { location.hash = channelHash(d.channel, 'blocks', parseRoute().project); });
   const ppm = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ppm'));
   // The hour label is centred on its line, so land 10px above the line: the whole label clears the sticky day header.
-  $('gwrap').scrollTop = GUIDE_OPEN_HOUR * 60 * ppm - 10;
+  if (grid) {
+    const g = $('guide');
+    const h0 = Number(g.dataset.h0 || 0);
+    const open = Math.min(Math.max(GUIDE_OPEN_HOUR, h0), h0 + Number(g.style.getPropertyValue('--gmin') || 1440) / 60 - 1);
+    $('gwrap').scrollTop = open > h0 ? (open - h0) * 60 * ppm - 10 : 0;
+  }
 }
 
 // The channel's blocks in one line: what the masthead stub shows, in full on hover.
@@ -1930,7 +1973,7 @@ function closePanel() {
   hideTip();
   const p = $('insp');
   if (p) { p.hidden = true; p.innerHTML = ''; }
-  document.querySelectorAll('.blk.sel, .pgm.sel, .airrow.sel').forEach((b) => b.classList.remove('sel'));
+  document.querySelectorAll('.blk.sel, .pgm.sel, .airrow.sel, .agrow.sel').forEach((b) => b.classList.remove('sel'));
 }
 
 function showPanel(html) {
@@ -1946,7 +1989,7 @@ function showPanel(html) {
 // Narrow, the panel is a sheet over the bottom half: bring the selected block into the top half.
 function revealSelected() {
   if (!narrow.matches) return;
-  const sel = document.querySelector('.blk.sel, .airrow.sel, .pgm.sel');
+  const sel = document.querySelector('.blk.sel, .airrow.sel, .pgm.sel, .agrow.sel');
   if (!sel) return;
   sel.scrollIntoView({ block: 'nearest' });
   const limit = window.innerHeight * 0.5 - 8;
@@ -1958,7 +2001,7 @@ function revealSelected() {
 document.addEventListener('click', (e) => {
   const sheet = $('insp');
   if (!narrow.matches || !sheet || sheet.hidden || !e.target.closest) return;
-  if (e.target.closest('#insp, .blk, .airrow, .pgm, #tip')) return;
+  if (e.target.closest('#insp, .blk, .airrow, .agrow, .pgm, #tip')) return;
   closePanel();
 });
 // A swipe down on the sheet, from its top edge of scroll, closes it.
@@ -1981,14 +2024,14 @@ function selectAiring(el) {
   if (!current || !el || el.dataset.index == null) return;
   const a = current.airings[Number(el.dataset.index)];
   showPanel(airingPanel(current, a, poolColor(current)));
-  document.querySelectorAll(`.blk[data-index="${a.index}"], .airrow[data-index="${a.index}"]`).forEach((x) => x.classList.add('sel'));
+  document.querySelectorAll(`.blk[data-index="${a.index}"], .airrow[data-index="${a.index}"], .agrow[data-index="${a.index}"]`).forEach((x) => x.classList.add('sel'));
   revealSelected();
   if (a.kind === 'movie' || a.kind === 'episode') loadArr(a.id);
   else $('arrbox').remove();
 }
-document.addEventListener('click', (e) => { const r = e.target.closest('.airrow'); if (r) selectAiring(r); });
+document.addEventListener('click', (e) => { const r = e.target.closest('.airrow, .agrow'); if (r) selectAiring(r); });
 document.addEventListener('keydown', (e) => {
-  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.airrow')) { e.preventDefault(); selectAiring(e.target.closest('.airrow')); }
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.airrow, .agrow')) { e.preventDefault(); selectAiring(e.target.closest('.airrow, .agrow')); }
 });
 document.addEventListener('click', (e) => { const b = e.target.closest('.blk'); if (b) selectAiring(b); });
 document.addEventListener('keydown', (e) => {
@@ -1999,14 +2042,46 @@ document.addEventListener('keydown', (e) => {
 function renderGuide(d, colors) {
   const changedAt = new Set(d.diff ? d.diff.changed_airings.map((c) => c.index) : []);
   const tz = d.tz;
+  // Only the days that hold an airing, and only the hours from the earliest start to the latest stop among them.
+  const days = [];
+  let firstMin = 1440;
+  let lastMin = 0;
+  for (let i = 0; i + 1 < d.day_starts.length; i++) {
+    const ds = d.day_starts[i];
+    const de = d.day_starts[i + 1];
+    const scale = 1440 / ((de - ds) / 60);
+    let any = false;
+    for (const a of d.airings) {
+      const s0 = Math.max(a.start, ds);
+      const e0 = Math.min(a.start + a.duration_secs, de);
+      if (e0 <= s0) continue;
+      any = true;
+      firstMin = Math.min(firstMin, ((s0 - ds) / 60) * scale);
+      lastMin = Math.max(lastMin, ((e0 - ds) / 60) * scale);
+    }
+    if (d.frontier != null && d.frontier >= ds && d.frontier < de) {
+      any = true;
+      const fm = ((d.frontier - ds) / 60) * scale;
+      firstMin = Math.min(firstMin, fm);
+      lastMin = Math.max(lastMin, fm + 1);
+    }
+    if (any) days.push(i);
+  }
+  const h0 = days.length ? Math.floor(firstMin / 60) : 0;
+  const h1 = days.length ? Math.min(24, Math.ceil(lastMin / 60)) : 24;
+  const off = h0 * 60;
+  const gu = $('guide');
+  gu.dataset.h0 = String(h0);
+  gu.style.setProperty('--n', String(Math.max(days.length, 1)));
+  gu.style.setProperty('--gmin', String((h1 - h0) * 60));
   const cells = ['<div class="corner"></div>'];
-  for (let i = 0; i + 1 < d.day_starts.length; i++) cells.push(`<div class="colhead">${esc(dayOf(d.day_starts[i], tz))}</div>`);
-  cells.push(`<div class="gutter">${Array.from({ length: 24 }, (_, h) =>
-    `<span style="top:calc(${h * 60} * var(--ppm))${h === 0 ? ';transform:none' : ''}">${hourLabel(h)}</span>`).join('')}</div>`);
+  for (const i of days) cells.push(`<div class="colhead">${esc(dayOf(d.day_starts[i], tz))}</div>`);
+  cells.push(`<div class="gutter">${Array.from({ length: h1 - h0 }, (_, k) =>
+    `<span style="top:calc(${k * 60} * var(--ppm))${k === 0 ? ';transform:none' : ''}">${hourLabel(h0 + k)}</span>`).join('')}</div>`);
   // A block shows only the lines its height holds (a line is about 13px, plus 6px of padding and
   // border); a block too short for one line shows nothing and names itself in its tooltip.
   const ppm = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ppm'));
-  for (let i = 0; i + 1 < d.day_starts.length; i++) {
+  for (const i of days) {
     const ds = d.day_starts[i];
     const de = d.day_starts[i + 1];
     // Minutes on the column's scale, so a 23- or 25-hour DST day still fills its column.
@@ -2016,7 +2091,7 @@ function renderGuide(d, colors) {
       const s = Math.max(a.start, ds);
       const e = Math.min(a.start + a.duration_secs, de);
       if (e <= s) continue;
-      const top = ((s - ds) / 60) * scale;
+      const top = ((s - ds) / 60) * scale - off;
       const h = ((e - s) / 60) * scale;
       const rep = a.repeat_of != null;
       // An airing crossing midnight is drawn in both columns; the second copy is marked as the
@@ -2039,11 +2114,55 @@ function renderGuide(d, colors) {
     }
     // The frontier: where the published playout ends. Past it, blocks are projected.
     if (d.frontier != null && d.frontier >= ds && d.frontier < de) {
-      blocks.push(`<div class="frontier" style="top:calc(${((d.frontier - ds) / 60) * scale} * var(--ppm))"><span>frontier ${esc(timeOf(d.frontier, tz))}</span></div>`);
+      blocks.push(`<div class="frontier" style="top:calc(${((d.frontier - ds) / 60) * scale - off} * var(--ppm))"><span>frontier ${esc(timeOf(d.frontier, tz))}</span></div>`);
     }
     cells.push(`<div class="col">${blocks.join('')}</div>`);
   }
-  $('guide').innerHTML = cells.join('');
+  gu.innerHTML = cells.join('');
+}
+
+// The Schedule as a list: a heading per day that holds an airing, one row per airing (an airing is listed once, under the day it starts), the frontier as a labelled divider.
+function renderAgenda(d, colors) {
+  const tz = d.tz;
+  const changedAt = new Set(d.diff ? d.diff.changed_airings.map((c) => c.index) : []);
+  const out = [];
+  if (!d.airings.length) return;   // the masthead's notice says "No published playout for this channel yet."
+  const now = Math.floor(Date.now() / 1000);
+  const onNow = d.airings.find((a) => a.start <= now && now < a.start + a.duration_secs);
+  if (onNow) {
+    const left = Math.round((onNow.start + onNow.duration_secs - now) / 60);
+    const pct = Math.round(((now - onNow.start) / onNow.duration_secs) * 100);
+    const next = d.airings.filter((a) => a.start >= onNow.start + onNow.duration_secs).sort((x, y) => x.start - y.start)[0];
+    out.push(`<div class="ag-now"><div class="k">On now · ends ${esc(timeOf(onNow.start + onNow.duration_secs, tz))}</div>
+      <div class="t">${esc(headline(onNow))}</div>
+      <div class="meta"><span class="swatch" style="background:${colors[onNow.pool] || '#ccc'}"></span> ${esc(onNow.pool)} · ${left} min left</div>
+      <div class="bar"><span style="width:${pct}%"></span></div>
+      ${next ? `<div class="muted">Up next · ${esc(timeOf(next.start, tz))} · <b>${esc(headline(next))}</b> · ${esc(next.pool)}</div>` : ''}</div>`);
+  }
+  const dur = (secs) => { const m = Math.round(secs / 60); return m >= 60 ? `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m` : `${m} min`; };
+  let frontierDrawn = d.frontier == null;
+  const frontierRow = () => `<div class="ag-frontier"><span class="swatch fl"></span>Published playout ends · ${esc(dayOf(d.frontier, tz))} ${esc(timeOf(d.frontier, tz))}</div>`;
+  for (let i = 0; i + 1 < d.day_starts.length; i++) {
+    const ds = d.day_starts[i];
+    const de = d.day_starts[i + 1];
+    const last = d.day_starts.length - 2;
+    const todays = d.airings.filter((a) => (a.start >= ds || i === 0) && (a.start < de || i === last)).sort((x, y) => x.start - y.start);
+    if (!todays.length) continue;
+    const total = todays.reduce((t, a) => t + a.duration_secs, 0);
+    out.push(`<div class="ag-day"><span>${esc(dayOf(ds, tz))}</span><span class="n">${todays.length} airing${todays.length === 1 ? '' : 's'} · ${esc(dur(total))}</span></div>`);
+    for (const a of todays) {
+      if (!frontierDrawn && a.start >= d.frontier) { out.push(frontierRow()); frontierDrawn = true; }
+      const rep = a.repeat_of != null;
+      const sub = subline(a);
+      const label = `${timeOf(a.start, tz)} · ${headline(a)} · ${a.pool}`;
+      out.push(`<div class="agrow" tabindex="0" role="button" data-index="${a.index}" aria-label="${esc(label)}">
+        <span class="tm">${esc(timeOf(a.start, tz))}</span>
+        <span><b>${esc(headline(a))}</b>${sub ? `<div class="ep">${esc(sub)}</div>` : ''}</span>
+        <span class="meta"><span class="swatch" style="background:${colors[a.pool] || '#ccc'}"></span>${esc(a.pool)} · ${esc(dur(a.duration_secs))}${rep ? ' <span class="tagx">Repeat</span>' : ''}${a.projected ? ' <span class="tagx proj">Projected</span>' : ''}${changedAt.has(a.index) ? ' <span class="tagx">Changed</span>' : ''}</span></div>`);
+    }
+  }
+  if (!frontierDrawn) out.push(frontierRow());
+  $('agenda').innerHTML = out.join('');
 }
 
 // Full title on hover or keyboard focus, for blocks too short to show it.
@@ -2351,12 +2470,12 @@ async function discardDraft() {
   location.hash = channelHash(channel, 'pools');
 }
 
-$('lineupSelect').addEventListener('change', () => { const r = parseRoute(); if (r.tab === 'edit') { location.hash = editHash($('lineupSelect').value); return; } location.hash = channelHash($('lineupSelect').value, r.view, r.project); });
+$('lineupSelect').addEventListener('change', () => { const r = parseRoute(); if (r.tab === 'edit') { location.hash = editHash($('lineupSelect').value); return; } location.hash = channelHash($('lineupSelect').value, r.view, r.project, null, r.layout); });
 // Choosing a projection length changes the hash; choosing the pressed length again asks for it afresh.
 function chooseProject(project) {
   const r = parseRoute();
   if (!r.channel) return;
-  const target = channelHash(r.channel, r.view, project, r.draft);
+  const target = channelHash(r.channel, r.view, project, r.draft, r.layout);
   if (location.hash === target) { shown = null; route(); } else location.hash = target;
 }
 for (const b of $('projBtns').querySelectorAll('button')) b.addEventListener('click', () => chooseProject(b.dataset.project));
