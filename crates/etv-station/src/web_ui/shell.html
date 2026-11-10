@@ -96,7 +96,16 @@
   .facts dt { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
   .facts dd { margin: 0; font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
   .facts dd.d { font-size: 11.5px; font-weight: 400; color: var(--muted); max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  @media (max-width: 900px) { .mast { grid-template-columns: auto minmax(0, 1fr); } .facts { grid-column: 1 / -1; } }
+  .mast .sumline { display: none; }
+  @media (max-width: 900px) {
+    .mast { grid-template-columns: auto minmax(0, 1fr); }
+    .facts { grid-column: 1 / -1; }
+    /* Narrow: number, name and one summary line; the config path, the pattern text and the four stats sit behind Details. */
+    .mast .sumline { display: flex; justify-content: space-between; align-items: center; gap: 10px; min-height: 44px; cursor: pointer; font-size: 12.5px; color: var(--muted); }
+    .mast .sumline .dtl { color: var(--accent); font-weight: 700; white-space: nowrap; }
+    .mast:not(.open) .sub, .mast:not(.open) .pattern, .mast:not(.open) .facts { display: none; }
+  }
+  .mast .sumline:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
 
   .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; margin: 0 0 8px; align-items: center; }
   .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 1px; margin-right: 5px; vertical-align: -1px; }
@@ -1425,7 +1434,8 @@ function render(d) {
     <div class="bug">${esc(d.number)}</div>
     <div>
       <h1>${esc(d.display_name || d.name)}</h1>
-      <div class="sub">${esc(dayOf(d.start, tz))} – ${esc(dayOf(d.end - 1, tz))} · ${esc(covers)} (${esc(tz)}) · seed ${esc(seedLabel(d.seed))} · ${esc(d.config_path)}</div>
+      <div class="sumline" id="mastToggle" role="button" tabindex="0" aria-expanded="false" aria-controls="mastDetails"><span>${esc(dayOf(d.start, tz))} – ${esc(dayOf(d.end - 1, tz))} · ${esc(covers)} · ${d.items_aired} items aired</span><span class="dtl">Details <span aria-hidden="true">▾</span></span></div>
+      <div class="sub" id="mastDetails">${esc(dayOf(d.start, tz))} – ${esc(dayOf(d.end - 1, tz))} · ${esc(covers)} (${esc(tz)}) · seed ${esc(seedLabel(d.seed))} · ${esc(d.config_path)}</div>
       <div class="pattern"><button type="button" class="linkish" id="patternBtn">Blocks</button><span class="pstub" title="${esc(patternWords(d.blocks))}">${esc(patternWords(d.blocks))}</span></div>
     </div>
     <dl class="facts">
@@ -1532,6 +1542,19 @@ function render(d) {
       if (again) selectAiring(again);
     });
   }
+  const mast = document.querySelector('.mast');
+  const tg = $('mastToggle');
+  const setDetails = (open) => {
+    mast.classList.toggle('open', open);
+    tg.setAttribute('aria-expanded', String(open));
+    tg.querySelector('.dtl span').textContent = open ? '▴' : '▾';
+    try { localStorage.setItem('etv-mast-details', open ? '1' : '0'); } catch (e) { /* storage blocked: the toggle still works for this page */ }
+  };
+  let wasOpen = false;
+  try { wasOpen = localStorage.getItem('etv-mast-details') === '1'; } catch (e) { /* none saved */ }
+  setDetails(wasOpen);
+  tg.addEventListener('click', () => setDetails(!mast.classList.contains('open')));
+  tg.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setDetails(!mast.classList.contains('open')); } });
   $('patternBtn').addEventListener('click', () => { location.hash = channelHash(d.channel, 'blocks', parseRoute().project); });
   const ppm = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ppm'));
   // The hour label is centred on its line, so land 10px above the line: the whole label clears the sticky day header.
