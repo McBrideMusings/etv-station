@@ -1,9 +1,8 @@
 //! The station's web dashboard, served by `etv-station --serve-ui`: one page
 //! at `/` with a tab bar (Channels, Edit, Guide, Health) and, on Channels, a rail of
 //! every lineup channel. A channel's Schedule is its review — the airings
-//! the daemon has published and aired, a projection past them on request, their
-//! depth, overlap and programming grades, and why each airing is on it
-//! (`channel`); its Pools lists every pool with its sources, config, taste
+//! the daemon has published and aired, a projection past them on request, and
+//! why each airing is on it (`channel`); its Pools lists every pool with its sources, config, taste
 //! profile and ranking, and lets a person try profile edits in a draft
 //! (`pools`). The rail is the lineup in `station.yaml` order (`lineup`).
 //!
@@ -24,8 +23,7 @@
 //! directory and projections under the data volume beside the catalog. The server listens on the network in the container with no
 //! auth of its own, so every channel a request names is checked against the
 //! lineup. Requests are served one at a time on one thread; simulations run on
-//! `projection`'s worker thread, the lineup's candidate sets for the review's
-//! overlap on `overlap`'s, and stills on their own threads, and the
+//! `projection`'s worker thread and stills on their own threads, and the
 //! container runs the whole process at `nice 19` so the channels' transcodes
 //! always come first. A channel's Graphics page renders its overlay and bumper
 //! scripts the same way (`graphics`): `GET /api/channels/{ch}/graphics` lists
@@ -50,7 +48,6 @@ mod graphics;
 mod health;
 mod lineup;
 mod mcp;
-mod overlap;
 mod pools;
 mod preview;
 mod projection;
@@ -159,7 +156,6 @@ pub fn serve(options: Options) -> Result<(), String> {
 
     let review = ReviewState::new(options.station.clone(), options.catalog.clone());
     review.sims.spawn();
-    review.overlap.spawn();
     let mut state = AppState {
         catalog,
         pools: PoolState::default(),
@@ -189,16 +185,11 @@ fn api_health(state: &AppState) -> (u16, Value) {
     let channels = scored_channel_count(&o.station);
     let status = if channels.is_ok() { 200 } else { 503 };
     let sims = state.review.sims.stats();
-    let overlap = state.review.overlap.stats();
     let body = json!({
         "projections": {
             "in_memory": sims.in_memory,
             "queued": sims.queued,
             "running": sims.running,
-        },
-        "overlap": {
-            "fingerprints": overlap.fingerprints,
-            "running": overlap.running,
         },
         "ok": channels.is_ok(),
         "station": o.station.display().to_string(),
@@ -937,7 +928,6 @@ mod tests {
             },
         };
         state.review.sims.spawn();
-        state.review.overlap.spawn();
         Fixture { dir, state }
     }
 
@@ -975,41 +965,6 @@ mod tests {
         let frontier = body["frontier"].as_i64().unwrap();
         assert_eq!(body["span"]["real_until"], frontier);
         assert_eq!(body["span"]["projected_until"], Value::Null);
-    }
-
-    /// The real schedule never waits on the overlap: with no overlap worker
-    /// running the review still answers 200 with its airings and the overlap
-    /// pending, and once the worker has resolved the lineup the overlap is
-    /// there.
-    #[test]
-    fn the_real_schedule_answers_while_the_overlap_is_resolving() {
-        let mut state = example_state();
-        let station =
-            config::load_for_inspection(&state.options.station).expect("example station loads");
-        let base = state.options.station.parent().unwrap().to_path_buf();
-        let key = lineup::lineup_keys(&station.lineup, &base)
-            .into_iter()
-            .next()
-            .unwrap();
-        let (status, body) = get_json(
-            &mut state,
-            &format!("/api/channels/{}/review", key.replace('/', "%2F")),
-        );
-        assert_eq!(status, 200, "{body}");
-        assert_eq!(body["overlap"]["pending"], true, "{}", body["overlap"]);
-        assert_eq!(body["overlap"]["ready"], 0);
-
-        let mut f = fixture();
-        for _ in 0..600 {
-            let (status, body) = review(&mut f.state, "");
-            assert_eq!(status, 200, "{body}");
-            if body["overlap"]["pending"] != true {
-                assert_eq!(body["overlap"]["candidates"], 20, "{}", body["overlap"]);
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        panic!("the overlap never resolved");
     }
 
     #[test]

@@ -7,18 +7,19 @@ channel against. Each principle has four parts:
 - one real network that does it;
 - how a `channel.yaml` says it today, with the key and a short example;
 - where today's schema cannot say it, the bead that tracks the gap;
-- how the Review view grades it, when a schedule yields a number for it.
+- how the `schedule-analysis` skill grades it, when a schedule yields a number for it.
 
 A number marked **unsourced** or **inference** is reasoning written for this
 page. No source states it. Treat it as a starting question for a review, not
 as a rule.
 
-The Review view grades a principle 0 to 3 only when the simulated schedule
+The `schedule-analysis` skill grades a principle 0 to 3 only when the schedule
 measures it; the channel's total counts those principles alone. A principle
 with no number to measure, or one that does not apply to the channel, is
 listed with the reason and left out of the total. Every grade threshold below
 is **unsourced** unless it cites a source: it is the line this page draws, not
-an industry standard. `crates/etv-station/src/review.rs` computes them.
+an industry standard. The station computes none of them: an agent applies them
+to a schedule's airings (`.claude/skills/schedule-analysis/SKILL.md`).
 
 The keys named below are documented in the [config schema](/schema).
 Every YAML example is a fragment. `pools:`, `pattern:` and `sequencer:` sit
@@ -393,7 +394,7 @@ schedules:
 each year's dates are written out.
 
 **Grade.** Not scored: a marathon is a choice a channel makes, not a standard
-it meets. The Review view shows the longest run of one show.
+it meets. `schedule-analysis` reports the longest run of one show.
 
 ## Interstitials and bumpers
 
@@ -539,7 +540,7 @@ rule:
 - Temperature is measured, not guessed. On 034 SyFy's films pools, a 14-day
   web UI review put the median pick at score rank 7 at `0.1`, 15 at
   `0.25`, and 21 at `0.5`. At `0.5`, 15 of 91 films came from below rank 100.
-  Run the Review view at two or three values and read the titles.
+  Run the dashboard's Schedule at two or three values and read the titles.
 - A shows pool usually wants `temperature: 0`. A new list there swaps which
   shows the rotation visits, and a show half-way through a season should not
   leave the rotation because a period ended. The walk opens each new list on

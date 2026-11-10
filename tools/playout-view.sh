@@ -86,7 +86,7 @@ if jq -e 'has("load_error")' "$work/review.json" >/dev/null; then
   exit 1
 fi
 jq '{
-  channel, number, name, display_name, tz, span, notices, day_starts, principles,
+  channel, number, name, display_name, tz, span, notices, day_starts,
   blocks: [.blocks[] | {name, pools, placed}],
   rotations: (.rotations // []),
   airings: [.airings[] | {index, label, kind, pool, start, duration_secs, projected, slot, schedule, rotation, rotation_reason}],

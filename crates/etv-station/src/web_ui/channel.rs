@@ -65,8 +65,8 @@ pub(super) fn drawn_from_pool(metadata: Option<&Value>) -> Option<String> {
 
 // ---------------------------------------------------------------------------
 // Channel review (the page's Schedule, `/api/channels/{ch}/review`): one channel's schedule as
-// a report — depth before repeats, film/series share, overlap with the rest of
-// the lineup, seeded tune-in samples and a day-by-day guide. It opens on the
+// a report — the first repeat, film/series share, seeded tune-in samples and a
+// day-by-day guide. It opens on the
 // channel's real airings (`real`: the published playout and the play history),
 // with no simulation. `?project=Nd` adds N days simulated from the real
 // frontier, seeded from the daemon's `.resume` state and recent airings; the
@@ -82,11 +82,6 @@ const TUNE_IN_SAMPLES: usize = 5;
 /// What the Review view keeps between requests.
 pub(super) struct ReviewState {
     station_path: PathBuf,
-    /// Every channel's candidate ids and the library's, filled by a worker
-    /// thread so no request resolves one.
-    pub(super) overlap: Arc<super::overlap::OverlapCache>,
-    /// The last review's comparable numbers per channel, for "Since last run".
-    previous: HashMap<String, Vec<(String, Value)>>,
     /// Every tune-in still a review has offered, keyed by the file name its
     /// URL carries, so `/api/stills/{id}` renders it on first request.
     stills: HashMap<String, TuneInStill>,
@@ -136,9 +131,7 @@ impl ReviewState {
                     .unwrap_or_else(|| std::env::temp_dir().join("etv-station-ui-renders")),
             ),
             candidate_digests: HashMap::new(),
-            overlap: super::overlap::OverlapCache::new(station_path.clone(), catalog_path.clone()),
             station_path,
-            previous: HashMap::new(),
             stills: HashMap::new(),
             still_dir: std::env::temp_dir()
                 .join("etv-station-ui-stills")
@@ -203,7 +196,7 @@ pub(super) fn api_channel_review(
         draft = %draft_id,
         pending,
         changed_airings = diff["changed_airings"].as_array().map(Vec::len).unwrap_or(0),
-        "review: draft graded against deployed"
+        "review: draft compared against deployed"
     );
     Ok((
         if pending { 202 } else { 200 },
@@ -222,59 +215,10 @@ pub(super) fn api_channel_review(
 /// a draft re-simulation costs about 10s a generation (etv-station-1ne2).
 const DRAFT_PROJECT_DAYS: u32 = 3;
 
-/// What moved between a deployed review and its draft: each principle's grade
-/// with a direction in words, each depth row, the first repeat, and the draft
-/// airings that are not the deployed schedule's airing at the same instant.
+/// What moved between a deployed review and its draft: the first repeat, and
+/// the draft airings that are not the deployed schedule's airing at the same
+/// instant.
 fn review_diff(deployed: &Value, draft: &Value) -> Value {
-    let direction = |was: Option<i64>, now: Option<i64>| match (was, now) {
-        (Some(w), Some(n)) if n > w => "up",
-        (Some(w), Some(n)) if n < w => "down",
-        _ => "same",
-    };
-    let principles =
-        |r: &Value| -> Vec<Value> { r["principles"].as_array().cloned().unwrap_or_default() };
-    let dep_principles = principles(deployed);
-    let grades: Vec<Value> = principles(draft)
-        .iter()
-        .map(|p| {
-            let was = dep_principles.iter().find(|d| d["name"] == p["name"]);
-            let (was_grade, now_grade) =
-                (was.and_then(|w| w["grade"].as_i64()), p["grade"].as_i64());
-            json!({
-                "name": p["name"],
-                "deployed": was.map(|w| w["grade"].clone()).unwrap_or(Value::Null),
-                "draft": p["grade"],
-                "deployed_measure": was.map(|w| w["measure"].clone()).unwrap_or(Value::Null),
-                "draft_measure": p["measure"],
-                "direction": direction(was_grade, now_grade),
-            })
-        })
-        .collect();
-
-    let row_id = |r: &Value| format!("{}|{}|{}", r["kind"], r["name"], r["pool"]);
-    let dep_depth: Vec<Value> = deployed["depth"].as_array().cloned().unwrap_or_default();
-    let depth: Vec<Value> = draft["depth"]
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .map(|r| {
-                    let was = dep_depth.iter().find(|d| row_id(d) == row_id(r));
-                    json!({
-                        "kind": r["kind"],
-                        "name": r["name"],
-                        "pool": r["pool"],
-                        "aired": { "deployed": was.map(|w| w["aired"].clone()), "draft": r["aired"] },
-                        "distinct": { "deployed": was.map(|w| w["distinct"].clone()), "draft": r["distinct"] },
-                        "first_repeat_days": {
-                            "deployed": was.map(|w| w["first_repeat_days"].clone()),
-                            "draft": r["first_repeat_days"],
-                        },
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     let at = |a: &Value| (a["start"].as_i64(), a["id"].as_str().map(str::to_string));
     let dep_airings: Vec<Value> = deployed["airings"].as_array().cloned().unwrap_or_default();
     let deployed_set: HashSet<(Option<i64>, Option<String>)> = dep_airings.iter().map(at).collect();
@@ -301,8 +245,6 @@ fn review_diff(deployed: &Value, draft: &Value) -> Value {
         .unwrap_or_default();
 
     json!({
-        "grades": grades,
-        "depth": depth,
         "first_repeat": { "deployed": deployed["first_repeat"], "draft": draft["first_repeat"] },
         "changed_airings": changed,
     })
@@ -531,9 +473,6 @@ pub(super) fn channel_review(
                 .map(|e| e.kind.clone())
                 .unwrap_or_else(|| "unknown".to_string()),
             show: entry.as_ref().and_then(|e| e.show.clone()),
-            show_id: a.show_id.clone(),
-            season: entry.as_ref().and_then(|e| e.season),
-            episode: entry.as_ref().and_then(|e| e.episode),
             pool: drawn_from_pool(a.metadata.as_ref())
                 .unwrap_or_else(|| block_names.get(a.block).cloned().unwrap_or_default()),
             start: a.start,
@@ -542,27 +481,6 @@ pub(super) fn channel_review(
     }
 
     let review = build_review(state, &station, lc, &airings, &simulated, start, end)?;
-    let summary = comparable_numbers(&review);
-    // A draft's numbers are not the channel's "last run", and neither are
-    // numbers whose overlap count is still resolving.
-    let overlap_pending = review["overlap"]["pending"] == true;
-    let since_last = match draft {
-        None if overlap_pending => state.review.previous.get(&key).cloned(),
-        None => state.review.previous.insert(key.clone(), summary.clone()),
-        Some(_) => None,
-    };
-    let since_last_json = since_last.map(|old| {
-        let old: HashMap<String, Value> = old.into_iter().collect();
-        summary
-            .iter()
-            .map(|(label, new)| {
-                let old = old.get(label).cloned().unwrap_or(Value::Null);
-                // A number this review could not compute (null) is not a change.
-                json!({ "label": label, "old": old, "new": new, "changed": !new.is_null() && old != *new })
-            })
-            .collect::<Vec<_>>()
-    });
-
     let mut notices = Vec::new();
     let projected_airings = &airings[real_count.min(airings.len())..];
     let unprobed = projected_airings
@@ -665,11 +583,6 @@ pub(super) fn channel_review(
         pending,
         real_airings = real_count,
         airings = airings.len(),
-        overlap_channels = review["overlap"]["channels"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or(0),
-        overlap_pending,
         real_ms,
         ms = began.elapsed().as_millis() as u64,
         "review: schedule replayed"
@@ -699,7 +612,6 @@ pub(super) fn channel_review(
     if pending {
         obj.insert("pending".into(), json!(true));
     }
-    obj.insert("since_last".into(), json!(since_last_json));
     obj.insert("notices".into(), json!(notices));
     obj.insert(
         "rotations".into(),
@@ -1028,151 +940,7 @@ fn candidate_contents(
         .collect())
 }
 
-/// Whether a channel's candidates hold every movie or every episode in the
-/// catalog — a channel that can air anything shares everything, so listing
-/// its overlap says nothing.
-fn is_whole_library(library: &(HashSet<String>, HashSet<String>), ids: &HashSet<String>) -> bool {
-    let (movies, episodes) = library;
-    (!movies.is_empty() && movies.is_subset(ids))
-        || (!episodes.is_empty() && episodes.is_subset(ids))
-}
-
-/// Every other channel sharing candidates with `lc`, largest first, each with
-/// the shared titles (episodes rolled up to their show). While the overlap
-/// worker is still resolving the lineup it is `{pending, ready, channels}`
-/// instead, and the page asks again; when the library or the worker failed it
-/// is `{error}`, and the rest of the review still answers.
-fn overlap_json(
-    state: &mut AppState,
-    station: &config::Station,
-    lc: &config::LoadedChannel,
-) -> Result<Value, String> {
-    use super::overlap::Lookup;
-    let began = std::time::Instant::now();
-    let paths: Vec<&Path> = station
-        .channels
-        .iter()
-        .map(|c| c.config_path.as_path())
-        .collect();
-    let (library, fingerprints) = match state.review.overlap.lookup(&paths) {
-        Lookup::Ready {
-            library,
-            fingerprints,
-        } => (library, fingerprints),
-        Lookup::Pending { ready, total } => {
-            tracing::info!(
-                event = "ui.review.overlap_pending",
-                channel = %channel_key(&lc.config_path),
-                ready,
-                channels = total,
-                "review: overlap still resolving"
-            );
-            return Ok(json!({ "pending": true, "ready": ready, "channels": total }));
-        }
-        Lookup::Failed(e) => {
-            tracing::warn!(event = "ui.review.overlap_failed", channel = %channel_key(&lc.config_path), error = %e, "review: overlap unavailable");
-            return Ok(json!({ "error": e }));
-        }
-    };
-    let mut own = None;
-    let mut others = Vec::new();
-    let mut errors = Vec::new();
-    for (other, ids) in station.channels.iter().zip(fingerprints) {
-        if other.config_path == lc.config_path {
-            own = Some(ids?);
-            continue;
-        }
-        match ids {
-            Ok(ids) => others.push((other, ids)),
-            Err(e) => {
-                errors.push(json!({ "channel": channel_key(&other.config_path), "error": e }))
-            }
-        }
-    }
-    let own = own.ok_or_else(|| format!("{} is not in the lineup", lc.config_path.display()))?;
-    let library = &*library;
-    let own_whole = is_whole_library(library, &own);
-
-    let mut whole_library = Vec::new();
-    let mut shared: Vec<(&config::LoadedChannel, Vec<String>)> = Vec::new();
-    for (other, ids) in others {
-        if is_whole_library(library, &ids) {
-            whole_library.push(channel_key(&other.config_path));
-            continue;
-        }
-        if own_whole {
-            continue;
-        }
-        let common: Vec<String> = own.intersection(&ids).cloned().collect();
-        if !common.is_empty() {
-            shared.push((other, common));
-        }
-    }
-    shared.sort_by(|a, b| {
-        b.1.len()
-            .cmp(&a.1.len())
-            .then(a.0.config.number.cmp(&b.0.config.number))
-    });
-
-    let channels: Vec<Value> = shared
-        .iter()
-        .map(|(other, ids)| {
-            json!({
-                "channel": channel_key(&other.config_path),
-                "number": other.config.number,
-                "display_name": other.config.display_name,
-                "shared": ids.len(),
-                "titles": shared_titles(&state.catalog, ids),
-            })
-        })
-        .collect();
-    tracing::info!(
-        event = "ui.review.overlap",
-        channel = %channel_key(&lc.config_path),
-        channels = station.channels.len(),
-        ms = began.elapsed().as_millis() as u64,
-        "review: overlap computed"
-    );
-    Ok(json!({
-        "this_channel_whole_library": own_whole,
-        "candidates": own.len(),
-        "channels": channels,
-        "whole_library": whole_library,
-        "errors": errors,
-    }))
-}
-
-/// Shared ids as titles: a film as `Title (Year)`, a show's episodes as one
-/// `Show (n episodes)` line. Most shared first.
-fn shared_titles(catalog: &Catalog, ids: &[String]) -> Vec<String> {
-    let mut shows: HashMap<String, usize> = HashMap::new();
-    let mut films: Vec<String> = Vec::new();
-    for id in ids {
-        match catalog.entry(id).ok().flatten() {
-            Some(e) => match &e.show {
-                Some(show) => *shows.entry(show.clone()).or_insert(0) += 1,
-                None => films.push(airing_label(&e)),
-            },
-            None => films.push(id.clone()),
-        }
-    }
-    let mut shows: Vec<(String, usize)> = shows.into_iter().collect();
-    shows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    films.sort();
-    shows
-        .into_iter()
-        .map(|(show, n)| {
-            if n == 1 {
-                format!("{show} (1 episode)")
-            } else {
-                format!("{show} ({n} episodes)")
-            }
-        })
-        .chain(films)
-        .collect()
-}
-
-/// The report itself: header, tiles, depth rows, overlap and tune-in samples.
+/// The report itself: header, tiles and tune-in samples.
 fn build_review(
     state: &mut AppState,
     station: &config::Station,
@@ -1185,7 +953,7 @@ fn build_review(
     use crate::review;
 
     let days = (end - start).as_seconds_f64() / 86_400.0;
-    let first_repeat = review::first_repeat(airings, start, |_| true)
+    let first_repeat = review::first_repeat(airings, start)
         .map(|r| json!({ "days": r.days, "index": r.index, "label": airings[r.index].title }));
 
     // The last airing can run past the span's end; only its share inside the
@@ -1206,21 +974,6 @@ fn build_review(
             0.0
         }
     };
-
-    let depth: Vec<Value> = review::depth_rows(airings, start)
-        .into_iter()
-        .map(|row| {
-            json!({
-                "kind": row.kind,
-                "name": row.name,
-                "pool": row.pool,
-                "aired": row.aired,
-                "distinct": row.distinct,
-                "first_repeat_days": row.first_repeat.as_ref().map(|r| r.days),
-                "first_repeat_label": row.first_repeat.as_ref().map(|r| airings[r.index].title.clone()),
-            })
-        })
-        .collect();
 
     let seed = review_seed(station, lc, start);
     let mut samples: Vec<Value> = Vec::new();
@@ -1257,47 +1010,6 @@ fn build_review(
         .map(|a| a.id.as_str())
         .collect::<HashSet<_>>()
         .len();
-    let overlap = overlap_json(state, station, lc)?;
-
-    let random_order_pools: HashSet<String> = lc
-        .config
-        .rule
-        .blocks
-        .iter()
-        .flat_map(|b| &b.pools)
-        .filter(|p| matches!(p.order, Some(config::Order::Random)))
-        .map(|p| p.name.clone())
-        .collect();
-    let show_ids: Vec<String> = airings
-        .iter()
-        .filter_map(|a| a.show_id.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    let episode_counts = state
-        .catalog
-        .episode_counts_for(&show_ids)
-        .map_err(|e| e.to_string())?;
-    let principles: Vec<Value> = review::grade_principles(&review::GradeInputs {
-        airings,
-        start,
-        end,
-        tz: crate::tz::parse(&station.station.tz).map_err(|e| e.to_string())?,
-        random_order_pools: &random_order_pools,
-        episode_counts: &episode_counts,
-    })
-    .into_iter()
-    .map(|p| {
-        json!({
-            "name": p.name,
-            "grade": p.grade,
-            "value": p.value,
-            "measure": p.measure,
-            "not_scored": p.not_scored,
-        })
-    })
-    .collect();
-
     Ok(json!({
         "channel": channel_key(&lc.config_path),
         "config_path": lc.config_path.display().to_string(),
@@ -1319,9 +1031,6 @@ fn build_review(
         },
         "items_aired": airings.len(),
         "distinct_items": distinct,
-        "depth": depth,
-        "principles": principles,
-        "overlap": overlap,
         "samples": samples,
     }))
 }
@@ -1489,59 +1198,6 @@ fn render_review_still(dir: &Path, id: &str, still: &TuneInStill) -> Result<Vec<
         "still: rendered"
     );
     Ok(jpeg)
-}
-
-/// The numbers "Since last run" compares, in display order.
-fn comparable_numbers(review: &Value) -> Vec<(String, Value)> {
-    let pct = |v: &Value| v.as_f64().map(|f| json!((f * 1000.0).round() / 10.0));
-    let mut out = vec![
-        ("Days shown".to_string(), review["days"].clone()),
-        (
-            "Days until first repeat".to_string(),
-            review["first_repeat"]["days"]
-                .as_f64()
-                .map(|d| json!((d * 10.0).round() / 10.0))
-                .unwrap_or(Value::Null),
-        ),
-        (
-            "Film share of airtime (%)".to_string(),
-            pct(&review["airtime"]["film_share"]).unwrap_or(Value::Null),
-        ),
-        (
-            "Series share of airtime (%)".to_string(),
-            pct(&review["airtime"]["series_share"]).unwrap_or(Value::Null),
-        ),
-        // `channels` is a count while the overlap is pending and absent when
-        // it failed: then there is no number to compare.
-        (
-            "Channels sharing content".to_string(),
-            review["overlap"]["channels"]
-                .as_array()
-                .map(|c| json!(c.len()))
-                .unwrap_or(Value::Null),
-        ),
-        ("Items aired".to_string(), review["items_aired"].clone()),
-        (
-            "Distinct items".to_string(),
-            review["distinct_items"].clone(),
-        ),
-    ];
-    for row in review["depth"].as_array().into_iter().flatten() {
-        if row["kind"] != "pool" {
-            continue;
-        }
-        out.push((
-            format!(
-                "Pool {} — days until first repeat",
-                row["name"].as_str().unwrap_or("")
-            ),
-            row["first_repeat_days"]
-                .as_f64()
-                .map(|d| json!((d * 10.0).round() / 10.0))
-                .unwrap_or(Value::Null),
-        ));
-    }
-    out
 }
 
 #[cfg(test)]

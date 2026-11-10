@@ -157,8 +157,8 @@ pub(super) const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "channel_review",
-        about: "A channel's schedule review: published and aired airings, depth, overlap, \
-                programming grades. Waits while a projection runs.",
+        about: "A channel's schedule review: published and aired airings, first repeat, \
+                airtime split, tune-in samples. Waits while a projection runs.",
         verb: Verb::Get,
         path: "/api/channels/{channel}/review",
         args: &[

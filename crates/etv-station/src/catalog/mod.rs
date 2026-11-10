@@ -1067,37 +1067,6 @@ impl Catalog {
         Ok(out)
     }
 
-    /// How many episodes the catalog holds for each requested `show_id` — a
-    /// show's library size, as `docs/programming.md` uses the term. A show
-    /// with no episodes in the catalog is missing from the returned map.
-    pub fn episode_counts_for(
-        &self,
-        show_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, usize>, CatalogError> {
-        let mut out = std::collections::HashMap::new();
-        let mut seen = std::collections::HashSet::new();
-        let unique: Vec<&String> = show_ids.iter().filter(|id| seen.insert(*id)).collect();
-        for chunk in unique.chunks(500) {
-            let placeholders = std::iter::repeat_n("?", chunk.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!(
-                "SELECT show_id, COUNT(*) FROM entries \
-                 WHERE type = 'episode' AND missing_since IS NULL \
-                 AND show_id IN ({placeholders}) GROUP BY show_id"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-            })?;
-            for row in rows {
-                let (show_id, n) = row?;
-                out.insert(show_id, n as usize);
-            }
-        }
-        Ok(out)
-    }
-
     /// Every requested entry's collection names, each list ascending — the
     /// names a pool's `item.collections` reads. One statement per ~500 ids; an
     /// entry in no collection is missing from the returned map.
@@ -2161,28 +2130,6 @@ mod tests {
         c.add_collection_item("coll1", "b", 0).unwrap();
         c.add_collection_item("coll1", "c", 1).unwrap();
         assert_eq!(c.collection_members("coll1").unwrap(), vec!["b", "c", "a"]);
-    }
-
-    #[test]
-    fn episode_counts_for_counts_only_live_episodes_per_show() {
-        let c = cat();
-        for (id, show_id) in [("e1", "s1"), ("e2", "s1"), ("e3", "s2")] {
-            let mut e = Entry::new(id, "episode", id, Source::Plex);
-            e.show_id = Some(show_id.into());
-            c.upsert_entry(&e).unwrap();
-        }
-        c.conn
-            .execute(
-                "UPDATE entries SET missing_since = '2026-10-01' WHERE entry_id = 'e2'",
-                [],
-            )
-            .unwrap();
-        let got = c
-            .episode_counts_for(&["s1".into(), "s2".into(), "s9".into()])
-            .unwrap();
-        assert_eq!(got["s1"], 1);
-        assert_eq!(got["s2"], 1);
-        assert!(!got.contains_key("s9"));
     }
 
     #[test]

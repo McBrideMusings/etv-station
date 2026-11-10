@@ -105,10 +105,11 @@ applicable" with the reason.
 ## Step 4 — review pass
 
 Run the channel review as `.claude/skills/programming/SKILL.md` §"The channel review"
-says, 14 days, and keep the server running — the before/after of any fix you
-propose comes from the same process. Grade the channel against
-`docs/programming.md`, naming the principle behind each critique, and report
-the three numbers that skill names plus every `principles` grade below 2.
+says, 14 days, and keep its JSON — the before/after of any fix you propose
+compares against it. Run `schedule-analysis` on that JSON
+for the principle grades, depth and overlap, name the principle behind each
+critique, and report the two numbers `programming` names plus every grade
+below 2.
 
 If every channel answers `no such column`, prod's catalog is at an older schema
 than this checkout (etv-station-jrkt). Say the review pass is blocked and why,
@@ -134,14 +135,14 @@ converts the markdown with pandoc, writes it into the Wheel artifact
 opens or reuses a web pane on it. Re-running with the same name rewrites the same
 page. It exits 3 outside a Wheel agent pane (`WHEEL_PANE` unset); then the whole
 report goes in chat instead. With the page open, chat carries only the headline,
-the three numbers, and the fixes' option lines, so `1A`/`go` can be typed here.
+the two numbers, and the fixes' option lines, so `1A`/`go` can be typed here.
 
 The report, in this order:
 
 1. **Headline**: the finding that costs a viewer the most, as a number
    (minutes of error card per day, airings in the wrong language).
 2. **Findings by element**, each as a bug report (see the top of this file).
-3. **Programming review**: grades, the three numbers, critiques with their
+3. **Programming review**: grades, the two numbers, critiques with their
    principle.
 4. **Fixes**, as numbered options with a pick in the CLAUDE.md template — a
    `deploy/appdata/` edit (the `programming` skill owns how), a bead for a

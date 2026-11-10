@@ -13,7 +13,7 @@ of them. It names the steps around a schedule edit.
 
 1. **Read `docs/programming.md`** in full before changing what a channel airs or
    when. Name the principle each change serves when you report it.
-2. **Run the channel's review and keep its numbers** (below). That run is
+2. **Run the channel's review and keep its JSON** (below). That run is
    the "before".
 3. **Read the comment-style rule** for `channel.yaml` in `CLAUDE.local.md`
    (§"Comment style in `deploy/appdata/channels/*/channel.yaml`") and follow it.
@@ -66,18 +66,12 @@ channel files on every request, so an edit needs no restart.
 
 ## After the edit
 
-Request the same channel and `days` again **from the same web UI process**.
-The response's `since_last` array then holds one `{label, old, new, changed}`
-row per number. Report these three in chat, before → after:
+Request the same channel and `days` again and keep that JSON beside the
+"before". Report these two in chat, before → after:
 
-- `Days until first repeat` (`null` means nothing repeated inside `days`)
-- `Film share of airtime (%)`
-- `Channels sharing content` (overlap)
+- `first_repeat.days` (`null` means nothing repeated inside `days`)
+- `airtime.film_share`
 
-Add any other row whose `changed` is `true`, and the `principles` array's grades
-before → after. A grade is a 0–3 reading of one measured number against the
-thresholds under that principle's **Grade.** in `docs/programming.md`, most of
-them unsourced: say what moved and which principle the move answers to, and
-read a grade as a question about the channel, not a verdict on it. A restarted web UI has no "before"
-— `since_last` is `null` on its first request for a channel — so keep the
-process running across the edit.
+For principle grades, depth, overlap with other channels and every other
+number that moved, run `schedule-analysis` with the "before" JSON as
+`--previous`. Say what moved and which principle the move answers to.

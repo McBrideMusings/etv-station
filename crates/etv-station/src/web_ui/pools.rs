@@ -1567,7 +1567,7 @@ mod tests {
     }
 
     /// Asks again until both simulations have finished.
-    fn graded(state: &mut AppState, query: &str) -> Value {
+    fn settled(state: &mut AppState, query: &str) -> Value {
         for _ in 0..1200 {
             let (status, body) = call(state, Method::Get, query, "");
             if status == 200 {
@@ -1585,7 +1585,7 @@ mod tests {
         let draft = open_draft(&mut f.state, "foryou");
         add_desert(&mut f.state, &draft);
         let query = format!("/api/channels/foryou/review?draft={draft}&project=1d");
-        let body = graded(&mut f.state, &query);
+        let body = settled(&mut f.state, &query);
         let (dep, dra) = (
             body["deployed"]["projection"]["key"]
                 .as_str()
@@ -1630,11 +1630,11 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_that_changes_what_airs_names_the_airings_and_the_grade_that_moved() {
+    fn a_draft_that_changes_what_airs_names_the_airings_that_moved() {
         let mut f = fixture();
         let draft = open_draft(&mut f.state, "foryou");
         add_desert(&mut f.state, &draft);
-        let body = graded(
+        let body = settled(
             &mut f.state,
             &format!("/api/channels/foryou/review?draft={draft}&project=3d"),
         );
@@ -1646,26 +1646,6 @@ mod tests {
             "{first}"
         );
         assert_ne!(first["id"], first["was"], "{first}");
-        let grades = body["diff"]["grades"].as_array().unwrap();
-        assert!(!grades.is_empty());
-        // Four movies cannot move a grade's 0-3 score, but the draft does
-        // change what a graded principle measured.
-        assert!(
-            grades
-                .iter()
-                .any(|g| g["deployed_measure"] != g["draft_measure"]),
-            "{grades:?}"
-        );
-        for g in grades {
-            let dir = g["direction"].as_str().unwrap();
-            let (was, now) = (g["deployed"].as_i64(), g["draft"].as_i64());
-            let expected = match (was, now) {
-                (Some(w), Some(n)) if n > w => "up",
-                (Some(w), Some(n)) if n < w => "down",
-                _ => "same",
-            };
-            assert_eq!(dir, expected, "{g}");
-        }
         assert_eq!(
             body["deployed"]["span"]["label"], "real + 3 days projected",
             "the draft window is the deployed window"
@@ -1674,7 +1654,7 @@ mod tests {
         // A draft with no edit and the channel's own account is the deployed
         // schedule: nothing changed.
         let idle = open_channel_account_draft(&mut f.state, "foryou");
-        let same = graded(
+        let same = settled(
             &mut f.state,
             &format!("/api/channels/foryou/review?draft={idle}&project=3d"),
         );
@@ -1686,11 +1666,11 @@ mod tests {
         let mut f = fixture();
         let own = open_channel_account_draft(&mut f.state, "foryou");
         let other = open_draft(&mut f.state, "foryou");
-        let own_body = graded(
+        let own_body = settled(
             &mut f.state,
             &format!("/api/channels/foryou/review?draft={own}&project=1d"),
         );
-        let other_body = graded(
+        let other_body = settled(
             &mut f.state,
             &format!("/api/channels/foryou/review?draft={other}&project=1d"),
         );

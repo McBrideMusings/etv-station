@@ -11,9 +11,6 @@
   h1 { font-size:18px; margin:0 0 2px; }
   h2 { font-size:13px; margin:22px 0 6px; padding-top:8px; border-top:2px solid var(--line); }
   .sub { color:var(--dim); margin-bottom:10px; }
-  .chips { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
-  .chip { border:1px solid var(--line); border-radius:12px; padding:1px 9px; }
-  .chip b { color:var(--accent); }
   table { border-collapse:collapse; width:100%; }
   td, th { text-align:left; padding:3px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:var(--dim); font-weight:500; }
@@ -56,16 +53,6 @@ function render(d) {
     `${d.channel} · ${d.span.label} · ${d.airings.length} airings, ${d.bumpers.length} bumpers · ${d.tz}`));
   if ((d.notices || []).length) app.append(el("div", "", d.notices.join(" ")));
   app.append(el("div", "dim", "Bumpers show for the published span only; the projection does not run the bumper fill."));
-
-  const chips = el("div", "chips");
-  for (const p of d.principles || []) {
-    const c = el("span", "chip");
-    c.append(el("span", "", p.name + " "));
-    c.append(el("b", "", p.grade === null || p.grade === undefined ? "n/a" : `${p.grade}/3`));
-    c.title = p.measure || p.not_scored || "";
-    chips.append(c);
-  }
-  app.append(chips);
 
   const blocks = el("details");
   blocks.append(el("summary", "", `${d.blocks.length} blocks and pools`));

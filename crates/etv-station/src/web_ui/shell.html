@@ -8,7 +8,7 @@
   :root {
     color-scheme: light;
     --bg: #ffffff; --fg: #16181d; --muted: #5f6670; --line: #dfe2e7; --panel: #f6f7f9;
-    --accent: #3d4fd1; --bar: #3d4fd1; --bar-open: #9aa3b1; --track: #e9ebef;
+    --accent: #3d4fd1; --bar: #3d4fd1; --track: #e9ebef;
     --warn-bg: #fff6d8; --warn-fg: #6b4e00; --err-bg: #fde8e8; --err-fg: #8a1414;
     --ink-bg: #16181d; --ink-fg: #ffffff;
     --up: #1a7f37; --down: #b42318;
@@ -19,7 +19,7 @@
     :root {
       color-scheme: dark;
       --bg: #121418; --fg: #e6e8ec; --muted: #9298a3; --line: #2c3038; --panel: #1b1e24;
-      --accent: #8e9cff; --bar: #8e9cff; --bar-open: #5c6370; --track: #262a32;
+      --accent: #8e9cff; --bar: #8e9cff; --track: #262a32;
       --warn-bg: #3a3014; --warn-fg: #f2d98a; --err-bg: #3d1c1c; --err-fg: #ffb4b4;
       --ink-bg: #e6e8ec; --ink-fg: #121418;
       --up: #5fd07a; --down: #ff8f85;
@@ -118,7 +118,7 @@
     .facts { grid-column: 1 / -1; }
   }
   @media (max-width: 900px) {
-    /* Narrow: number, name and one summary line; the config path, the pattern text and the four stats sit behind Details. */
+    /* Narrow: number, name and one summary line; the config path, the pattern text and the three stats sit behind Details. */
     .mast .sumline { display: flex; justify-content: space-between; align-items: center; gap: 10px; min-height: 44px; cursor: pointer; font-size: 12.5px; color: var(--muted); }
     .mast .sumline .dtl { color: var(--accent); font-weight: 700; white-space: nowrap; }
     .mast:not(.open) .sub, .mast:not(.open) .pattern, .mast:not(.open) .facts { display: none; }
@@ -138,8 +138,6 @@
   /* Changed by the draft: a thick solid frame with an inset gap, which no repeat or projected marker uses and which does not rely on colour. */
   .blk.chg { border: 3px solid var(--fg); box-shadow: inset 0 0 0 2px var(--bg); }
   .swatch.chg { width: 14px; height: 10px; background-color: var(--track); border: 3px solid var(--fg); box-sizing: border-box; }
-  .dir { font-weight: 700; white-space: nowrap; }
-  .arrow { color: var(--muted); }
   .swatch.proj { width: 14px; height: 10px; background-color: var(--track); border: 1px dashed var(--fg); }
   .frontier { position: absolute; left: 0; right: 0; height: 0; border-top: 2px solid var(--err-fg); z-index: 1; pointer-events: none; }
   .frontier span { position: absolute; right: 2px; top: 1px; font-size: 9.5px; font-weight: 700; color: var(--err-fg); background: var(--bg); padding: 0 3px; border-radius: 2px; }
@@ -194,9 +192,12 @@
   .ag-now .bar span { display: block; height: 100%; background: var(--fg); }
   .ag-day { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; border-bottom: 2px solid var(--fg); font-weight: 700; padding: 12px 4px 4px; }
   .ag-day .n { font-weight: 400; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .agrow { display: grid; grid-template-columns: 78px minmax(0, 1fr) auto; gap: 2px 12px; align-items: baseline; padding: 8px 4px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .agrow { display: grid; grid-template-columns: 78px minmax(0, 1fr) auto; gap: 2px 12px; align-items: baseline; padding: 8px 4px; border-bottom: 1px solid var(--line); cursor: pointer;
+    /* Filled with the pool's colour, as the grid's blocks are, with dark text on it in both themes. */
+    background: var(--pc, transparent); color: #111; border-left: 6px solid rgba(0, 0, 0, .35); }
+  .agrow .ep { color: #333; }
   .agrow:focus-visible, .agrow:hover { outline: 2px solid var(--fg); outline-offset: -2px; }
-  .agrow.sel { background: var(--panel); outline: 3px solid var(--fg); outline-offset: -3px; }
+  .agrow.sel { outline: 3px solid var(--fg); outline-offset: -3px; }
   .agrow .tm { font-weight: 700; font-variant-numeric: tabular-nums; }
   .agrow .ep { color: var(--muted); font-size: 12px; }
   .agrow .meta { display: flex; gap: 6px; align-items: baseline; font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -206,6 +207,16 @@
   .blk.sel { outline: 3px solid var(--fg); outline-offset: -3px; }
   .rail section.insp { border-top: 2px solid var(--fg); background: var(--panel); padding: 8px 10px 12px; margin-bottom: 4px; }
   .insp h3 { font-size: 15px; margin: 0; }
+  .inspempty { display: flex; flex-direction: column; gap: 4px; align-items: center; text-align: center; padding: 28px 12px; border: 1px dashed var(--line); color: var(--muted); font-size: 12.5px; }
+  .inspempty b { color: var(--fg); font-size: 13px; }
+  /* Wide, the Schedule's panel is always there and Esc or another pick changes it; the × belongs to the phone sheet. */
+  /* The panel is as tall as the rail whether empty or full, so picking an airing never resizes it. */
+  @media (min-width: 901px) {
+    #insp[data-empty] .x { display: none; }
+    .rail section#insp[data-empty] { box-sizing: border-box; min-height: 100%; margin-bottom: 0; }
+    .rail section#insp.idle { display: flex; flex-direction: column; }
+    .rail section#insp.idle .inspempty { flex: 1; justify-content: center; }
+  }
   .insp .ep { color: var(--muted); font-size: 12.5px; }
   .insp .meta { display: flex; flex-wrap: wrap; gap: 2px 12px; font-size: 12px; margin: 4px 0 8px; font-variant-numeric: tabular-nums; }
   .insp h4 { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 10px 0 4px; }
@@ -231,30 +242,15 @@
   .preview-page .samples { grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
   .preview-page .sample { font-size: 12.5px; }
 
-  .ptotal { display: flex; gap: 10px; align-items: baseline; margin-bottom: 4px; }
-  .ptotal .big { font-size: 20px; font-weight: 750; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  table.principles td { vertical-align: top; padding: 3px 4px; }
-  table.principles .pname { font-weight: 600; width: 34%; }
-  table.principles .dots { white-space: nowrap; letter-spacing: 1px; font-size: 11px; }
-  table.principles .pmeasure { font-size: 11.5px; }
-  table.principles tr.unscored .pname { color: var(--muted); font-weight: 500; }
 
   table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
   th, td { text-align: left; padding: 2px 5px; border-bottom: 1px solid var(--line); vertical-align: middle; }
   th { color: var(--muted); font-weight: 500; font-size: 11.5px; }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-  tr.show td.name { padding-left: 20px; }
-  tr.pool td.name { font-weight: 600; }
   .bar { position: relative; height: 8px; background: var(--track); min-width: 40px; }
   .bar span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--bar); }
-  .bar span.open { background: var(--bar-open); }
-  .overlap-row { padding: 4px 0; border-bottom: 1px solid var(--line); font-size: 12.5px; }
-  .overlap-row summary { cursor: pointer; }
-  .overlap-row .titles { margin: 4px 0 2px 16px; font-size: 12px; color: var(--muted); }
-  .old { color: var(--muted); }
   td.v-fail { background: var(--err-bg); color: var(--err-fg); }
   td.v-stale { background: var(--warn-bg); color: var(--warn-fg); }
-  .changed .new { font-weight: 650; }
 
   @media (max-width: 900px) {
     :root { --col: 120px; }
@@ -289,11 +285,17 @@
     .agrow { grid-template-columns: 70px minmax(0, 1fr); }
     .agrow .meta { grid-column: 2; }
     /* The airing inspector is a sheet pinned to the bottom, at most half the viewport, with its own scroll; the page keeps room under the schedule so the selected block can scroll above it. */
+    .rail section#insp.idle { display: none; }
     .rail section#insp:not([hidden]) { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; max-height: 50vh; overflow-y: auto; overscroll-behavior: contain;
       margin: 0; padding: 14px 16px calc(12px + env(safe-area-inset-bottom)); border-radius: 12px 12px 0 0; box-shadow: 0 -6px 18px rgba(0, 0, 0, .35); }
+    .rail section#insp:not([hidden]):not(.idle) { animation: sheetin .22s ease-out; }
+    body:has(.rail section#insp:not([hidden]):not(.idle))::after { content: ""; position: fixed; inset: 0; z-index: 19; background: rgba(0, 0, 0, .45); pointer-events: none; animation: scrimin .22s ease-out; }
+    @keyframes sheetin { from { transform: translateY(100%); } }
+    @keyframes scrimin { from { opacity: 0; } }
+    @media (prefers-reduced-motion: reduce) { .rail section#insp, body::after { animation: none !important; } }
     .rail section#insp:not([hidden])::before { content: ""; display: block; width: 36px; height: 4px; border-radius: 2px; background: var(--line); margin: -8px auto 8px; }
     .insp .x { position: sticky; top: 0; min-width: 44px; min-height: 44px; margin: -10px -10px 0 8px; font-size: 22px; background: var(--panel); }
-    body:has(.rail section#insp:not([hidden])) { padding-bottom: 50vh; }
+    body:has(.rail section#insp:not([hidden]):not(.idle)) { padding-bottom: 50vh; }
     .rail { overflow: visible; }
   }
   /* Pools: one section per pool; the draft bar sits above them. */
@@ -531,9 +533,8 @@ const days1 = (d) => (Math.round(d * 10) / 10).toFixed(1);
 const hourLabel = (h) => (h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h - 12) + 'p');
 
 // Fetches the channel's review. The real schedule answers at once and is drawn; while a requested
-// projection runs the server answers 202 with that same real review, and while the lineup's overlap is
-// still resolving the review's `overlap` is `{pending}`, so the page asks again every second beside a
-// spinner and redraws when both have landed.
+// projection runs the server answers 202 with that same real review, so the page asks again every second
+// beside a spinner and redraws when the projection has landed.
 async function load(channel, project, view) {
   const q = new URLSearchParams();
   if (project) q.set('project', project);
@@ -557,10 +558,10 @@ async function load(channel, project, view) {
       data = await res.json();
       if (seq !== loadSeq) return;
       if (!res.ok) data = { error: `HTTP ${res.status}: ${data.error || 'no error message'}` };
-      if (!data.pending && !data.overlap?.pending) break;
+      if (!data.pending) break;
       if (!drewReal) { $('report').classList.remove('loading'); show(data, view); drewReal = true; }
-      if (Date.now() > deadline) throw new Error(`still ${data.pending ? 'projecting' : 'resolving the overlap'} after ${POLL_DEADLINE_MS / 1000}s; reload to keep waiting`);
-      if (data.pending) projecting();
+      if (Date.now() > deadline) throw new Error(`still projecting after ${POLL_DEADLINE_MS / 1000}s; reload to keep waiting`);
+      projecting();
       await new Promise((r) => setTimeout(r, 1000));
       if (seq !== loadSeq) return;
     }
@@ -596,9 +597,7 @@ async function loadDraft(channel, project, draft, view) {
     const which = [];
     if (pendingNow.deployed) which.push('deployed');
     if (pendingNow.draft) which.push('draft');
-    $('projState').innerHTML = which.length
-      ? `<span class="spinner"></span>Simulating ${esc(which.join(' and '))}… (asked again every ${DRAFT_POLL_MS / 1000}s) ${Math.round((Date.now() - began) / 1000)}s`
-      : `<span class="spinner"></span>Resolving the lineup's overlap… ${Math.round((Date.now() - began) / 1000)}s`;
+    $('projState').innerHTML = `<span class="spinner"></span>Simulating ${esc(which.join(' and '))}… (asked again every ${DRAFT_POLL_MS / 1000}s) ${Math.round((Date.now() - began) / 1000)}s`;
   };
   const pendingNow = { deployed: true, draft: true };
   const ticker = setInterval(simulating, 1000);
@@ -613,13 +612,12 @@ async function loadDraft(channel, project, draft, view) {
       data = await res.json();
       if (seq !== loadSeq) return;
       if (!res.ok && res.status !== 202) data = { error: `HTTP ${res.status}: ${data.error || 'no error message'}` };
-      if (!data.pending && !data.deployed?.overlap?.pending && !data.draft?.overlap?.pending) break;
+      if (!data.pending) break;
       pendingNow.deployed = !!data.deployed_pending;
       pendingNow.draft = !!data.draft_pending;
       if (!drewReal && data.deployed && !data.deployed.error) { $('report').classList.remove('loading'); show(data.deployed, view); drewReal = true; }
       simulating();
-      // Only the overlap left: it resolves in seconds, so ask again sooner than a simulation.
-      await new Promise((r) => setTimeout(r, data.pending ? DRAFT_POLL_MS : 1000));
+      await new Promise((r) => setTimeout(r, DRAFT_POLL_MS));
       if (seq !== loadSeq) return;
     }
   } catch (e) {
@@ -1502,17 +1500,10 @@ function render(d) {
   const span = d.days;
   const covers = d.span.label;   // "real only" or "real + N days projected"; every number below is over it
   const diff = d.diff || null;   // set when a draft is open: what moved against the deployed schedule
-  const gradeOf = (name) => (diff ? diff.grades.find((g) => g.name === name) : null);
-  const dots = (g) => (g == null ? '—' : '●'.repeat(g) + '○'.repeat(3 - g));
-  const WORDS = { up: '▲ up', down: '▼ down', same: '= same' };
   const html = [];
 
   // 1. Masthead
   const fr = d.first_repeat;
-  const ovPending = !!d.overlap.pending;
-  const ovError = d.overlap.error;
-  const ov = d.overlap.channels || [];
-  const largest = ov[0];
   html.push(`<header class="mast">
     <div class="bug">${esc(d.number)}</div>
     <div>
@@ -1526,14 +1517,10 @@ function render(d) {
         <dd class="d" title="${esc(fr ? fr.label : '')}">${fr ? esc(fr.label) : `Nothing repeated in ${esc(covers)}`}${diff ? `<br>deployed: ${diff.first_repeat.deployed ? days1(diff.first_repeat.deployed.days) + ' d' : '&gt;' + span + ' d'}` : ''}</dd></div>
       <div><dt>Film / series airtime</dt><dd>${Math.round(d.airtime.film_share * 100)}% / ${Math.round(d.airtime.series_share * 100)}%</dd>
         <dd class="d">${Math.round(d.airtime.total_secs / 3600)} h of airtime</dd></div>
-      <div><dt>Channels sharing content</dt><dd>${d.overlap.this_channel_whole_library || ovPending || ovError ? '—' : ov.length}</dd>
-        <dd class="d" title="${esc(largest ? `${largest.number} ${largest.display_name || largest.channel} (${largest.shared})` : '')}">${ovError ? 'Overlap unavailable' : ovPending ? `Resolving the lineup (${d.overlap.ready} of ${d.overlap.channels})…`
-          : d.overlap.this_channel_whole_library ? 'Draws from the whole library'
-          : largest ? `Largest: ${esc(largest.number)} ${esc(largest.display_name || largest.channel)} (${largest.shared})` : 'None share an item'}</dd></div>
       <div><dt>Items aired</dt><dd>${d.items_aired}</dd><dd class="d">${d.distinct_items} distinct · ${esc(covers)}</dd></div>
     </dl>
     ${notesHTML(d)}
-    ${diff ? `<div class="notes"><div class="notice" id="draftNote"><b>Draft ${esc(d.draftId)}</b> — ${diff.changed_airings.length} of ${d.airings.filter((a) => a.projected).length} projected airings differ from the deployed schedule over ${esc(covers)}. Grades read deployed → draft.</div></div>` : ''}
+    ${diff ? `<div class="notes"><div class="notice" id="draftNote"><b>Draft ${esc(d.draftId)}</b> — ${diff.changed_airings.length} of ${d.airings.filter((a) => a.projected).length} projected airings differ from the deployed schedule over ${esc(covers)}.</div></div>` : ''}
   </header>`);
 
   html.push(`<div class="legend">${Object.entries(colors).map(([p, c]) => `<span><span class="swatch" style="background:${c}"></span>${esc(p)}</span>`).join('')}
@@ -1548,67 +1535,7 @@ function render(d) {
   html.push(`<div class="layoutctl"><span class="seg" role="group" aria-label="Schedule layout" id="layoutBtns">
     <button type="button" data-layout="agenda" aria-pressed="${!grid}">Agenda</button>
     <button type="button" data-layout="grid" aria-pressed="${grid}">Grid</button></span></div>`);
-  html.push(`<div class="layout"><div class="gwrap${grid ? '' : ' agendawrap'}" id="gwrap">${grid ? '<div class="wk" id="guide"></div>' : '<div class="agenda" id="agenda"></div>'}</div><aside class="rail" id="rail"><section class="insp" id="insp" hidden></section>`);
-
-  // 3. Principles: graded where the schedule measures them, listed with the reason where it cannot.
-  const scored = d.principles.filter((p) => p.grade != null);
-  const points = scored.reduce((t, p) => t + p.grade, 0);
-  const principleRows = d.principles.map((p) => p.grade != null
-    ? (() => {
-      const g = gradeOf(p.name);
-      const cell = g
-        ? `<td class="dots" aria-label="${g.deployed ?? 'not scored'} of 3 deployed, ${p.grade} of 3 in the draft, ${g.direction}">${dots(g.deployed)} <span class="arrow">→</span> ${dots(p.grade)} <span class="dir">${WORDS[g.direction]}</span></td>`
-        : `<td class="dots" aria-label="${p.grade} of 3">${dots(p.grade)}</td>`;
-      const was = g && g.deployed_measure && g.deployed_measure !== p.measure ? `<br><span class="muted">deployed: ${esc(g.deployed_measure)}</span>` : '';
-      return `<tr><td class="pname">${esc(p.name)}</td>${cell}<td class="pmeasure">${esc(p.measure)}${was}</td></tr>`;
-    })()
-    : `<tr class="unscored"><td class="pname">${esc(p.name)}</td><td class="dots">—</td>
-        <td class="pmeasure">${p.measure ? esc(p.measure) + '<br>' : ''}<span class="muted">Not scored: ${esc(p.not_scored)}</span></td></tr>`).join('');
-  html.push(`<section><h2>Programming principles</h2>
-    <div class="ptotal"><span class="big">${diff ? `${diff.grades.reduce((t, g) => t + (g.deployed != null && g.draft != null ? g.deployed : 0), 0)} → ` : ''}${points} / ${scored.length * 3}</span>
-      <span class="muted">${scored.length} of ${d.principles.length} principles measured over ${esc(covers)}. Thresholds are in docs/programming.md under each principle's Grade.</span></div>
-    <table class="principles"><tbody>${principleRows}</tbody></table></section>`);
-
-  // 4. Depth
-  const depthRows = d.depth.map((r, di) => {
-    const days = r.first_repeat_days;
-    const pct = days == null ? 100 : Math.min(100, (days / span) * 100);
-    const value = days == null ? `&gt;${span} d` : `${days1(days)} d`;
-    const swatch = r.kind === 'pool' ? `<span class="swatch" style="background:${colors[r.name] || '#ccc'}"></span>` : '';
-    const tip = r.first_repeat_label ? ` title="First repeat: ${esc(r.first_repeat_label)}"` : '';
-    return `<tr class="${r.kind}"${tip}><td class="name">${swatch}${esc(r.name)}</td>
-      <td class="num">${r.aired} / ${r.distinct}</td>
-      <td style="width:30%"><div class="bar"><span class="${days == null ? 'open' : ''}" style="width:${pct}%"></span></div></td>
-      <td class="num">${value}${diff && diff.depth[di] && diff.depth[di].aired.deployed != null ? `<br><span class="muted">deployed: ${diff.depth[di].first_repeat_days.deployed == null ? '&gt;' + span : days1(diff.depth[di].first_repeat_days.deployed)} d</span>` : ''}</td></tr>`;
-  }).join('');
-  html.push(`<section><h2>Depth</h2>
-    <p class="muted">Days from the start of the span until each pool or show first airs something a second time, over ${esc(covers)}. Aired / distinct items.</p>
-    <table><thead><tr><th>Pool / show</th><th class="num">Aired</th><th></th><th class="num">First repeat</th></tr></thead>
-    <tbody>${depthRows}</tbody></table></section>`);
-
-  // 5. Overlap
-  const overlapRows = ovError
-    ? `<div class="error">${esc(ovError)}</div>`
-    : ovPending
-    ? `<p class="muted"><span class="spinner"></span>Resolving every channel's candidates (${d.overlap.ready} of ${d.overlap.channels})…</p>`
-    : d.overlap.this_channel_whole_library
-    ? '<p class="muted">This channel\'s pools resolve to the whole library, so every other channel overlaps it; no list.</p>'
-    : ov.length === 0 ? '<p class="muted">No other channel shares an item.</p>'
-    : ov.map((c) => `<details class="overlap-row"><summary><strong>${esc(c.number)} ${esc(c.display_name || c.channel)}</strong>
-        — ${c.shared} shared</summary><div class="titles">${c.titles.map((t) => `<div>${esc(t)}</div>`).join('')}</div></details>`).join('');
-  const excluded = (d.overlap.whole_library || []).length
-    ? `<p class="muted">Left out: ${d.overlap.whole_library.map(esc).join(', ')} — their pools resolve to the whole library.</p>` : '';
-  const errs = (d.overlap.errors || []).map((e) => `<div class="notice">${esc(e.channel)}: ${esc(e.error)}</div>`).join('');
-  html.push(`<section><h2>Overlap</h2>
-    <p class="muted">Channels whose configs resolve to some of the same items${ovPending || ovError ? '' : ` (${d.overlap.candidates} candidates here)`}, largest first.</p>
-    ${overlapRows}${excluded}${errs}</section>`);
-
-  // 6. Since last run
-  const since = d.since_last == null
-    ? '<p class="muted">First run of this channel in this session.</p>'
-    : `<table><tbody>${d.since_last.map((r) => `<tr class="${r.changed ? 'changed' : ''}"><td>${esc(r.label)}</td>
-        <td class="num"><span class="old">${esc(r.old ?? '—')}</span> → <span class="new">${esc(r.new ?? '—')}</span></td></tr>`).join('')}</tbody></table>`;
-  html.push(`<section><h2>Since last run</h2>${since}</section>`);
+  html.push(`<div class="layout"><div class="gwrap${grid ? '' : ' agendawrap'}" id="gwrap">${grid ? '<div class="wk" id="guide"></div>' : '<div class="agenda" id="agenda"></div>'}</div><aside class="rail" id="rail"><section class="insp idle" id="insp" data-empty="1">${INSP_EMPTY}</section>`);
 
   html.push('</aside></div>');
 
@@ -2075,10 +2002,13 @@ document.addEventListener('keydown', (e) => {
 });
 
 const narrow = window.matchMedia('(max-width: 900px)');
+// The Schedule's panel always shows on a wide screen, with this note until an airing is picked; Blocks and Preview hide theirs instead.
+const INSP_EMPTY = '<div class="inspempty"><b>Nothing selected</b><span>Select an airing in the schedule to inspect it.</span></div>';
 function closePanel() {
   hideTip();
   const p = $('insp');
-  if (p) { p.hidden = true; p.innerHTML = ''; }
+  if (p && p.dataset.empty) { p.classList.add('idle'); p.innerHTML = INSP_EMPTY; $('rail').scrollTop = 0; }
+  else if (p) { p.hidden = true; p.innerHTML = ''; }
   document.querySelectorAll('.blk.sel, .pgm.sel, .airrow.sel, .agrow.sel').forEach((b) => b.classList.remove('sel'));
 }
 
@@ -2087,6 +2017,7 @@ function showPanel(html) {
   const p = $('insp');
   p.innerHTML = html;
   p.hidden = false;
+  p.classList.remove('idle');
   p.querySelector('.x').addEventListener('click', closePanel);
   p.scrollTop = 0;
   if (!narrow.matches) p.scrollIntoView({ block: 'start' }); // wide: scrolls the rail to its top
@@ -2106,7 +2037,7 @@ function revealSelected() {
 // A tap on the schedule outside the sheet closes it; a tap on another block replaces its content instead.
 document.addEventListener('click', (e) => {
   const sheet = $('insp');
-  if (!narrow.matches || !sheet || sheet.hidden || !e.target.closest) return;
+  if (!narrow.matches || !sheet || sheet.hidden || sheet.classList.contains('idle') || !e.target.closest) return;
   if (e.target.closest('#insp, .blk, .airrow, .agrow, .pgm, #tip')) return;
   closePanel();
 });
@@ -2115,7 +2046,7 @@ let swipeY = null;
 let swipeFromTop = false;
 document.addEventListener('touchstart', (e) => {
   const sheet = e.target.closest && e.target.closest('#insp');
-  swipeY = narrow.matches && sheet ? e.touches[0].clientY : null;
+  swipeY = narrow.matches && sheet && !sheet.classList.contains('idle') ? e.touches[0].clientY : null;
   swipeFromTop = !!sheet && sheet.scrollTop === 0;
 }, { passive: true });
 document.addEventListener('touchend', (e) => {
@@ -2261,10 +2192,10 @@ function renderAgenda(d, colors) {
       const rep = a.repeat_of != null;
       const sub = subline(a);
       const label = `${timeOf(a.start, tz)} · ${headline(a)} · ${a.pool}`;
-      out.push(`<div class="agrow" tabindex="0" role="button" data-index="${a.index}" aria-label="${esc(label)}">
+      out.push(`<div class="agrow" style="--pc:${colors[a.pool] || '#ccc'}" tabindex="0" role="button" data-index="${a.index}" aria-label="${esc(label)}">
         <span class="tm">${esc(timeOf(a.start, tz))}</span>
         <span><b>${esc(headline(a))}</b>${sub ? `<div class="ep">${esc(sub)}</div>` : ''}</span>
-        <span class="meta"><span class="swatch" style="background:${colors[a.pool] || '#ccc'}"></span>${esc(a.pool)} · ${esc(dur(a.duration_secs))}${rep ? ' <span class="tagx">Repeat</span>' : ''}${a.projected ? ' <span class="tagx proj">Projected</span>' : ''}${changedAt.has(a.index) ? ' <span class="tagx">Changed</span>' : ''}</span></div>`);
+        <span class="meta">${esc(a.pool)} · ${esc(dur(a.duration_secs))}${rep ? ' <span class="tagx">Repeat</span>' : ''}${a.projected ? ' <span class="tagx proj">Projected</span>' : ''}${changedAt.has(a.index) ? ' <span class="tagx">Changed</span>' : ''}</span></div>`);
     }
   }
   if (!frontierDrawn) out.push(frontierRow());
