@@ -112,9 +112,12 @@
   .facts dd { margin: 0; font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
   .facts dd.d { font-size: 11.5px; font-weight: 400; color: var(--muted); max-width: 200px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .mast .sumline { display: none; }
-  @media (max-width: 900px) {
+  /* The four stats are 652px wide and the lineup rail takes 210px, so below 1240px the middle column would be under 275px: the stats drop to their own row. */
+  @media (max-width: 1240px) {
     .mast { grid-template-columns: auto minmax(0, 1fr); }
     .facts { grid-column: 1 / -1; }
+  }
+  @media (max-width: 900px) {
     /* Narrow: number, name and one summary line; the config path, the pattern text and the four stats sit behind Details. */
     .mast .sumline { display: flex; justify-content: space-between; align-items: center; gap: 10px; min-height: 44px; cursor: pointer; font-size: 12.5px; color: var(--muted); }
     .mast .sumline .dtl { color: var(--accent); font-weight: 700; white-space: nowrap; }
