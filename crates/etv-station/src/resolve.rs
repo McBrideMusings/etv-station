@@ -227,7 +227,7 @@ pub fn resolve_fill_pools(
     let channel_guide = config.guide.as_ref().map(|g| &g.text);
     let mut out = Vec::new();
     for (idx, block) in config.rule.all_blocks().enumerate() {
-        let mut named: Vec<&str> = block
+        let named: Vec<&str> = block
             .fill
             .iter()
             .filter_map(|e| e.pool.as_deref())
