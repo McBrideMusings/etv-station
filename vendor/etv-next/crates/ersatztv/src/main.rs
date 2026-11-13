@@ -239,6 +239,9 @@ async fn run() -> Result<(), LineupError> {
                 // Channel logos named as files in the lineup (#342): an image,
                 // so registered after the compression layer like /artwork.
                 .route("/logo/{filename}", get(channel_logo))
+                // The continuous MPEG-TS stream lineup.json hands to Plex.
+                // Video, so after the compression layer like /session.
+                .route("/stream/{filename}", get(ts_stream))
                 .nest_service(
                     "/session",
                     ServiceBuilder::new()
@@ -293,6 +296,25 @@ async fn stream(
         .strip_suffix(".m3u8")
         .ok_or(LineupError::ChannelNotFound(filename.clone()))?;
 
+    let channel = tune_in(&state, number).await?;
+
+    let content = get_multi_variant(channel, request.headers()).await;
+
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/vnd.apple.mpegurl",
+        )],
+        content,
+    ))
+}
+
+/// Start the channel's worker if none is running, wait until it is ready, and
+/// refresh its heartbeat — the step every way of tuning in shares.
+async fn tune_in<'a>(
+    state: &'a LineupState,
+    number: &str,
+) -> Result<&'a ChannelModel, LineupError> {
     let channel = state
         .channels
         .iter()
@@ -345,15 +367,176 @@ async fn stream(
         log::warn!("failed to refresh heartbeat for channel {number}: {err}");
     }
 
-    let content = get_multi_variant(channel, request.headers()).await;
+    Ok(channel)
+}
+
+/// How long the TS stream waits for the worker to list a new segment before it
+/// ends the response. Three 4 s segments: past that the worker has stopped or
+/// died, and the client's reconnect (`-reconnect_streamed`) tunes in afresh.
+const TS_STREAM_STALL: Duration = Duration::from_secs(12);
+
+/// How often the TS stream re-reads the media playlist. The worker signals
+/// through files, never IPC (see AGENTS.md); an HLS player follows the same
+/// file the same way.
+const TS_STREAM_POLL: Duration = Duration::from_millis(500);
+
+/// How long one segment write may wait on a client that stopped reading. Well
+/// under the worker's 90 s heartbeat timeout, so a stalled client ends its own
+/// stream rather than leaving the heartbeat unrefreshed until the worker idles out.
+const TS_STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// One channel as a single, continuous MPEG-TS byte stream: the segments the
+/// worker lists in `live.m3u8`, written back to back as each one appears.
+///
+/// This is what an HDHomeRun serves, and what Plex's tuner code expects: Plex
+/// opens a tuner URL with mpegts demuxer options (`-scan_all_pmts`), which an
+/// HLS playlist URL rejects outright (`Option scan_all_pmts not found`).
+/// Within one worker run plain concatenation is a valid stream, because the
+/// worker offsets every item's timestamps to continue the last
+/// (`-output_ts_offset`). A new run restarts timestamps at zero, so the
+/// response ends there and the client's reconnect tunes in to the new run.
+async fn ts_stream(
+    Path(filename): Path<String>,
+    State(state): State<Arc<LineupState>>,
+) -> Result<impl IntoResponse, LineupError> {
+    let number = filename
+        .strip_suffix(".ts")
+        .ok_or(LineupError::ChannelNotFound(filename.clone()))?
+        .to_owned();
+
+    let channel = tune_in(&state, &number).await?;
+    let output_folder = channel.output_folder().to_owned();
+    log::info!("ts stream started: channel={number}");
+
+    let (mut writer, reader) = tokio::io::duplex(1 << 20);
+    let active = Arc::clone(&state.active);
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let worker_alive = || {
+            let (active, number) = (Arc::clone(&active), number.clone());
+            async move { active.lock().await.contains_key(&number) }
+        };
+        let (segments, bytes, reason) =
+            write_ts_stream(&output_folder, &mut writer, worker_alive).await;
+        log::info!(
+            "ts stream ended: channel={number} segments={segments} bytes={bytes} secs={} reason={reason}",
+            started.elapsed().as_secs()
+        );
+    });
 
     Ok((
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/vnd.apple.mpegurl",
-        )],
-        content,
+        [(axum::http::header::CONTENT_TYPE, "video/mp2t")],
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
     ))
+}
+
+/// Follow `live.m3u8` in `output_folder` and copy each newly listed segment
+/// into `out`, starting with the newest two so a client gets data at once,
+/// and keep the worker's heartbeat fresh while `worker_alive` says it runs.
+/// Returns segments and bytes written and why it stopped.
+async fn write_ts_stream<Alive>(
+    output_folder: &std::path::Path,
+    out: &mut (impl tokio::io::AsyncWrite + Unpin),
+    worker_alive: impl Fn() -> Alive,
+) -> (u64, u64, &'static str)
+where
+    Alive: std::future::Future<Output = bool>,
+{
+    use tokio::io::AsyncWriteExt as _;
+
+    let playlist = output_folder.join("live.m3u8");
+    let heartbeat = output_folder.join(HEARTBEAT_FILE_NAME);
+    let mut last_sent: Option<String> = None;
+    let mut last_progress = Instant::now();
+    let (mut segments, mut bytes) = (0u64, 0u64);
+
+    loop {
+        if !worker_alive().await {
+            return (segments, bytes, "worker exited");
+        }
+        // A TS client never touches /session, so nothing else keeps the
+        // worker from idling out under it.
+        let _ = filetime::set_file_mtime(&heartbeat, filetime::FileTime::now());
+
+        let listed = tokio::fs::read_to_string(&playlist)
+            .await
+            .map(|body| segment_uris(&body))
+            .unwrap_or_default();
+
+        let owed = match unsent_segments(&listed, last_sent.as_deref()) {
+            Owed::Segments(owed) => owed,
+            Owed::NewRun => return (segments, bytes, "worker restarted"),
+            Owed::LostPlace => return (segments, bytes, "last segment left the playlist"),
+        };
+        for uri in owed {
+            let Ok(data) = tokio::fs::read(output_folder.join(uri)).await else {
+                // Sending the next one would leave an unmarked hole.
+                return (segments, bytes, "listed segment missing on disk");
+            };
+            match tokio::time::timeout(TS_STREAM_WRITE_TIMEOUT, out.write_all(&data)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return (segments, bytes, "client closed"),
+                Err(_) => return (segments, bytes, "client stopped reading"),
+            }
+            segments += 1;
+            bytes += data.len() as u64;
+            last_sent = Some(uri.to_owned());
+            last_progress = Instant::now();
+        }
+
+        if last_progress.elapsed() > TS_STREAM_STALL {
+            return (segments, bytes, "no new segment");
+        }
+        tokio::time::sleep(TS_STREAM_POLL).await;
+    }
+}
+
+/// The segment URIs a media playlist lists, in order.
+fn segment_uris(playlist: &str) -> Vec<String> {
+    playlist
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// What a TS stream should do next with the playlist it just read.
+#[derive(Debug, PartialEq)]
+enum Owed<'a> {
+    /// Write these, in order (possibly none yet).
+    Segments(&'a [String]),
+    /// The next segment belongs to a new worker run, whose timestamps restart.
+    NewRun,
+    /// The last segment sent is no longer listed, so where to continue is unknown.
+    LostPlace,
+}
+
+/// The worker run a segment URI belongs to: its `r<id>-NNNN` directory.
+fn segment_run(uri: &str) -> &str {
+    uri.split_once('/').map_or("", |(run, _)| run)
+}
+
+/// What a stream that last sent `last_sent` owes from `listed`. A new stream
+/// starts two from the end of the newest run.
+fn unsent_segments<'a>(listed: &'a [String], last_sent: Option<&str>) -> Owed<'a> {
+    let Some(sent) = last_sent else {
+        let newest_run = listed.last().map_or("", |uri| segment_run(uri));
+        let run_start = listed
+            .iter()
+            .position(|uri| segment_run(uri) == newest_run)
+            .unwrap_or(0);
+        let from = run_start.max(listed.len().saturating_sub(2));
+        return Owed::Segments(&listed[from..]);
+    };
+    let Some(index) = listed.iter().position(|uri| uri == sent) else {
+        return Owed::LostPlace;
+    };
+    let owed = &listed[index + 1..];
+    match owed.first() {
+        Some(next) if segment_run(next) != segment_run(sent) => Owed::NewRun,
+        _ => Owed::Segments(owed),
+    }
 }
 
 /// The commit and time the image was built from. The Dockerfile bakes both
@@ -703,12 +886,22 @@ async fn channel_playlist(
     ))
 }
 
-/// Where a client fetches this channel's stream. One definition, because the
-/// M3U and `lineup.json` handing out different addresses for the same channel
-/// fails in whichever surface nobody happened to test.
+/// Where an IPTV player fetches this channel's HLS stream (`channels.m3u`).
+/// HDHomeRun clients get `tuner_url` instead; each surface has one definition
+/// so no caller builds a stream address by hand.
 fn stream_url(request: &axum::extract::Request, channel: &ChannelModel) -> String {
     format!(
         "{}/channel/{}.m3u8",
+        get_scheme_host(request.headers()),
+        channel.number()
+    )
+}
+
+/// Where an HDHomeRun client (Plex) fetches this channel: the continuous
+/// MPEG-TS stream, because Plex cannot open an HLS URL as a tuner.
+fn tuner_url(request: &axum::extract::Request, channel: &ChannelModel) -> String {
+    format!(
+        "{}/stream/{}.ts",
         get_scheme_host(request.headers()),
         channel.number()
     )
@@ -752,7 +945,7 @@ async fn hdhr_lineup(
             serde_json::json!({
                 "GuideNumber": channel.number(),
                 "GuideName": channel.name(),
-                "URL": stream_url(&request, channel),
+                "URL": tuner_url(&request, channel),
             })
         })
         .collect();
@@ -1217,5 +1410,202 @@ mod forwarded_prefix_tests {
     async fn a_prefix_not_starting_with_slash_is_ignored() {
         let m3u = channels_m3u(Some("iptv")).await;
         assert!(m3u.contains("\nhttps://ersatz.example.com/channel/1.m3u8\n"));
+    }
+}
+
+#[cfg(test)]
+mod ts_stream_tests {
+    use tokio::io::AsyncReadExt as _;
+
+    use super::*;
+
+    fn uris(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_new_stream_starts_two_from_the_live_edge_of_the_newest_run() {
+        let listed = uris(&["r1/a.ts", "r1/b.ts", "r1/c.ts"]);
+        assert_eq!(
+            unsent_segments(&listed, None),
+            Owed::Segments(&uris(&["r1/b.ts", "r1/c.ts"]))
+        );
+        let restarted = uris(&["r1/a.ts", "r1/b.ts", "r2/a.ts"]);
+        assert_eq!(
+            unsent_segments(&restarted, None),
+            Owed::Segments(&uris(&["r2/a.ts"]))
+        );
+        let one = uris(&["r1/a.ts"]);
+        assert_eq!(unsent_segments(&one, None), Owed::Segments(&one));
+        assert_eq!(unsent_segments(&[], None), Owed::Segments(&[]));
+    }
+
+    #[test]
+    fn a_running_stream_gets_only_what_follows_its_last_segment() {
+        let listed = uris(&["r1/a.ts", "r1/b.ts", "r1/c.ts"]);
+        assert_eq!(
+            unsent_segments(&listed, Some("r1/a.ts")),
+            Owed::Segments(&uris(&["r1/b.ts", "r1/c.ts"]))
+        );
+        assert_eq!(
+            unsent_segments(&listed, Some("r1/c.ts")),
+            Owed::Segments(&[])
+        );
+    }
+
+    #[test]
+    fn a_new_run_or_a_lost_place_ends_the_stream() {
+        let listed = uris(&["r1/a.ts", "r2/a.ts"]);
+        assert_eq!(unsent_segments(&listed, Some("r1/a.ts")), Owed::NewRun);
+        assert_eq!(unsent_segments(&listed, Some("r0/z.ts")), Owed::LostPlace);
+    }
+
+    #[test]
+    fn segment_uris_skips_tags_and_blank_lines() {
+        let playlist = "#EXTM3U\n#EXT-X-DISCONTINUITY\n#EXTINF:4.0,\nr1/live1.ts\n\n#EXTINF:4.0,\nr1/live2.ts\n";
+        assert_eq!(
+            segment_uris(playlist),
+            uris(&["r1/live1.ts", "r1/live2.ts"])
+        );
+    }
+
+    /// A folder with segments `r1/live{1..=n}.ts` holding four bytes each.
+    fn segment_folder(n: u32) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("r1")).unwrap();
+        for i in 1..=n {
+            let body = [b'A' + (i as u8 - 1); 4];
+            std::fs::write(dir.path().join(format!("r1/live{i}.ts")), body).unwrap();
+        }
+        std::fs::write(dir.path().join(HEARTBEAT_FILE_NAME), b"").unwrap();
+        dir
+    }
+
+    fn write_playlist(folder: &std::path::Path, uris: &[&str]) {
+        let body: String = uris
+            .iter()
+            .map(|u| format!("#EXTINF:4.0,\n{u}\n"))
+            .collect();
+        std::fs::write(folder.join("live.m3u8"), body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_stream_is_the_segments_back_to_back_as_they_appear() {
+        let dir = segment_folder(5);
+        let folder = dir.path().to_owned();
+        write_playlist(&folder, &["r1/live1.ts", "r1/live2.ts", "r1/live3.ts"]);
+        let old = filetime::FileTime::from_unix_time(1_000_000, 0);
+        filetime::set_file_mtime(folder.join(HEARTBEAT_FILE_NAME), old).unwrap();
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let task_folder = folder.clone();
+        let task = tokio::spawn(async move {
+            write_ts_stream(&task_folder, &mut writer, || async { true }).await
+        });
+
+        let mut first = [0u8; 8];
+        reader.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"BBBBCCCC");
+        let touched = std::fs::metadata(folder.join(HEARTBEAT_FILE_NAME)).unwrap();
+        assert!(filetime::FileTime::from_last_modification_time(&touched) > old);
+
+        write_playlist(
+            &folder,
+            &["r1/live1.ts", "r1/live2.ts", "r1/live3.ts", "r1/live4.ts"],
+        );
+        let mut next = [0u8; 4];
+        reader.read_exact(&mut next).await.unwrap();
+        assert_eq!(&next, b"DDDD");
+
+        drop(reader);
+        write_playlist(&folder, &["r1/live3.ts", "r1/live4.ts", "r1/live5.ts"]);
+        assert_eq!(task.await.unwrap(), (3, 12, "client closed"));
+    }
+
+    #[tokio::test]
+    async fn the_stream_ends_where_a_new_worker_run_begins() {
+        let dir = segment_folder(2);
+        let folder = dir.path().to_owned();
+        write_playlist(&folder, &["r1/live1.ts", "r1/live2.ts"]);
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let task_folder = folder.clone();
+        let task = tokio::spawn(async move {
+            write_ts_stream(&task_folder, &mut writer, || async { true }).await
+        });
+        let mut first = [0u8; 8];
+        reader.read_exact(&mut first).await.unwrap();
+
+        std::fs::create_dir(folder.join("r2")).unwrap();
+        std::fs::write(folder.join("r2/live1.ts"), b"ZZZZ").unwrap();
+        write_playlist(&folder, &["r1/live1.ts", "r1/live2.ts", "r2/live1.ts"]);
+        assert_eq!(task.await.unwrap(), (2, 8, "worker restarted"));
+    }
+
+    #[tokio::test]
+    async fn the_stream_ends_when_the_worker_exits_or_a_segment_is_missing() {
+        let dir = segment_folder(1);
+        write_playlist(dir.path(), &["r1/live1.ts"]);
+        let (mut writer, _reader) = tokio::io::duplex(64);
+        let ended = write_ts_stream(dir.path(), &mut writer, || async { false }).await;
+        assert_eq!(ended, (0, 0, "worker exited"));
+
+        write_playlist(dir.path(), &["r1/live1.ts", "r1/gone.ts"]);
+        let ended = write_ts_stream(dir.path(), &mut writer, || async { true }).await;
+        assert_eq!(ended, (1, 4, "listed segment missing on disk"));
+    }
+
+    #[tokio::test]
+    async fn lineup_json_hands_plex_the_ts_stream_and_the_m3u_keeps_hls() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("playout")).unwrap();
+        let cfg_path = dir.path().join("channel.json");
+        std::fs::write(&cfg_path, r#"{"playout":{"folder":"playout"}}"#).unwrap();
+        let cfg = ersatztv::config::ChannelConfig {
+            number: "7".into(),
+            name: "ETV 7".into(),
+            config: cfg_path.to_string_lossy().into_owned(),
+            overlays: Vec::new(),
+            tvg_id: None,
+            logo: None,
+            group: None,
+        };
+        let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).await.unwrap();
+        let state = Arc::new(LineupState {
+            channels: vec![channel],
+            active: Arc::new(Mutex::new(HashMap::new())),
+            health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
+            device_id: String::new(),
+        });
+        let request = || {
+            axum::http::Request::builder()
+                .header("host", "tuner:8409")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let body = |response: axum::response::Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+
+        let lineup = body(
+            hdhr_lineup(State(Arc::clone(&state)), request())
+                .await
+                .into_response(),
+        )
+        .await;
+        let entries: serde_json::Value = serde_json::from_str(&lineup).unwrap();
+        assert_eq!(entries[0]["URL"], "http://tuner:8409/stream/7.ts");
+
+        let m3u = body(
+            channel_playlist(State(state), request())
+                .await
+                .unwrap()
+                .into_response(),
+        )
+        .await;
+        assert!(m3u.contains("\nhttp://tuner:8409/channel/7.m3u8\n"));
     }
 }
