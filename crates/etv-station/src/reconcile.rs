@@ -403,8 +403,10 @@ fn copy_item(item: &PlayoutItem) -> Option<PlayoutItem> {
 
 /// Swap every pending segment in `items` whose real file is readable and that
 /// starts more than [`PENDING_SWAP_LEAD`] after `now`. One segment is a run of
-/// consecutive items naming the same pending path (a stand-in shorter than its
-/// slot is followed by black); the run is replaced by the real file's items, so
+/// consecutive items sharing an id base before `#` and naming the same pending
+/// path (a stand-in shorter than its slot repeats as `#0`, `#1`, … when the
+/// segment loops and is followed by `#pad` black otherwise); the run is
+/// replaced by the real file's items, so
 /// a file shorter than the slot is looped when the segment loops and padded
 /// with black otherwise. `record_swap` is asked before each swap to point the
 /// segment's ledger row at the real file; a `false` leaves the stand-in in
@@ -1608,5 +1610,88 @@ mod tests {
         assert_eq!(n, 2);
         let ids: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["bumper:c:1:0", "bumper:c:1:1"]);
+    }
+
+    /// What `emit_timeline` lays for one looping pending segment of 12 s
+    /// whose stand-in is 3 s: four stand-in repeats, `#0` to `#3`.
+    fn emitted_looping_stand_in(real: &str, at: OffsetDateTime) -> Vec<PlayoutItem> {
+        use crate::bumper::emit::{EmitContext, emit_timeline};
+        use crate::bumper::timeline::{
+            Duration as Dur, Segment, SegmentAudio, SegmentSource, Timeline, fit,
+        };
+        let segment = Segment {
+            name: "chapter".into(),
+            source: SegmentSource::Pending {
+                path: real.into(),
+                stand_in: "/stand/in.mp4".into(),
+            },
+            duration: Dur::Fixed(12_000),
+            loop_: true,
+            optional: false,
+            priority: 0,
+            overlay: None,
+            audio: SegmentAudio::Own,
+        };
+        let resolved = fit(
+            &Timeline {
+                segments: vec![segment],
+                bed: None,
+            },
+            12_000,
+            30.0,
+        )
+        .unwrap();
+        let ctx = EmitContext {
+            channel: "c",
+            fps: 30.0,
+            overlay_root: Path::new("/o"),
+            media_len_ms: &|_| Some(3_000),
+        };
+        emit_timeline(&resolved, &ctx, at)
+    }
+
+    #[test]
+    fn every_repeat_of_a_looping_stand_in_is_swapped_as_one_segment() {
+        let dir = TempDir::new().unwrap();
+        let real = real_file(&dir);
+        let at = datetime!(2026-08-16 13:00:00 UTC);
+        let now = datetime!(2026-08-16 12:00:00 UTC);
+        let stand_in = emitted_looping_stand_in(&real, at);
+        assert_eq!(
+            spans(&stand_in),
+            vec![("/stand/in.mp4".to_string(), 3, Some(3_000)); 4]
+        );
+        assert!(
+            stand_in
+                .iter()
+                .all(|i| pending_of(i) == Some((real.clone(), true)))
+        );
+        let no_pending = |items: &[PlayoutItem]| {
+            items
+                .iter()
+                .all(|i| i.metadata.as_ref().unwrap().get(PENDING_KEY).is_none())
+        };
+
+        let mut long = stand_in.iter().filter_map(copy_item).collect();
+        let n = swap_items(&mut long, "c", now, len_20s, &mut |_| true).len();
+        assert_eq!(n, 1);
+        assert_eq!(spans(&long), vec![(real.clone(), 12, Some(12_000))]);
+        assert_eq!(long[0].id, "bumper:c:1786885200000:0");
+        assert!(no_pending(&long));
+
+        let mut short = stand_in.iter().filter_map(copy_item).collect();
+        let n = swap_items(&mut short, "c", now, len_4s, &mut |_| true).len();
+        assert_eq!(n, 1);
+        assert_eq!(spans(&short), vec![(real.clone(), 4, Some(4_000)); 3]);
+        let ids: Vec<&str> = short.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "bumper:c:1786885200000:0#0",
+                "bumper:c:1786885200000:0#1",
+                "bumper:c:1786885200000:0#2",
+            ]
+        );
+        assert!(no_pending(&short));
     }
 }

@@ -16,8 +16,9 @@
 //! mute segment sets its level on purpose, so its items carry
 //! `normalize_loudness: false` and the channel's loudnorm leaves them alone.
 //! A `Ducked` segment mixes its own file's audio with the bed in one lavfi
-//! graph (`amix`, `normalize=0`), and a pending segment airs its stand-in and carries [`PENDING_KEY`] so the swap
-//! (etv-station-7aa7.35) can find it.
+//! graph (`amix`, `normalize=0`), and a pending segment airs its stand-in (repeated
+//! across the window when the segment loops, like a Clip) and every item it
+//! emits carries [`PENDING_KEY`] so the swap (etv-station-7aa7.35) can find it.
 
 use std::path::Path;
 
@@ -218,12 +219,21 @@ pub fn emit_timeline(
                 );
             }
             SegmentSource::Pending { stand_in, .. } => {
-                push_local_padded(
+                // A looping segment repeats the whole stand-in across its window;
+                // a plain one reads the length once, in `push_local_padded`.
+                let window = if seg.segment.loop_ {
+                    (ctx.media_len_ms)(stand_in).unwrap_or(0)
+                } else {
+                    0
+                };
+                push_local_span(
                     &mut items,
                     &media,
                     &id_base,
                     stand_in,
                     0,
+                    window,
+                    seg.segment.loop_,
                     begin,
                     seg.duration_ms,
                 );
@@ -1114,5 +1124,76 @@ mod tests {
         let meta = items[0].metadata.as_ref().unwrap();
         assert_eq!(meta[PENDING_KEY]["path"], "/r/real.mp4");
         assert_eq!(meta[PENDING_KEY]["loop"], true);
+    }
+
+    #[test]
+    fn a_looping_pending_segment_repeats_its_stand_in_and_a_plain_one_pads_black() {
+        let pending = |loop_| {
+            let mut s = seg(
+                "chapter",
+                SegmentSource::Pending {
+                    path: "/r/real.mp4".into(),
+                    stand_in: "/r/stand.mp4".into(),
+                },
+                Dur::Fixed(10_000),
+            );
+            s.loop_ = loop_;
+            let resolved = fit(
+                &Timeline {
+                    segments: vec![s],
+                    bed: None,
+                },
+                10_000,
+                30.0,
+            )
+            .unwrap();
+            let ctx = EmitContext {
+                media_len_ms: &|_| Some(4_000),
+                ..ctx()
+            };
+            emit_timeline(&resolved, &ctx, start())
+        };
+        let span = |item: &PlayoutItem| match item.source.as_ref().unwrap() {
+            PlayoutItemSource::Local {
+                path, out_point_ms, ..
+            } => (
+                item.id.clone(),
+                path.clone(),
+                (item.finish - item.start).whole_milliseconds(),
+                *out_point_ms,
+            ),
+            PlayoutItemSource::Lavfi { .. } => (
+                item.id.clone(),
+                "lavfi".into(),
+                (item.finish - item.start).whole_milliseconds(),
+                None,
+            ),
+            other => panic!("{other:?}"),
+        };
+
+        let looped = pending(true);
+        let id = "bumper:7:1800000000000:0";
+        assert_eq!(
+            looped.iter().map(span).collect::<Vec<_>>(),
+            vec![
+                (format!("{id}#0"), "/r/stand.mp4".into(), 4_000, Some(4_000)),
+                (format!("{id}#1"), "/r/stand.mp4".into(), 4_000, Some(4_000)),
+                (format!("{id}#2"), "/r/stand.mp4".into(), 2_000, Some(2_000)),
+            ]
+        );
+        for item in &looped {
+            let meta = item.metadata.as_ref().unwrap();
+            assert_eq!(meta[PENDING_KEY]["path"], "/r/real.mp4");
+            assert_eq!(meta[PENDING_KEY]["loop"], true);
+        }
+
+        let plain = pending(false);
+        assert_eq!(
+            plain.iter().map(span).collect::<Vec<_>>(),
+            vec![
+                (id.to_string(), "/r/stand.mp4".into(), 4_000, Some(4_000)),
+                (format!("{id}#pad"), "lavfi".into(), 6_000, None),
+            ]
+        );
     }
 }
