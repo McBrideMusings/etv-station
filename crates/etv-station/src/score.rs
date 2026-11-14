@@ -1356,7 +1356,16 @@ pub(crate) fn engine() -> Engine {
         .register_fn("entry_id_for", ScoreCtx::entry_id_for)
         .register_fn("http", ScoreCtx::http);
     engine.register_fn("parse_json", crate::plugin_http::parse_json);
+    // Rhai ships its own `to_json(map)`, which escapes a non-printable character
+    // the way Rust's `Debug` does (`\u{f028}`) — not JSON. A map or array call
+    // matches that built-in before a `Dynamic` one, so both get their own entry.
     engine.register_fn("to_json", crate::plugin_http::to_json);
+    engine.register_fn("to_json", |m: rhai::Map| {
+        crate::plugin_http::to_json(m.into())
+    });
+    engine.register_fn("to_json", |a: rhai::Array| {
+        crate::plugin_http::to_json(a.into())
+    });
     engine.register_fn("log", |text: &str| {
         tracing::info!(event = "score.log", "{text}");
     });

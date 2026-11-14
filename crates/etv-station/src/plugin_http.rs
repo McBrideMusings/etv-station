@@ -249,6 +249,27 @@ pub(crate) mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    /// A plugin's `to_json` writes JSON a JSON reader accepts, for a map, an
+    /// array and a string holding a character Rust's `Debug` escapes as
+    /// `\u{…}` (a private-use code point, as an SMB share maps `?` in a name).
+    #[test]
+    fn a_plugins_to_json_is_valid_json_for_every_string() {
+        let engine = crate::score::engine();
+        for script in [
+            r#"to_json(#{ path: "/m/Shaq\uF028/Skillz.mkv" })"#,
+            r#"to_json([#{ path: "/m/Shaq\uF028/Skillz.mkv" }])"#,
+            r#"to_json("/m/Shaq\uF028/Skillz.mkv")"#,
+        ] {
+            let text: String = engine.eval(script).expect(script);
+            let back: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{script} gave {text:?}: {e}"));
+            assert!(
+                back.to_string().contains("Shaq\u{f028}"),
+                "{script}: {back}"
+            );
+        }
+    }
+
     /// A server on a free local port that answers one request with `status`
     /// and `body`, and hands back the request line it received.
     pub(crate) fn serve_once(
