@@ -3392,7 +3392,7 @@ A plugin that queues a chapter airs it in a bumper segment named `chapter:<job>|
 
 ### Rendering
 
-`etv-station render <plan.json>` renders one plan and exits non-zero with the failing layer named. Per hook it separates the region from 4 bars before `landing_s` to 18 bars after into vocals and instrumental with Demucs (two-stem), cached by entry and region under the cache directory. Each audio layer is trimmed, stretched to `bpm` with ffmpeg's `rubberband` filter, shifted by `semitones`, gained to a target RMS, faded and delayed; the layers are mixed and limited. Each cut becomes a 1080p segment from its source at `ratio`, and the segments are concatenated. The encoder is the hardware one named by `ETV_ACCEL` when the image's ffmpeg lists it, else libx264.
+`etv-station render <plan.json>` renders one plan and exits non-zero with the failing layer named. Per hook it separates the region from 4 bars before `landing_s` to 18 bars after into vocals and instrumental with Demucs (two-stem), cached by entry and region under the cache directory. Each audio layer is trimmed, stretched to `bpm` with ffmpeg's `rubberband` filter, shifted by `semitones`, gained to a target RMS, faded and delayed; the layers are mixed and limited. Each cut becomes a 1080p segment from its source at `ratio`, and the segments are concatenated. The encoder is the hardware one named by `ETV_ACCEL` when the renderer's ffmpeg (`ETV_RENDER_FFMPEG`) lists it, else libx264.
 
 ### Queue and sidecar
 
@@ -3408,7 +3408,7 @@ The cache is capped. When rendered chapters and stems pass the cap, chapters who
 | `renderer.cache_dir` | `ETV_RENDER_CACHE_DIR` | Stems and scratch files. |
 | `renderer.cache_cap_gb` | `ETV_RENDER_CACHE_CAP_GB` | Cache cap in gigabytes; default 20. |
 
-The image also reads `ETV_RENDER_PYTHON` (the interpreter with Demucs and PyTorch; `/opt/render-venv/bin/python` in the image), `ETV_RENDER_FFMPEG` and `ETV_RENDER_FFPROBE`.
+The image also reads `ETV_RENDER_PYTHON` (the interpreter with Demucs and PyTorch; `/opt/render-venv/bin/python` in the image), `ETV_RENDER_FFMPEG` (an ffmpeg with librubberband; `/opt/render-ffmpeg/bin/ffmpeg` in the image, Ubuntu's ffmpeg package kept apart from the base image's ffmpeg that the channels play with) and `ETV_RENDER_FFPROBE`.
 
 ### Health
 

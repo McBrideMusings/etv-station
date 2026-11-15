@@ -137,6 +137,31 @@ COPY vendor/etv-next vendor/etv-next
 WORKDIR /build/vendor/etv-next
 RUN jobs=$(cargo-jobs) && CARGO_BUILD_JOBS=$jobs cargo build --release --locked --target x86_64-unknown-linux-gnu --bin ersatztv --bin ersatztv-channel
 
+# ---- render-ffmpeg ----
+# The chapter renderer's ffmpeg. Tempo changes need the rubberband filter, and
+# the base image's ffmpeg is built without librubberband. Ubuntu's ffmpeg
+# package has it (and h264_vaapi), and the runtime is Ubuntu 24.04 too, so this
+# stage is the same release. It is NOT installed into the runtime with apt: the
+# base image sets LD_LIBRARY_PATH to /usr/local/lib/x86_64-linux-gnu and then
+# /usr/lib/x86_64-linux-gnu, and Ubuntu's libx264, libass, libdav1d, libzimg and
+# others landing in /usr/lib would replace the base's own builds of them under
+# the playback ffmpeg. Instead the binary and its libraries go to
+# /opt/render-ffmpeg, which only docker/render-ffmpeg.sh puts on the library
+# path. Left out: glibc, which the runtime has at the same version, and libva,
+# libva-drm and libdrm, which must be the base's builds because its VAAPI
+# drivers are built against them. Ubuntu's libva-x11, which the base lacks, is
+# copied and loads against the base's libva. The renderer's ffmpeg is therefore
+# 6.1, not the base's 8.1; the Health tab shows its version line.
+FROM ubuntu:24.04@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5 AS render-ffmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+RUN ! ldd /usr/bin/ffmpeg | grep -q 'not found' \
+    && mkdir -p /opt/render-ffmpeg/lib /opt/render-ffmpeg/libexec \
+    && cp /usr/bin/ffmpeg /opt/render-ffmpeg/libexec/ffmpeg \
+    && ldd /usr/bin/ffmpeg | awk '$3 ~ /^\// { print $3 }' \
+        | grep -vE '/(libc|libm|libmvec|libpthread|libdl|librt|libresolv|ld-linux-x86-64|libva|libva-drm|libdrm)\.so\.[0-9]+$' \
+        | xargs -I{} cp -L {} /opt/render-ffmpeg/lib/
+
 # ---- runtime ----
 # ErsatzTV's own ffmpeg image: it carries the ffmpeg/ffprobe build ETV-next
 # expects for streaming, and the same ffprobe covers the station daemon's
@@ -176,14 +201,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The chapter renderer's stem separation: Demucs on CPU PyTorch, in its own
 # virtualenv so the system python3 the diagnostics use is untouched.
 # ETV_RENDER_PYTHON points the renderer at it; the Health tab reports Demucs and
-# PyTorch as detected or missing. Tempo changes use ffmpeg's rubberband filter,
-# which needs an ffmpeg built with librubberband — the Health tab reports that
-# too, because the base image's ffmpeg build decides it, not this file.
+# PyTorch as detected or missing.
 RUN python3 -m venv /opt/render-venv \
     && /opt/render-venv/bin/pip install --no-cache-dir \
         --index-url https://download.pytorch.org/whl/cpu torch torchaudio \
     && /opt/render-venv/bin/pip install --no-cache-dir demucs soundfile
 ENV ETV_RENDER_PYTHON=/opt/render-venv/bin/python
+
+# The renderer's own ffmpeg (see the render-ffmpeg stage); the playback
+# channels keep /usr/local/bin/ffmpeg. The build fails here when the copied ffmpeg cannot load a library, lacks rubberband, or
+# cannot run the renderer's software path: a rubberband stretch whose tempo an
+# asendcmd changes, encoded with libx264 and aac. The VAAPI encode needs the
+# host's GPU, so only the deployed container can run it. The Health tab reports
+# the same detection at run time.
+COPY --from=render-ffmpeg /opt/render-ffmpeg /opt/render-ffmpeg
+COPY --chmod=755 docker/render-ffmpeg.sh /opt/render-ffmpeg/bin/ffmpeg
+RUN /opt/render-ffmpeg/bin/ffmpeg -hide_banner -filters | grep -qE '^ [.A-Z]{3} rubberband ' \
+    && /opt/render-ffmpeg/bin/ffmpeg -hide_banner -v error \
+        -f lavfi -i sine=frequency=440:duration=2 -f lavfi -i testsrc2=size=320x240:rate=30:duration=2 \
+        -filter_complex "[0:a]asendcmd=c='1.0 rubberband@r tempo 1.2',rubberband@r=tempo=1.1:pitch=1.0[a]" \
+        -map "[a]" -map 1:v -c:v libx264 -c:a aac -f mp4 /dev/null
+ENV ETV_RENDER_FFMPEG=/opt/render-ffmpeg/bin/ffmpeg
 
 # The container runs as uid 1000, and a plain non-root process cannot open the
 # packet socket tcpdump needs. A file capability grants that one binary the one
