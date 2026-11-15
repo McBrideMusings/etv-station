@@ -17,20 +17,55 @@
 # ---- chef ----
 # Shared base: the pinned toolchain plus cargo-chef. Edition 2024 requires
 # Rust >= 1.85.
-FROM rust:1.93-bookworm AS chef
-RUN cargo install cargo-chef --locked
+#
+# The Rust stages run natively on the build machine's own architecture
+# ($BUILDPLATFORM) and cross-compile to x86_64-unknown-linux-gnu, the runtime's,
+# so their output is under target/x86_64-unknown-linux-gnu/release. On an amd64
+# build machine the x86_64 toolchain is its native one.
+#
+# Every cargo run takes its job count from docker/cargo-jobs.sh, which sizes it
+# to the build machine's memory and CPUs; the CARGO_BUILD_JOBS build arg
+# overrides it.
+FROM --platform=$BUILDPLATFORM rust:1.93-bookworm AS chef
+ARG BUILDARCH
+
+# cargo-chef's own release binary for the build machine, pinned by its sha256,
+# rather than `cargo install`, which compiles ~200 crates on every cold build.
+RUN case "$BUILDARCH" in \
+        arm64) triple=aarch64-unknown-linux-gnu; sum=a47e13fba89c2895f5a5c3d0844acd2a5fd416eceb3a6f9dfb26e28155099f4e ;; \
+        amd64) triple=x86_64-unknown-linux-gnu; sum=70ef940ef90d04d122f0176fdb8d6c39069191b484a1eaa29b327370c2e1c3c0 ;; \
+        *) echo "no cargo-chef binary for $BUILDARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSLo /tmp/chef.tar.xz "https://github.com/LukeMathWalker/cargo-chef/releases/download/v0.1.78/cargo-chef-$triple.tar.xz" \
+    && echo "$sum  /tmp/chef.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/chef.tar.xz -C /tmp \
+    && install -m 755 "/tmp/cargo-chef-$triple/cargo-chef" /usr/local/cargo/bin/cargo-chef \
+    && rm -rf /tmp/chef.tar.xz "/tmp/cargo-chef-$triple"
 WORKDIR /build
 
-# Native build dependencies for the graphics stack pulled in transitively by
-# etv-overlay (vello + wgpu + parley). Shared by the `builder` stage, which
-# compiles etv-station (a dependent of etv-overlay for overlay-spec
-# validation), and the `etv-builder` stage below, which compiles
-# ersatztv-channel (a dependent of etv-overlay for its diagnostic card).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Build dependencies for the graphics stack pulled in transitively by
+# etv-overlay (vello + wgpu + parley), plus the x86_64 C toolchain the cross
+# build links with. fontconfig is the target's (amd64) library, because it is
+# linked into the binaries; cmake and pkg-config run on the build machine.
+# Shared by the `builder` stage, which compiles etv-station (a dependent of
+# etv-overlay for overlay-spec validation), and the `etv-builder` stage below,
+# which compiles ersatztv-channel (a dependent of etv-overlay for its
+# diagnostic card).
+RUN dpkg --add-architecture amd64 \
+    && apt-get update && apt-get install -y --no-install-recommends \
         cmake \
         pkg-config \
-        libfontconfig1-dev \
+        libfontconfig1-dev:amd64 \
+        $( [ "$BUILDARCH" = amd64 ] || echo gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libc6-dev-amd64-cross ) \
     && rm -rf /var/lib/apt/lists/*
+RUN rustup target add x86_64-unknown-linux-gnu
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ \
+    AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar \
+    PKG_CONFIG_ALLOW_CROSS=1 \
+    PKG_CONFIG_PATH_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+COPY --chmod=755 docker/cargo-jobs.sh /usr/local/bin/cargo-jobs
 
 # ---- planner ----
 # Reads the whole workspace (including the ersatztv-playout path dep under
@@ -41,6 +76,7 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ---- builder ----
 FROM chef AS builder
+ARG CARGO_BUILD_JOBS
 
 # Cook only the dependencies from the recipe. This layer is cached across source
 # changes — only a Cargo.toml/Cargo.lock change busts it, so iterating on the
@@ -57,7 +93,7 @@ FROM chef AS builder
 # the only thing besides a Cargo.lock change that busts the cache.
 COPY --from=planner /build/recipe.json recipe.json
 COPY vendor/etv-next vendor/etv-next
-RUN cargo chef cook --release --locked --recipe-path recipe.json -p etv-station -p etv-overlay
+RUN jobs=$(cargo-jobs) && CARGO_BUILD_JOBS=$jobs cargo chef cook --release --locked --target x86_64-unknown-linux-gnu --recipe-path recipe.json -p etv-station -p etv-overlay
 
 # Now the real build. The whole workspace is needed: ersatztv-playout is a path
 # dependency under vendor/etv-next, and etv-overlay is a sibling crate.
@@ -66,7 +102,7 @@ RUN cargo chef cook --release --locked --recipe-path recipe.json -p etv-station 
 # workspace crates. etv-query-test (the Phase A CEL harness) is a dev tool and
 # intentionally left out of the deployed image.
 COPY . .
-RUN cargo build --release --locked -p etv-station -p etv-overlay
+RUN jobs=$(cargo-jobs) && CARGO_BUILD_JOBS=$jobs cargo build --release --locked --target x86_64-unknown-linux-gnu -p etv-station -p etv-overlay
 
 # ---- etv-builder ----
 # ErsatzTV-next is its own cargo workspace under vendor/, so it builds on its own
@@ -94,11 +130,12 @@ RUN cargo build --release --locked -p etv-station -p etv-overlay
 # both are what should bust the cache — ordinary station-side changes outside
 # those two trees still don't.
 FROM chef AS etv-builder
+ARG CARGO_BUILD_JOBS
 COPY Cargo.toml Cargo.toml
 COPY crates/etv-overlay crates/etv-overlay
 COPY vendor/etv-next vendor/etv-next
 WORKDIR /build/vendor/etv-next
-RUN cargo build --release --locked --bin ersatztv --bin ersatztv-channel
+RUN jobs=$(cargo-jobs) && CARGO_BUILD_JOBS=$jobs cargo build --release --locked --target x86_64-unknown-linux-gnu --bin ersatztv --bin ersatztv-channel
 
 # ---- runtime ----
 # ErsatzTV's own ffmpeg image: it carries the ffmpeg/ffprobe build ETV-next
@@ -175,10 +212,10 @@ RUN groupadd --system --gid 1000 etv \
 # The daemon resolves the overlay binary next to its own executable
 # (overlay_supervisor::overlay_binary_path) and ETV-next resolves
 # ersatztv-channel next to its own, so all four sit in one directory.
-COPY --from=builder /build/target/release/etv-station /usr/local/bin/etv-station
-COPY --from=builder /build/target/release/etv-overlay /usr/local/bin/etv-overlay
-COPY --from=etv-builder /build/vendor/etv-next/target/release/ersatztv /usr/local/bin/ersatztv
-COPY --from=etv-builder /build/vendor/etv-next/target/release/ersatztv-channel /usr/local/bin/ersatztv-channel
+COPY --from=builder /build/target/x86_64-unknown-linux-gnu/release/etv-station /usr/local/bin/etv-station
+COPY --from=builder /build/target/x86_64-unknown-linux-gnu/release/etv-overlay /usr/local/bin/etv-overlay
+COPY --from=etv-builder /build/vendor/etv-next/target/x86_64-unknown-linux-gnu/release/ersatztv /usr/local/bin/ersatztv
+COPY --from=etv-builder /build/vendor/etv-next/target/x86_64-unknown-linux-gnu/release/ersatztv-channel /usr/local/bin/ersatztv-channel
 COPY --chmod=755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chmod=755 tools/stream-access-log.py tools/stream-watch.py tools/client-stall.py /usr/local/bin/
 COPY --chmod=755 tools/probe-checks.sh tools/soak-probe.sh /usr/local/bin/
