@@ -64,6 +64,7 @@ export default defineConfig({
           { text: '0011 — An audit trail is a stage list', link: '/adr/0011-an-audit-trail-is-a-stage-list-and-a-plugin-explains-itself-in-a-function' },
           { text: '0012 — The reason set and the audit trail are separate fields', link: '/adr/0012-the-reason-set-and-the-audit-trail-are-separate-fields' },
           { text: '0013 — A plugin hands its working set forward in the return value', link: '/adr/0013-a-plugin-hands-its-working-set-forward-in-the-return-value' },
+          { text: '0023 — The renderer mixes and cuts what a plan lists', link: '/adr/0023-the-renderer-mixes-and-cuts-what-a-plan-lists' },
         ],
       },
     ],

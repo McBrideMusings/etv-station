@@ -4,7 +4,7 @@
 
 ## Core exposes facts; plugins own policy
 
-The station core offers generic facts and primitives — the schedule, the airings ledger, `ctx.probe`, granted `exec`/`http` — and a Rhai plugin decides what to do with them. Before proposing anything core-side, name the generic fact it exposes. If its name is a plugin's concept (a job, a clip, a render, a joke, a ranking), it belongs in a plugin, not the station — including when the reason is speed. ADR 0014 and ADR 0021 are the decisions behind this.
+The station core offers generic facts and primitives — the schedule, the airings ledger, `ctx.probe`, granted `exec`/`http` — and a Rhai plugin decides what to do with them. Before proposing anything core-side, name the generic fact it exposes. If its name is a plugin's concept (a job, a clip, a render, a joke, a ranking), it belongs in a plugin, not the station — including when the reason is speed. ADR 0014, ADR 0021 and ADR 0023 are the decisions behind this.
 
 The same check applies to config. Before proposing a new key or value in a channel or station file, name the existing keys in `docs/schema.md` that already express the choice — a pool's `select`/`order`/`weight`/`constraints`, a seed's `rotate`/`cycle`, a fill entry's `when`/`weight` — and reuse them where they fit. A new word needs a reason none of them does.
 
