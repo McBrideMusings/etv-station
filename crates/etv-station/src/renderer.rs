@@ -195,6 +195,15 @@ pub mod cli {
                 .queue()
                 .enqueue(&plan, air_at, OffsetDateTime::now_utc())
                 .map_err(|e| e.to_string())?;
+            if job.status == etv_render::queue::Status::Missed {
+                eprintln!(
+                    "enqueue: job {} is missed: its air time {} has passed, so it will not render",
+                    job.id,
+                    air_at
+                        .and_then(|t| t.format(&Rfc3339).ok())
+                        .unwrap_or_default()
+                );
+            }
             Ok(job.id)
         };
         match run() {

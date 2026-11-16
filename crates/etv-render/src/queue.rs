@@ -34,15 +34,18 @@ pub enum Status {
     Failed,
     /// Rendered, then removed from the cache to stay under its size cap.
     Evicted,
+    /// Its air time came before the sidecar reached it, so it was never rendered.
+    Missed,
 }
 
 impl Status {
-    pub const ALL: [Status; 5] = [
+    pub const ALL: [Status; 6] = [
         Status::Queued,
         Status::Running,
         Status::Done,
         Status::Failed,
         Status::Evicted,
+        Status::Missed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -52,6 +55,7 @@ impl Status {
             Status::Done => "done",
             Status::Failed => "failed",
             Status::Evicted => "evicted",
+            Status::Missed => "missed",
         }
     }
 }
@@ -164,7 +168,10 @@ impl Queue {
 
     /// Put `plan` on the queue and return at once with its job. A plan already
     /// queued, running or done is left as it is (its air time is updated when
-    /// given); one that failed or was evicted is queued again.
+    /// given); one that failed, was evicted or was missed is queued again. A
+    /// new or requeued plan whose air time has already come is recorded as
+    /// missed, not queued; a queued one given a past air time is marked missed
+    /// by the sidecar's next pass.
     pub fn enqueue(
         &self,
         plan: &Document,
@@ -175,6 +182,7 @@ impl Queue {
         fs::create_dir_all(&self.dir).map_err(|e| self.io(e))?;
         let json = serde_json::to_vec_pretty(plan).map_err(|e| self.io(e))?;
         let id = job_id(plan);
+        let past = is_past(air_at, now);
 
         if let Some(mut existing) = self.read(&id) {
             if matches!(
@@ -187,18 +195,21 @@ impl Queue {
                 }
                 return Ok(existing);
             }
+            if past && existing.status == Status::Missed && existing.air_at == air_at {
+                return Ok(existing);
+            }
             let attempts = existing.attempts;
             let state = fresh_state(&id, plan, air_at, now, attempts);
             write_atomic(&self.plan_path(&id), &json).map_err(|e| self.io(e))?;
             self.write(&state)?;
-            tracing::info!(event = "render.enqueued", id = %id, retry = true, "requeued a chapter");
+            tracing::info!(event = "render.enqueued", id = %id, retry = true, status = state.status.as_str(), "requeued a chapter");
             return Ok(state);
         }
 
         write_atomic(&self.plan_path(&id), &json).map_err(|e| self.io(e))?;
         let state = fresh_state(&id, plan, air_at, now, 0);
         self.write(&state)?;
-        tracing::info!(event = "render.enqueued", id = %id, output = %plan.output().display(), kind = plan.kind(), "queued a plan");
+        tracing::info!(event = "render.enqueued", id = %id, output = %plan.output().display(), kind = plan.kind(), status = state.status.as_str(), "queued a plan");
         Ok(state)
     }
 
@@ -219,9 +230,57 @@ impl Queue {
         n
     }
 
-    fn next_queued(&self) -> Option<JobState> {
-        self.list().into_iter().find(|j| j.status == Status::Queued)
+    /// Mark every queued job whose air time has come as missed, returning their
+    /// ids. Rendering one would help nobody: the station swaps a chapter in
+    /// only before it airs.
+    pub fn mark_missed(&self, jobs: &mut [JobState], now: OffsetDateTime) -> Vec<String> {
+        let mut missed = Vec::new();
+        for job in jobs.iter_mut() {
+            if job.status != Status::Queued || !is_past(job.air_at, now) {
+                continue;
+            }
+            // An enqueue may have moved its air time since `list` read it.
+            match self.read(&job.id) {
+                Some(current)
+                    if current.status == Status::Queued && is_past(current.air_at, now) =>
+                {
+                    *job = current;
+                }
+                Some(current) => {
+                    *job = current;
+                    continue;
+                }
+                None => continue,
+            }
+            job.status = Status::Missed;
+            let written = self.write(job).map_err(|e| e.to_string()).err();
+            tracing::warn!(event = "render.missed", id = %job.id, air_at = ?job.air_at, write_error = ?written, "air time came before the chapter rendered; not rendering it");
+            if written.is_none() {
+                missed.push(job.id.clone());
+            }
+        }
+        missed
     }
+}
+
+fn is_past(air_at: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
+    air_at.is_some_and(|air| air <= now)
+}
+
+/// The queued job to render next: the one airing soonest, then any with no
+/// air time; ties go to the one enqueued first. A job whose air time has come
+/// is never picked.
+pub fn pick_next(jobs: &[JobState], now: OffsetDateTime) -> Option<&JobState> {
+    jobs.iter()
+        .filter(|j| j.status == Status::Queued && !is_past(j.air_at, now))
+        .min_by(|a, b| {
+            (a.air_at.is_none(), a.air_at, a.enqueued_at, &a.id).cmp(&(
+                b.air_at.is_none(),
+                b.air_at,
+                b.enqueued_at,
+                &b.id,
+            ))
+        })
 }
 
 fn fresh_state(
@@ -233,7 +292,11 @@ fn fresh_state(
 ) -> JobState {
     JobState {
         id: id.to_string(),
-        status: Status::Queued,
+        status: if is_past(air_at, now) {
+            Status::Missed
+        } else {
+            Status::Queued
+        },
         output: plan.output().to_path_buf(),
         duration_s: plan.duration_s(),
         enqueued_at: now,
@@ -256,15 +319,18 @@ pub fn job_id(plan: &Document) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Render the oldest queued job. Returns its final state, or `None` when
-/// nothing was waiting.
+/// Render the queued job airing soonest, after marking any whose air time has
+/// come as missed. Returns its final state, or `None` when nothing was waiting.
 pub fn process_next(
     queue: &Queue,
     settings: &Settings,
     cap_bytes: u64,
     now: impl Fn() -> OffsetDateTime,
 ) -> Option<JobState> {
-    let mut job = queue.next_queued()?;
+    let mut jobs = queue.list();
+    let at = now();
+    queue.mark_missed(&mut jobs, at);
+    let mut job = pick_next(&jobs, at)?.clone();
     job.status = Status::Running;
     job.started_at = Some(now());
     job.attempts += 1;

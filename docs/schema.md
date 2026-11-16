@@ -3396,7 +3396,7 @@ A plugin that queues a chapter airs it in a bumper segment named `chapter:<job>|
 
 ### Queue and sidecar
 
-`etv-station enqueue <plan.json> [--air-at <RFC 3339>]` writes the plan into the queue directory and prints its job id at once. The same plan queued twice is one job. `etv-station render-sidecar`, started by the container entrypoint, renders queued plans one at a time. Each job has a state file, `<id>.state.json`, with `status` (`queued`, `running`, `done`, `failed`), the failing layer and last error, and timings. The sidecar exits 78 when no queue or cache is configured, and the entrypoint then leaves it off.
+`etv-station enqueue <plan.json> [--air-at <RFC 3339>]` writes the plan into the queue directory and prints its job id at once. The same plan queued twice is one job. `etv-station render-sidecar`, started by the container entrypoint, renders queued plans one at a time, the one airing soonest first; plans with no air time wait until none with one is queued, and ties go to the plan enqueued first. A queued plan whose air time comes before the sidecar reaches it is marked `missed` and never rendered, since the station swaps a chapter in only before it airs; enqueueing it again with a later `--air-at` queues it again. Each job has a state file, `<id>.state.json`, with `status` (`queued`, `running`, `done`, `failed`, `evicted`, `missed`), the failing layer and last error, and timings. The sidecar exits 78 when no queue or cache is configured, and the entrypoint then leaves it off.
 
 The cache is capped. When rendered chapters and stems pass the cap, chapters whose `--air-at` has passed are removed oldest first; a chapter within 30 minutes of air, or with no air time, is never removed.
 
