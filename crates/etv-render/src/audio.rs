@@ -1,228 +1,189 @@
-//! The chapter's audio: layers cut from each hook's stems, stretched to the
-//! chapter tempo, shifted to its key, levelled, faded, delayed to their bar and
-//! mixed.
-//!
-//! Each hook contributes its vocal from its landing bar on. For the first
-//! `vocal_over_bars` the previous hook's instrumental carries on underneath it;
-//! after that the hook's own instrumental joins its vocal for `full_bars`.
+//! The plan's audio: every layer read from its source or stem, stretched,
+//! shifted, filtered, levelled, faded, delayed to its place and summed.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::error::RenderError;
-use crate::plan::{Plan, REGION_BARS_BEFORE};
-use crate::stems::{NO_VOCALS, VOCALS};
+use crate::plan::{Curve, FadeKind, Filter, Plan};
+use crate::stems::{self, Region};
 use crate::tools;
 
-/// Mean level, in dB, the layers are brought to before mixing.
-const VOCAL_DB: f64 = -20.0;
-const SEAM_VOCAL_DB: f64 = -19.0;
-const INSTRUMENTAL_DB: f64 = -17.0;
-/// A stem quieter than this is silence, not music to be turned up.
+/// A stem quieter than this is silence, not music to be brought to a level.
 const SILENT_DB: f64 = -70.0;
 /// Rate the mix is written at.
-const SAMPLE_RATE: u32 = 44_100;
+pub const SAMPLE_RATE: u32 = 44_100;
+/// Extra source seconds read past a layer's end, so a stretch never runs dry.
+const READ_SLACK_S: f64 = 0.25;
 
-/// One stem excerpt on the chapter's timeline.
+/// Where one layer's samples come from: a file and the offset into it.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Layer {
-    /// What an error calls it: `hook 2 (song-b) vocals`.
-    pub name: String,
+pub struct Input {
     pub file: PathBuf,
-    /// Where the excerpt starts in the stem file, and how long it is there.
-    pub native_start: f64,
-    pub native_len: f64,
-    /// Where it starts in the chapter.
-    pub out_start: f64,
-    /// Chapter bpm over the song's own.
-    pub tempo: f64,
-    /// Frequency ratio for the semitone shift.
-    pub pitch: f64,
-    /// The mean level to bring the excerpt to, in dB.
-    pub target_db: f64,
-    pub fade_in: f64,
-    pub fade_out: f64,
+    pub start_s: f64,
 }
 
-impl Layer {
-    /// Seconds the excerpt lasts once stretched to the chapter tempo.
-    pub fn out_len(&self) -> f64 {
-        self.native_len / self.tempo
-    }
-}
-
-/// Every layer of the chapter. `stem_dirs[i]` is hook `i`'s stems.
-pub fn layers(plan: &Plan, stem_dirs: &[PathBuf]) -> Vec<Layer> {
-    let bar = plan.bar_seconds;
-    let mut layers = Vec::new();
-    let mut out_bar = 0u32;
-    for (i, hook) in plan.hooks.iter().enumerate() {
-        let native_bar = 240.0 / hook.native_bpm;
-        let tempo = plan.bpm / hook.native_bpm;
-        let pitch = 2f64.powf(f64::from(hook.semitones) / 12.0);
-        let name = |kind: &str| format!("hook {} ({}) {kind}", i + 1, hook.entry_id);
-        let layer = |kind: &str,
-                     dir: &Path,
-                     file: &str,
-                     from_bar: u32,
-                     bars: u32,
-                     at_bar: u32,
-                     db: f64,
-                     fi: f64,
-                     fo: f64| Layer {
-            name: name(kind),
-            file: dir.join(file),
-            native_start: (REGION_BARS_BEFORE + f64::from(from_bar)) * native_bar,
-            native_len: f64::from(bars) * native_bar,
-            out_start: f64::from(at_bar) * bar,
-            tempo,
-            pitch,
-            target_db: db,
-            fade_in: fi,
-            fade_out: fo,
-        };
-
-        if i == 0 {
-            layers.push(layer(
-                "vocals",
-                &stem_dirs[i],
-                VOCALS,
-                0,
-                hook.full_bars,
-                out_bar,
-                VOCAL_DB,
-                0.02,
-                0.02,
-            ));
-            layers.push(layer(
-                "instrumental",
-                &stem_dirs[i],
-                NO_VOCALS,
-                0,
-                hook.full_bars,
-                out_bar,
-                INSTRUMENTAL_DB,
-                1.0,
-                0.02,
-            ));
-        } else {
-            let prev = &plan.hooks[i - 1];
-            if hook.vocal_over_bars > 0 {
-                // The previous song's instrumental keeps playing from where its
-                // own bars ended, pitched and stretched as it was.
-                let prev_native_bar = 240.0 / prev.native_bpm;
-                layers.push(Layer {
-                    name: format!(
-                        "hook {} ({}) instrumental under the next vocal",
-                        i, prev.entry_id
-                    ),
-                    file: stem_dirs[i - 1].join(NO_VOCALS),
-                    native_start: (REGION_BARS_BEFORE
-                        + f64::from(prev.vocal_over_bars + prev.full_bars))
-                        * prev_native_bar,
-                    native_len: f64::from(hook.vocal_over_bars) * prev_native_bar,
-                    out_start: f64::from(out_bar) * bar,
-                    tempo: plan.bpm / prev.native_bpm,
-                    pitch: 2f64.powf(f64::from(prev.semitones) / 12.0),
-                    target_db: INSTRUMENTAL_DB,
-                    fade_in: 0.02,
-                    fade_out: bar,
-                });
-                layers.push(layer(
-                    "vocals over the previous song",
-                    &stem_dirs[i],
-                    VOCALS,
-                    0,
-                    hook.vocal_over_bars,
-                    out_bar,
-                    SEAM_VOCAL_DB,
-                    0.5,
-                    0.02,
-                ));
+/// The input for every layer: the source file for a `full` read, else the
+/// separated stem, offset by where its region starts. `stem_dirs` maps a
+/// source id to its region and stem directory.
+pub fn inputs(plan: &Plan, stem_dirs: &BTreeMap<String, (Region, PathBuf)>) -> Vec<Input> {
+    plan.layers
+        .iter()
+        .map(|l| match stems::file_name(l.stem) {
+            None => Input {
+                file: plan
+                    .source_path(&l.source)
+                    .expect("validated: every layer names a known source")
+                    .clone(),
+                start_s: l.src_start_s,
+            },
+            Some(name) => {
+                let (region, dir) = &stem_dirs[&l.source];
+                Input {
+                    file: dir.join(name),
+                    start_s: l.src_start_s - region.start_s,
+                }
             }
-            let full_at = out_bar + hook.vocal_over_bars;
-            layers.push(layer(
-                "vocals",
-                &stem_dirs[i],
-                VOCALS,
-                hook.vocal_over_bars,
-                hook.full_bars,
-                full_at,
-                VOCAL_DB,
-                0.02,
-                0.02,
-            ));
-            layers.push(layer(
-                "instrumental",
-                &stem_dirs[i],
-                NO_VOCALS,
-                hook.vocal_over_bars,
-                hook.full_bars,
-                full_at,
-                INSTRUMENTAL_DB,
-                0.3,
-                0.02,
-            ));
-        }
-        out_bar += hook.vocal_over_bars + hook.full_bars;
-    }
-    layers
+        })
+        .collect()
 }
 
-/// The ffmpeg filter graph that mixes `layers` into `[aout]`, `total_s` long.
-/// `gains[i]` is the dB to apply to layer `i`.
-pub fn filter_graph(layers: &[Layer], gains: &[f64], total_s: f64) -> String {
+fn afade(kind: FadeKind, start_s: f64, len_s: f64, curve: Curve) -> String {
+    let t = match kind {
+        FadeKind::In => "in",
+        FadeKind::Out => "out",
+    };
+    let c = match curve {
+        Curve::Linear => "tri",
+        Curve::EqualPower => "qsin",
+    };
+    format!("afade=t={t}:st={start_s:.4}:d={len_s:.4}:curve={c}")
+}
+
+fn filter(f: &Filter) -> String {
+    match f {
+        Filter::Highpass { hz } => format!("highpass=f={hz:.1}"),
+        Filter::Lowpass { hz } => format!("lowpass=f={hz:.1}"),
+        Filter::Echo {
+            in_gain,
+            out_gain,
+            delay_ms,
+            decay,
+        } => format!("aecho={in_gain:.3}:{out_gain:.3}:{delay_ms:.0}:{decay:.3}"),
+    }
+}
+
+/// The ffmpeg filter graph that mixes the plan's layers into `[aout]`. Input
+/// `i` is layer `i`'s excerpt, already cut to its start; `gains[i]` is the dB
+/// to apply to it.
+pub fn filter_graph(plan: &Plan, gains: &[f64]) -> String {
     let mut parts = Vec::new();
     let mut labels = String::new();
-    for (i, (l, gain)) in layers.iter().zip(gains).enumerate() {
-        let out_len = l.out_len();
-        let fade_in = l.fade_in.min(out_len / 2.0);
-        let fade_out = l.fade_out.min(out_len / 2.0);
-        let delay_ms = (l.out_start * 1000.0).round() as i64;
-        parts.push(format!(
-            "[{i}:a]atrim=start={:.4}:end={:.4},asetpts=PTS-STARTPTS,aresample={SAMPLE_RATE},aformat=channel_layouts=stereo,\
-             rubberband=tempo={:.6}:pitch={:.6},volume={gain:.3}dB,\
-             afade=t=in:st=0:d={fade_in:.4},afade=t=out:st={:.4}:d={fade_out:.4},\
-             adelay=delays={delay_ms}:all=1[a{i}]",
-            l.native_start,
-            l.native_start + l.native_len,
-            l.tempo,
-            l.pitch,
-            out_len - fade_out,
-        ));
+    for (i, (l, gain)) in plan.layers.iter().zip(gains).enumerate() {
+        let mut chain = format!(
+            "[{i}:a]asetpts=PTS-STARTPTS,aresample={SAMPLE_RATE},aformat=channel_layouts=stereo"
+        );
+        match &l.ride {
+            Some(ride) => {
+                // The tempo steps once per step on the input's clock: the
+                // source's own seconds, since the stretch comes after.
+                let steps: Vec<String> = ride
+                    .ratios
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .map(|(k, r)| {
+                        format!(
+                            "{:.4} rubberband@ride{i} tempo {r:.6}",
+                            k as f64 * ride.step_src_s
+                        )
+                    })
+                    .collect();
+                if !steps.is_empty() {
+                    chain.push_str(&format!(",asendcmd=c='{}'", steps.join(";")));
+                }
+                chain.push_str(&format!(
+                    ",rubberband@ride{i}=tempo={:.6}:pitch={:.6}",
+                    ride.ratios[0], l.pitch
+                ));
+            }
+            None if (l.ratio - 1.0).abs() > 1e-9 || (l.pitch - 1.0).abs() > 1e-9 => {
+                chain.push_str(&format!(
+                    ",rubberband=tempo={:.6}:pitch={:.6}",
+                    l.ratio, l.pitch
+                ));
+            }
+            None => {}
+        }
+        chain.push_str(&format!(",atrim=end={:.4}", l.out_len_s));
+        for f in &l.filters {
+            chain.push(',');
+            chain.push_str(&filter(f));
+        }
+        if gain.abs() > 1e-9 {
+            chain.push_str(&format!(",volume={gain:.3}dB"));
+        }
+        for f in &l.fades {
+            chain.push(',');
+            chain.push_str(&afade(f.kind, f.start_s, f.len_s, f.curve));
+        }
+        let delay_ms = (l.out_start_s * 1000.0).round() as i64;
+        chain.push_str(&format!(",adelay=delays={delay_ms}:all=1[a{i}]"));
+        parts.push(chain);
         labels.push_str(&format!("[a{i}]"));
     }
+    let total = plan.duration_s;
     parts.push(format!(
-        "{labels}amix=inputs={}:normalize=0:duration=longest,apad=whole_dur={total_s:.4},atrim=end={total_s:.4},alimiter=limit=0.95[aout]",
-        layers.len()
+        "{labels}amix=inputs={}:normalize=0:duration=longest,apad=whole_dur={total:.4},atrim=end={total:.4},alimiter=limit=0.95[aout]",
+        plan.layers.len()
     ));
     parts.join(";")
 }
 
-/// Mix the chapter's audio into `out_wav`.
-pub fn mix(ffmpeg: &str, plan: &Plan, layers: &[Layer], out_wav: &Path) -> Result<(), RenderError> {
-    let mut gains = Vec::with_capacity(layers.len());
-    for layer in layers {
-        let measured =
-            tools::mean_volume_db(ffmpeg, &layer.file, layer.native_start, layer.native_len)
-                .map_err(|e| RenderError::new(&layer.name, e))?;
-        if measured < SILENT_DB {
-            return Err(RenderError::new(
-                &layer.name,
-                format!(
-                    "{} is silent at {:.1}s (mean {measured:.1} dB), so there is nothing to level",
-                    layer.file.display(),
-                    layer.native_start
-                ),
-            ));
-        }
-        gains.push(layer.target_db - measured);
+/// The dB each layer is turned by: what brings its excerpt to `level_db`, when
+/// it has one, plus its `gain_db`.
+fn gains(ffmpeg: &str, plan: &Plan, inputs: &[Input]) -> Result<Vec<f64>, RenderError> {
+    let mut out = Vec::with_capacity(plan.layers.len());
+    for (l, input) in plan.layers.iter().zip(inputs) {
+        let level = match l.level_db {
+            None => 0.0,
+            Some(target) => {
+                let measured =
+                    tools::mean_volume_db(ffmpeg, &input.file, input.start_s, l.src_len_s())
+                        .map_err(|e| RenderError::new(&l.name, e))?;
+                if measured < SILENT_DB {
+                    return Err(RenderError::new(
+                        &l.name,
+                        format!(
+                            "{} is silent at {:.1}s (mean {measured:.1} dB), so there is nothing to level",
+                            input.file.display(),
+                            input.start_s
+                        ),
+                    ));
+                }
+                target - measured
+            }
+        };
+        out.push(level + l.gain_db);
     }
-    let graph = filter_graph(layers, &gains, plan.duration_s());
+    Ok(out)
+}
+
+/// Mix the plan's audio into `out_wav`. Each layer is its own input, read from
+/// its start for its length, so no file is decoded past the part it plays.
+pub fn mix(ffmpeg: &str, plan: &Plan, inputs: &[Input], out_wav: &Path) -> Result<(), RenderError> {
+    let gains = gains(ffmpeg, plan, inputs)?;
+    let graph = filter_graph(plan, &gains);
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-y", "-v", "error"]);
-    for layer in layers {
-        cmd.arg("-i").arg(&layer.file);
+    for (l, input) in plan.layers.iter().zip(inputs) {
+        cmd.arg("-ss")
+            .arg(format!("{:.4}", input.start_s))
+            .arg("-t")
+            .arg(format!("{:.4}", l.src_len_s() + READ_SLACK_S))
+            .arg("-i")
+            .arg(&input.file);
     }
     cmd.args(["-filter_complex", &graph, "-map", "[aout]", "-ar"])
         .arg(SAMPLE_RATE.to_string())
@@ -235,101 +196,60 @@ pub fn mix(ffmpeg: &str, plan: &Plan, layers: &[Layer], out_wav: &Path) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{Cut, Hook, Plan};
+    use crate::plan::tests::sample;
+    use crate::plan::{Ride, Stem};
 
-    fn plan() -> Plan {
-        let hook = |id: &str, bpm: f64, semis: i32, over: u32, full: u32| Hook {
-            entry_id: id.into(),
-            path: format!("/m/{id}.mp4").into(),
-            landing_s: 30.0,
-            native_bpm: bpm,
-            semitones: semis,
-            vocal_over_bars: over,
-            full_bars: full,
-        };
-        Plan {
-            bpm: 120.0,
-            key: "A minor".into(),
-            camelot: "8A".into(),
-            bar_seconds: 2.0,
-            hooks: vec![hook("a", 100.0, 0, 0, 4), hook("b", 120.0, -2, 2, 4)],
-            broll: vec![],
-            cuts: vec![Cut {
-                entry_id: "a".into(),
-                native_start_s: 0.0,
-                out_start_s: 0.0,
-                length_s: 20.0,
-                ratio: 1.0,
-            }],
-            cards: vec![],
-            output: "/o.mp4".into(),
-        }
-    }
-
-    fn dirs() -> Vec<PathBuf> {
-        vec!["/s/a".into(), "/s/b".into()]
+    fn dirs(p: &Plan) -> BTreeMap<String, (Region, PathBuf)> {
+        stems::regions(p)
+            .into_iter()
+            .map(|r| (r.source.clone(), (r, PathBuf::from("/s/a"))))
+            .collect()
     }
 
     #[test]
-    fn the_first_hook_is_one_vocal_and_one_instrumental_layer() {
-        let l = layers(&plan(), &dirs());
-        assert_eq!(l[0].name, "hook 1 (a) vocals");
-        assert_eq!(l[1].name, "hook 1 (a) instrumental");
-        // 4 bars of a 100 bpm song, starting 4 native bars (9.6s) into its stem file.
-        assert!((l[0].native_start - 9.6).abs() < 1e-9);
-        assert!((l[0].native_len - 9.6).abs() < 1e-9);
-        // Stretched to 120 bpm: 4 bars of 2s.
-        assert!((l[0].out_len() - 8.0).abs() < 1e-9);
+    fn a_stem_layer_reads_its_stem_file_offset_into_the_region() {
+        let p = sample();
+        let inputs = inputs(&p, &dirs(&p));
+        assert_eq!(inputs[0].file, PathBuf::from("/s/a/vocals.wav"));
+        // The read starts at 30 s; the region starts 8 s before it.
+        assert!((inputs[0].start_s - 8.0).abs() < 1e-9);
+        // `b` is read whole, from its own file.
+        assert_eq!(inputs[1].file, PathBuf::from("/m/b.mp4"));
+        assert!((inputs[1].start_s - 10.0).abs() < 1e-9);
     }
 
     #[test]
-    fn the_seam_carries_the_previous_instrumental_under_the_new_vocal() {
-        let l = layers(&plan(), &dirs());
-        let under = &l[2];
-        assert_eq!(under.file, PathBuf::from("/s/a/no_vocals.wav"));
-        // After a's 4 bars, 4 bars of region lead-in: 8 native bars of 2.4s.
-        assert!((under.native_start - 8.0 * 2.4).abs() < 1e-9);
-        assert!((under.out_start - 8.0).abs() < 1e-9);
-        assert!((under.out_len() - 4.0).abs() < 1e-9);
-        let vocal = &l[3];
-        assert_eq!(vocal.file, PathBuf::from("/s/b/vocals.wav"));
-        assert!((vocal.out_start - 8.0).abs() < 1e-9);
-        assert!((vocal.out_len() - 4.0).abs() < 1e-9);
+    fn the_graph_stretches_filters_levels_fades_and_places_every_layer() {
+        let p = sample();
+        let g = filter_graph(&p, &[2.0, -3.0]);
+        assert!(
+            g.contains("rubberband=tempo=1.200000:pitch=1.000000"),
+            "{g}"
+        );
+        assert!(g.contains("highpass=f=250.0"), "{g}");
+        assert!(g.contains("volume=-3.000dB"), "{g}");
+        assert!(
+            g.contains("afade=t=in:st=0.0000:d=2.0000:curve=qsin"),
+            "{g}"
+        );
+        assert!(g.contains("adelay=delays=6000:all=1[a1]"), "{g}");
+        assert!(g.contains("amix=inputs=2:normalize=0"), "{g}");
+        assert!(g.contains("apad=whole_dur=16.0000"), "{g}");
+        // `b` plays at its own speed and pitch: no stretch on its branch.
+        let b = g.split(';').nth(1).unwrap();
+        assert!(!b.contains("rubberband"), "{b}");
     }
 
     #[test]
-    fn the_full_section_starts_after_the_seam_in_both_chapter_and_song() {
-        let l = layers(&plan(), &dirs());
-        let full_vocals = &l[4];
-        assert_eq!(full_vocals.name, "hook 2 (b) vocals");
-        assert!((full_vocals.out_start - 12.0).abs() < 1e-9);
-        // b is at the chapter tempo: bars of 2s, 4 lead-in + 2 seam bars in.
-        assert!((full_vocals.native_start - 6.0 * 2.0).abs() < 1e-9);
-        assert!((full_vocals.out_len() - 8.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn the_layers_cover_exactly_the_chapter() {
-        let p = plan();
-        let l = layers(&p, &dirs());
-        let end = l
-            .iter()
-            .map(|x| x.out_start + x.out_len())
-            .fold(0.0, f64::max);
-        assert!((end - p.duration_s()).abs() < 1e-9, "{end}");
-    }
-
-    #[test]
-    fn the_filter_graph_stretches_shifts_delays_and_mixes_every_layer() {
-        let p = plan();
-        let l = layers(&p, &dirs());
-        let gains = vec![0.0; l.len()];
-        let g = filter_graph(&l, &gains, p.duration_s());
-        assert_eq!(g.matches("rubberband=").count(), l.len());
-        assert!(g.contains("amix=inputs=6:normalize=0"));
-        assert!(g.contains("adelay=delays=8000:all=1[a2]"));
-        assert!(g.contains("apad=whole_dur=20.0000"));
-        // b is two semitones down: 2^(-2/12).
-        assert!(g.contains("pitch=0.890899"));
+    fn a_ride_steps_its_tempo_on_the_sources_clock_then_holds_the_last() {
+        let mut p = sample();
+        p.layers[1].stem = Stem::Full;
+        p.layers[1].ride = Some(Ride {
+            step_src_s: 2.0,
+            ratios: vec![0.9, 0.95, 1.0],
+        });
+        let g = filter_graph(&p, &[0.0, 0.0]);
+        assert!(g.contains("asendcmd=c='2.0000 rubberband@ride1 tempo 0.950000;4.0000 rubberband@ride1 tempo 1.000000'"), "{g}");
+        assert!(g.contains("rubberband@ride1=tempo=0.900000"), "{g}");
     }
 }

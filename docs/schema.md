@@ -3345,46 +3345,83 @@ the whole session's subtitle rendition and it cannot vary per item.
 
 ## Chapter renderer
 
-The image ships a renderer that turns a **chapter plan** into one video file, and a sidecar that drains a queue of plans ahead of air. The station core only holds the plan, the queue and the cache; which songs a plan names, and when it is queued, is a plugin's decision.
+The image ships a renderer that turns a **render plan** into one video file, and a sidecar that drains a queue of plans ahead of air. The station core only holds the plan, the queue and the cache; which songs a plan names, how they join, and when it is queued are a plugin's decisions. The renderer mixes the audio layers and cuts the picture the plan lists and decides nothing else (ADR 0023).
 
-### Chapter plan
+### Render plan
 
-A JSON document. Unknown keys are refused. `crates/etv-render/tests/fixtures/chapter.plan.json` is a checked-in example.
-
-| Key | Meaning |
-|---|---|
-| `bpm` | Chapter tempo; every audio layer is stretched to it. |
-| `key`, `camelot` | The chapter key (`A minor`) and its Camelot code (`8A`). Audit record only. |
-| `bar_seconds` | Seconds in one bar: `240 / bpm`, within 1 ms, or the plan is refused. |
-| `hooks` | The songs in air order: `entry_id`, `path`, `landing_s` (where the hook's landing bar starts in the file), `native_bpm`, `semitones` (moved to reach the chapter key), `vocal_over_bars` (bars this song's vocal sings over the previous song's instrumental; 0 for the first hook), `full_bars` (bars of vocal and instrumental together after that). |
-| `broll` | Optional video-only sources, `{entry_id, path}`, that cuts may draw from besides the hooks. |
-| `cuts` | The picture, in air order, with no gap: `entry_id` (a hook or B-roll source), `native_start_s`, `out_start_s`, `length_s`, `ratio` (source seconds per chapter second). |
-| `cards` | `{at_s, artist, title, year?}` in air order, each `at_s` inside the set. The renderer does not draw them; the overlay does (`examples/overlays/hook_card.rhai` draws artist and title for one bar from each `at_s`; it ignores `year`). |
-| `output` | Where the rendered file lands. |
-
-The chapter lasts `bar_seconds` times the sum of every hook's `vocal_over_bars` and `full_bars`.
-
-### Set plan
-
-A JSON document that plays whole songs one after another. It names itself with `"kind": "set"`; a plan file with no `kind` is a chapter plan. Unknown keys are refused. `etv-station render` and `enqueue` take either kind, and a job's state file reads the same for both.
+A JSON document. Unknown keys are refused everywhere in it. `crates/etv-render/src/plan.rs` parses and validates it; `crates/etv-render/tests/fixtures/chapter.plan.json` is a checked-in example. `etv-station render` and `enqueue` refuse a malformed plan at once, from its structure and arithmetic alone; a named file that does not exist is found when the render runs and recorded against the job.
 
 | Key | Meaning |
 |---|---|
-| `kind` | `"set"`. |
-| `tracks` | The songs in air order: `entry_id` (unique), `path`, `native_bpm`, `enter_s` (where the song enters, in file seconds: 0 for the whole song, or its landing bar), `ratio` (source seconds per set second when the song enters; 1.0 is the song's own tempo), and `ride_bars` (optional, default 0, at most 64; only for a song that enters by a `bass_swap`). |
-| `seams` | One fewer than `tracks`; `seams[i]` joins `tracks[i]` to `tracks[i + 1]`: `recipe`, `out_s` (where in the outgoing song, in file seconds, its phrase ends; at least one bar after it enters, two for `echo_out`), and for `bass_swap` only `bars` (even, 2 or more) and `sweep`. |
-| `end_s` | Where in the last song's file the set stops. The last 2 seconds fade out. |
-| `cards` | `{at_s, artist, title, year?}`. The renderer does not draw them; the overlay does. |
-| `output` | Where the rendered file lands. |
+| `sources` | Every media file the layers and cuts read: `{id, path, separate?}`. At least one; each `id` and `path` non-empty, each `id` unique. `separate` is `{start_s, len_s}`, the stretch of the source split into stems; every `vocals` or `instrumental` layer of that source must read inside it. Unset, the renderer separates the stretch the layers read plus margins (§ Rendering). A plugin names it so plans that read different parts of one song share one separation. |
+| `layers` | The audio, mixed: every layer is summed at its place on the timeline. At least one. See the layer table. |
+| `cuts` | The picture, in air order, with no gap and no overlap. At least one. See the cut table. |
+| `duration_s` | Seconds the result lasts. Positive. |
+| `cards` | Optional. `{at_s, artist, title, year?}` for the overlay. The renderer does not draw them (`examples/overlays/hook_card.rhai` draws artist and title for one bar from each `at_s`; it ignores `year`). Each `at_s` is from 0 to `duration_s`, and the list is in air order. |
+| `output` | Where the rendered file lands. Non-empty. |
+| `notes` | Optional, any JSON. The plugin's own record of why the plan looks as it does. The renderer keeps it with the plan and never reads it. |
 
-The recipes, in set seconds with `bl` the outgoing song's bar at its `ratio`:
+A layer is `{name, source, src_start_s, out_start_s, out_len_s, ...}`:
 
-- `bass_swap`: A plays full band through `out_s` and for `bars / 2 * bl` more; over that stretch A's tail continues with its bass cut (and narrowed to 250 to 1200 Hz when `sweep`) while B's bass-cut entry plays from `bars / 2` bars before its `enter_s`; B then plays full band. B must play alone for at least the tail's `bars / 2 * bl` (until its own seam `out_s`, or `end_s`), else the tail would overlap the next seam or run past the set. B's `ratio` must equal A's running tempo over B's `native_bpm` (within 0.002) so the beats stay locked, and `enter_s` must leave the lead-in before the start of the file. The picture cuts between the two once a bar, B's share growing.
-- Tempo ride: a song with `ride_bars` above 0 and a `ratio` other than 1.0 enters at `ratio` and steps back to its own tempo over its next `ride_bars` bars of the file, counted from `enter_s`. Bar `i` of `n` (counting from 1) plays at `ratio + (1 - ratio) * i / n`, so the first bar is one step from the swap's tempo and the last bar is native, and every later bar plays at 1.0. The sound is one stretch whose `rubberband` tempo an `asendcmd` sets at each bar line; the picture is one segment per bar at the same per-bar ratio, so both reach each bar line together. Once the ride is over the song's running tempo is its own, so the next `bass_swap` out of it locks to `native_bpm`. The ride must end before the song's seam `out_s` (by one bar, two for `echo_out`) or, in the last song, before `end_s` less the closing fade; a plan that cuts a ride short is refused.
-- `echo_out`: A plays to one bar before `out_s`; that bar and the two after it ring out in an echo (`aecho=0.8:0.7`, delay three quarters of a beat) while B enters at its own tempo at `out_s`.
-- `drop_mix`: A stops at `out_s` with a 10 ms fade and B starts on the beat.
+| Key | Default | Meaning |
+|---|---|---|
+| `name` | required | What an error calls the layer. |
+| `source` | required | A `sources` id. |
+| `stem` | `full` | Which audio to read: `full` (the file's own audio), `vocals` or `instrumental` (separated by Demucs). |
+| `src_start_s` | required | Where the excerpt starts in the source, in the source's own seconds. 0 or more. |
+| `out_start_s` | required | Where it starts in the result. 0 or more. |
+| `out_len_s` | required | Seconds it lasts in the result, after stretching. Positive. |
+| `ratio` | `1.0` | Source seconds played per result second. Positive. |
+| `ride` | none | A tempo that changes in steps, opening the layer: `{step_src_s, ratios}`. Each step lasts `step_src_s` source seconds (positive) at the next ratio of `ratios` (1 to 64 positive ratios). Once the steps end the layer keeps the last ratio. The steps must not last longer in the result than `out_len_s`. A layer with a `ride` takes its tempo from it, and `ratio` is not read. |
+| `pitch` | `1.0` | Frequency ratio of the pitch shift; 1.0 leaves it alone. Positive. |
+| `level_db` | none | Bring the excerpt's mean level to this many dB before `gain_db`. Unset leaves the source's level. |
+| `gain_db` | `0` | dB added after levelling. |
+| `fades` | `[]` | `{kind, start_s, len_s, curve}`: `kind` is `in` or `out`; `start_s` (0 or more) is seconds from the layer's start in the result; `len_s` is positive; `curve` is `linear` (default) or `equal_power`, which keeps two crossfading layers at a steady combined loudness. A fade must end within the layer. |
+| `filters` | `[]` | Applied over the whole layer after the stretch and before the fades: `{"kind": "highpass", "hz"}`, `{"kind": "lowpass", "hz"}`, or `{"kind": "echo", "in_gain", "out_gain", "delay_ms", "decay"}` (repeats `delay_ms` apart, each `decay` times the last). Every number is positive. |
 
-The set lasts the sum of each song's body, `(out_s - enter_s) / ratio` (for a riding song, the ride's set seconds plus `(out_s - enter_s - ride)` at 1.0), plus each bass swap's `bars / 2 * bl`, plus the last song's `(end_s - enter_s) / ratio`. `crates/etv-render/src/set.rs` lays it out, and a plan whose seams do not fit is refused with the seam named. Audio comes from each song's full mix (no stem separation), and the picture is cut and joined as in a chapter.
+A layer may end at most 0.05 s past `duration_s`.
+
+A cut is `{source, src_start_s, out_start_s, out_len_s, ratio}`: a `sources` id, where the picture starts in the source (0 or more), where it lands in the result, how long it lasts there (positive), and source seconds shown per result second (`ratio`, default `1.0`, positive). The first cut starts at 0, each cut starts where the previous one ended, and the last ends at `duration_s`, each within 0.05 s.
+
+An example with two sources, a vocal-over seam at 8 s, and a title card per song:
+
+```json
+{
+  "sources": [
+    { "id": "a", "path": "/media/a.mp4" },
+    { "id": "b", "path": "/media/b.mp4" }
+  ],
+  "layers": [
+    { "name": "a instrumental", "source": "a", "stem": "instrumental",
+      "src_start_s": 24.0, "out_start_s": 0.0, "out_len_s": 12.0, "ratio": 1.2, "level_db": -17.0,
+      "fades": [ { "kind": "out", "start_s": 10.0, "len_s": 2.0, "curve": "equal_power" } ] },
+    { "name": "b vocals over a", "source": "b", "stem": "vocals",
+      "src_start_s": 20.0, "out_start_s": 8.0, "out_len_s": 12.0, "ratio": 0.923, "pitch": 0.891, "level_db": -19.0,
+      "fades": [ { "kind": "in", "start_s": 0.0, "len_s": 0.5 } ] }
+  ],
+  "cuts": [
+    { "source": "a", "src_start_s": 24.0, "out_start_s": 0.0, "out_len_s": 8.0, "ratio": 1.2 },
+    { "source": "b", "src_start_s": 20.0, "out_start_s": 8.0, "out_len_s": 12.0, "ratio": 0.923 }
+  ],
+  "duration_s": 20.0,
+  "cards": [ { "at_s": 0.0, "artist": "Artist A", "title": "Song A", "year": 1999 },
+             { "at_s": 8.0, "artist": "Artist B", "title": "Song B" } ],
+  "output": "/out/chapter.mp4",
+  "notes": { "bpm": 120.0 }
+}
+```
+
+**`notes` belongs to the plugin.** The megamix plugin writes the chapter's tempo, key and songs there so `admin audit` can explain the seams:
+
+```json
+"notes": {
+  "bpm": 120.0, "key": "A minor", "camelot": "8A", "bar_seconds": 2.0,
+  "hooks": [ { "entry_id": "...", "landing_s": 24.0, "landing_bar": 8, "native_bpm": 100.0, "semitones": 0,
+              "vocal_over_bars": 0, "full_bars": 8, "ratio": 1.2, "pitch": 1.0 } ]
+}
+```
+
+The renderer reads none of these. Tempo, key, bars, hooks and seams are the plugin's words; by the time the plan reaches the renderer each is a layer's `ratio`, `pitch`, `out_start_s` and `fades`, or a cut's range.
 
 ### Naming a queued chapter
 
@@ -3392,7 +3429,7 @@ A plugin that queues a chapter airs it in a bumper segment named `chapter:<job>|
 
 ### Rendering
 
-`etv-station render <plan.json>` renders one plan and exits non-zero with the failing layer named. Per hook it separates the region from 4 bars before `landing_s` to 18 bars after into vocals and instrumental with Demucs (two-stem), cached by entry and region under the cache directory. Each audio layer is trimmed, stretched to `bpm` with ffmpeg's `rubberband` filter, shifted by `semitones`, gained to a target RMS, faded and delayed; the layers are mixed and limited. Each cut becomes a 1080p segment from its source at `ratio`, and the segments are concatenated. The encoder is the hardware one named by `ETV_ACCEL` when the renderer's ffmpeg (`ETV_RENDER_FFMPEG`) lists it, else libx264.
+`etv-station render <plan.json>` renders one plan and exits non-zero with the failing layer named. For each source that any layer reads as `vocals` or `instrumental`, it separates one region with Demucs (two-stem): the source's `separate` span, or else from the earliest such read, less 8 seconds (but not before the file's start), to the latest, plus 1 second. The megamix plugin names each song's span as 4 of its bars before the landing to 18 after. The stems are cached by source and region under the cache directory, so a source read the same way by two plans is separated once. Each layer is trimmed, stretched to its `ratio` (or `ride`) with ffmpeg's `rubberband` filter, shifted by `pitch`, filtered, turned by the dB that brings the unfiltered excerpt's mean level to `level_db` plus `gain_db`, faded and delayed to `out_start_s`; the layers are mixed and limited. Each cut becomes a 1080p segment from its source at `ratio`, and the segments are concatenated. The encoder is the hardware one named by `ETV_ACCEL` when the renderer's ffmpeg (`ETV_RENDER_FFMPEG`) lists it, else libx264. `crates/etv-render/tests/no_arrangement_in_core.rs` fails if the renderer's source names an arrangement concept such as a seam, a hook or a recipe.
 
 ### Queue and sidecar
 
@@ -3421,8 +3458,8 @@ The image also reads `ETV_RENDER_PYTHON` (the interpreter with Demucs and PyTorc
 1. Candidates are the entries `config.expr` matches that have audio facts with `beat_confidence` at or above `floor`, a steady beat grid of at least `steady_beats` beats, a file long enough for the 18 bars after the landing bar, and are not a hook of the last `tail` chapters on the channel's ledger.
 2. Clusters form around each seed (at most `seeds` of them): entries within `tempo_band_pct` percent of the seed's tempo and at Camelot distance 1 or less from its key. The `rule` ranker picks the cluster with the most candidates, a tie going to the channel's seeded rng. The chapter tempo is the cluster's median, its key the seed's.
 3. The hooks are drawn from the cluster, ordered by rising energy over the four bars from each song's landing bar, and each is moved by the semitone shift within `max_shift` that lands closest to the chapter key. A hook is 16 bars (8 when 16 bars would pass 40 seconds), starts on an 8-bar boundary of the chapter, and from the second hook on opens with `vocal_over_bars` bars of its vocal over the previous instrumental. Picture cuts are four bars long, alternating a hook's own video with another hook's, or with a Frame index shot when `plexdb_url` and `phrase` are set (step 3a).
-3a. With `plexdb_url` and `phrase`, one `POST /api/search/run` (the call `up_next.rhai` makes) asks the plex-db-ex explorer for `phrase` among the pool's songs that are not hooks of this chapter, drawing one shot per odd four-bar cut (2 per 16-bar hook, 1 per 8-bar). A shot with at least four bars of room replaces that cut's picture, at its own speed (`ratio` 1), and its song is listed in the plan's `broll`. An ungranted `http`, an unreachable explorer or an empty answer leaves the alternating hook pictures; `<stem>.audit.txt` gains a `broll` line per shot used.
-4. The plan (§ Chapter plan) is written to `<dir>/<stem>.plan.json` with `<stem>.audit.txt` (one seam line per hook) beside it, and queued with `<enqueue> <enqueue_args> enqueue <plan> --air-at <t>`, where `t` is the gap's start. `ctx.exec` returns at once, since `enqueue` only files the plan.
+3a. With `plexdb_url` and `phrase`, one `POST /api/search/run` (the call `up_next.rhai` makes) asks the plex-db-ex explorer for `phrase` among the pool's songs that are not hooks of this chapter, drawing one shot per odd four-bar cut (2 per 16-bar hook, 1 per 8-bar). A shot with at least four bars of room replaces that cut's picture, at its own speed (`ratio` 1), and its song is listed in the plan's `sources` with no `separate` span. An ungranted `http`, an unreachable explorer or an empty answer leaves the alternating hook pictures; `<stem>.audit.txt` gains a `broll` line per shot used.
+4. The plan (§ Render plan) is written to `<dir>/<stem>.plan.json` with `<stem>.audit.txt` (one seam line per hook) beside it, and queued with `<enqueue> <enqueue_args> enqueue <plan> --air-at <t>`, where `t` is the gap's start. `ctx.exec` returns at once, since `enqueue` only files the plan.
 5. The timeline is one `pending(<dir>/<stem>.mp4, <dir>/stand-in.mp4)` segment, looped, named `chapter:<job>|<entry>|<entry>...`. The stand-in is a ten-second black clip with a brown-noise bed that the script makes with `ffmpeg` once. With no `enqueue` program, the plan is still written and the segment is named `chapter:unqueued-<stem>|...`. With no stand-in, the segment is black. When `card_script` is set the segment carries `overlay(card_script, #{ cards })`, `cards` being `{at_s, artist, title, year}` per hook and `bar_s` the length of one bar, so the overlay reads the card copy from the item's metadata.
 
 Config keys: `expr` and `dir` (required); `floor` (default 2.5), `steady_beats` (32), `ranker` (`rule` or `model`), `hooks_min` (3), `hooks_max` (5), `tempo_band_pct` (4), `max_shift` (3), `vocal_over_bars` (2), `tail` (12), `seeds` (60), `artist_field` (`show`), `card_script`, `enqueue` (`etv-station`), `enqueue_args` (`[]`), `ffmpeg` (`ffmpeg`), `plexdb_url` and `phrase` (both unset; Frame index shots, step 3a), and for `ranker: model` `model_url` and `model` (required), `brief`, `model_headers` (`{}`), `model_clusters` (6), `model_songs` (40). `examples/channels/megamix-test.yaml` fills a 12-minute grid with chapters after each music video.
@@ -3433,7 +3470,7 @@ Config keys: `expr` and `dir` (required); `floor` (default 2.5), `steady_beats` 
 
 ### Whole-song plugin
 
-`examples/plugins/bumpers/whole_song.rhai` fills a gap with music videos played whole, joined by seam recipes, and queues a set plan (§ Set plan). It needs `probe`, `catalog_read` and `exec`, and names its segment `chapter:<job>|<entry>|...` so the chapters endpoint, `admin audit` and the recent-songs check treat it as they treat a megamix chapter. Candidates are the pool's entries with audio facts at or above `floor`, a steady run of `steady_beats` beats, and a phrase boundary to leave the song by; songs of the last `tail` sets are skipped. The first song is drawn at random; each next one is drawn from the three nearest in tempo to the running tempo. The recipe per seam, from the autodj spike: `echo_out` when the tempo gap passes `tempo_gap_pct` or either beat confidence is under 1.5; `drop_mix` when the arrival is more than `drop_step_db` louder than the exit; otherwise `bass_swap`, 2 bars with a sweep when the arrival is within 90% of the song's peak and 4 bars without. After a bass swap the incoming song plays at the outgoing song's tempo and rides back to its own over `ride_bars` bars (§ Set plan); a song with no room for the ride before its seam or the end of the set keeps the swap's tempo. A song entering at its file start has no lead-in for a bass swap, so that seam is a `drop_mix` on a step up and an `echo_out` otherwise. The last song plays until the gap ends or its file does; a set that ends early leaves the rest of the gap black.
+`examples/plugins/bumpers/whole_song.rhai` fills a gap with music videos played whole, joined by seam recipes, and queues a render plan (§ Render plan). It needs `probe`, `catalog_read` and `exec`, and names its segment `chapter:<job>|<entry>|...` so the chapters endpoint, `admin audit` and the recent-songs check treat it as they treat a megamix chapter. Candidates are the pool's entries with audio facts at or above `floor`, a steady run of `steady_beats` beats, and a phrase boundary to leave the song by; songs of the last `tail` sets are skipped. The first song is drawn at random; each next one is drawn from the three nearest in tempo to the running tempo. The recipe per seam, from the autodj spike: `echo_out` when the tempo gap passes `tempo_gap_pct` or either beat confidence is under 1.5; `drop_mix` when the arrival is more than `drop_step_db` louder than the exit; otherwise `bass_swap`, 2 bars with a sweep when the arrival is within 90% of the song's peak and 4 bars without. After a bass swap the incoming song plays at the outgoing song's tempo and rides back to its own over `ride_bars` bars (a layer's `ride`, § Render plan); a song with no room for the ride before its seam or the end of the set keeps the swap's tempo. A song entering at its file start has no lead-in for a bass swap, so that seam is a `drop_mix` on a step up and an `echo_out` otherwise. The last song plays until the gap ends or its file does; a set that ends early leaves the rest of the gap black.
 
 Config keys: `expr` and `dir` (required); `entry` (`landing`, the song's landing bar, or `start`, the whole song), `floor` (2.5), `steady_beats` (32), `tail` (12), `tempo_gap_pct` (8), `drop_step_db` (3), `ride_bars` (16; 0 keeps a swapped song at the outgoing tempo for its whole play), `artist_field` (`show`), `card_script`, `enqueue`, `enqueue_args`, `ffmpeg`. `<stem>.audit.txt` gets one line per seam with the recipe, both songs, the tempo gap and the energy step.
 

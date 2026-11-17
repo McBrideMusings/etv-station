@@ -1,6 +1,9 @@
 // A whole-song bumper: fills a gap with music videos played whole, one after
-// another, each pair joined by a seam recipe chosen by rule, and hands the set
-// plan to the renderer's queue (docs/schema.md § Set plan).
+// another, each pair joined by a seam recipe chosen by rule, and hands the
+// render plan (the audio layers and picture cuts, docs/schema.md § Render plan)
+// to the renderer's queue. The recipes, tempo ride, filters, fades and the
+// picture split are resolved here into layers and cuts; the plan's `notes` keep
+// the songs and seams (recipe, bars, sweep) for audit.
 //
 // config (the block's `fill:` entry):
 //   expr:            CEL over the catalog naming the pool, as a pool's `expr` does (required)
@@ -49,17 +52,18 @@ fn end_margin_s() { 0.5 }
 
 fn num(v) { v * 1.0 }
 
-// Config `ride_bars` as a whole number of bars the renderer accepts (0 to 64).
+// Config `ride_bars` as a whole number of bars, 0 (no ride) to 64; a ride is one
+// step per bar and the plan takes 1 to 64 steps.
 fn ride_bars_of(cfg) {
     let n = conf(cfg, "ride_bars", 16).to_int();
-    if n < 0 { 0 } else if n > 64 { 64 } else { n }
+    if n < 0 { 0 } else if n > max_ride_bars() { max_ride_bars() } else { n }
 }
 
-// A song's bar in the file, as the renderer counts it (240 / bpm).
+// Seconds in one bar of a song's file at its native tempo (240 / bpm).
 fn file_bar(item) { 240.0 / num(item.audio.bpm) }
 
 // The ratio of each bar of a track's tempo ride: a straight line from the entry
-// ratio to 1.0, the last bar native (crates/etv-render/src/set.rs Track::ride_ratios).
+// ratio to 1.0, the last step native.
 fn ride_ratios(tr) {
     let out = [];
     for i in 1..=tr.ride { out.push(tr.ratio + (1.0 - tr.ratio) * i / tr.ride); }
@@ -90,6 +94,187 @@ fn finish(tr, play) {
     } else {
         #{ end_s: tr.enter + play * tr.ratio, ride: 0 }
     }
+}
+
+// Constants of the seam arithmetic.
+fn bass_crossover_hz() { 250.0 }
+fn sweep_ceiling_hz() { 1200.0 }
+fn cut_fade_s() { 0.01 }
+fn short_fade_s() { 0.02 }
+fn last_fade_s() { 2.0 }
+fn ratio_tolerance() { 0.002 }
+fn max_ride_bars() { 64 }
+
+fn rides(tr) { tr.ride > 0 && (tr.ratio - 1.0).abs() > 0.000000001 }
+
+// Seconds in one bar as the set plays it when the song leaves.
+fn bar_out(tr) { file_bar(tr.item) / exit_ratio(tr) }
+
+fn ride_of(tr) {
+    if rides(tr) { #{ step_src_s: file_bar(tr.item), ratios: ride_ratios(tr) } } else { () }
+}
+
+fn fade(kind, start, len) {
+    #{ kind: kind, start_s: if start < 0.0 { 0.0 } else { start }, len_s: len, curve: "linear" }
+}
+
+fn mk_layer(name, tr, src, out, len, ratio) {
+    #{ name: name, source: tr.item.entry_id, src_start_s: src, out_start_s: out, out_len_s: len,
+       ratio: ratio, fades: [], filters: [] }
+}
+
+fn mk_cut(tr, src, out, len, ratio) {
+    #{ source: tr.item.entry_id, src_start_s: src, out_start_s: out, out_len_s: len, ratio: ratio }
+}
+
+// The picture of `tr` from where it enters to `src_to` in its file, laid from set
+// second `t`: one cut, or, after a bass swap, one per bar of the tempo ride and
+// one for the rest.
+fn played_picture(tr, t, src_to) {
+    let out = [];
+    let at = t;
+    let src = tr.enter;
+    let bar = file_bar(tr.item);
+    if rides(tr) {
+        for r in ride_ratios(tr) {
+            out.push(mk_cut(tr, src, at, bar / r, r));
+            at += bar / r;
+            src += bar;
+        }
+    }
+    let ratio = exit_ratio(tr);
+    out.push(mk_cut(tr, src, at, (src_to - src) / ratio, ratio));
+    out
+}
+
+fn bad(msg) { throw "whole_song: " + msg; }
+
+// The checks on a set that the walk in `build` does not settle by construction:
+// the facts a song's row supplies (tempo, entry time, length) and the room the
+// last song has. The seam recipes, bars, ratios, rides and card times the walk
+// derives itself are not rechecked here; the renderer refuses a bad plan.
+fn validate_set(tracks, seams, end_s) {
+    for i in 0..tracks.len() {
+        let t = tracks[i];
+        let at = "tracks[" + i + "] (" + t.item.entry_id + ")";
+        if !(num(t.item.audio.bpm) > 0.0) { bad(at + ": native_bpm must be positive"); }
+        if !(t.enter >= 0.0) { bad(at + ": enter_s must not be negative"); }
+    }
+    for k in 0..seams.len() {
+        let seam = seams[k];
+        let a = tracks[k];
+        let b = tracks[k + 1];
+        if seam.recipe == "bass_swap" {
+            let at = "seams[" + k + "] (" + a.item.entry_id + " -> " + b.item.entry_id + ")";
+            let half = seam.bars / 2.0 * bar_out(a);
+            let b_stops_at = if k + 1 < seams.len() { seams[k + 1].out_s } else { end_s };
+            let b_alone = play_out(b, b_stops_at - b.enter);
+            if b_stops_at >= b.enter && b_alone + 0.000000001 < half {
+                bad(at + ": " + b.item.entry_id + " plays alone for " + b_alone + "s before "
+                    + (if k + 1 < seams.len() { "the next seam" } else { "the set ends" })
+                    + ", shorter than the " + half + "s tail of " + a.item.entry_id + " the bass swap lays over it");
+            }
+        }
+    }
+    let last = tracks[tracks.len() - 1];
+    if !(end_s >= last.enter + ride_src(last) + last_fade_s() * exit_ratio(last)) {
+        bad("end_s " + end_s + " leaves less than the " + last_fade_s() + "s closing fade after "
+            + last.item.entry_id + " enters at " + last.enter + "s"
+            + (if rides(last) { " and its " + last.ride + "-bar tempo ride" } else { "" }));
+    }
+}
+
+// The audio layers and picture cuts of a set, and how long it lasts: A's body to
+// its seam, the recipe's overlap or ring-out, B from its entry, and the last song
+// to `end_s` with a closing fade.
+fn layout(tracks, seams, end_s) {
+    let layers = [];
+    let cuts = [];
+    let t = 0.0;
+    for k in 0..seams.len() {
+        let seam = seams[k];
+        let a = tracks[k];
+        let b = tracks[k + 1];
+        let ra = exit_ratio(a);
+        let pos = a.enter;
+        let bl = bar_out(a);
+        let p = seam.out_s;
+        let body = play_out(a, p - pos);
+        let tp = t + body;
+        let an = "seam " + (k + 1) + " (" + a.item.entry_id + ") ";
+        let bn = "seam " + (k + 1) + " (" + b.item.entry_id + ") ";
+        cuts.append(played_picture(a, t, p));
+        if seam.recipe == "bass_swap" {
+            let half = seam.bars / 2.0 * bl;
+            let swap = tp + half;
+            let rb = b.ratio;
+            let through = body + half;
+            let l = mk_layer(an + "body", a, pos, t, through, a.ratio);
+            l.ride = ride_of(a);
+            l.fades.push(fade("out", through - short_fade_s(), short_fade_s()));
+            layers.push(l);
+
+            l = mk_layer(an + "tail without bass", a, p + half * ra, swap, half, ra);
+            l.filters.push(#{ kind: "highpass", hz: bass_crossover_hz() });
+            if seam.sweep { l.filters.push(#{ kind: "lowpass", hz: sweep_ceiling_hz() }); }
+            l.fades.push(fade("in", 0.0, short_fade_s()));
+            l.fades.push(fade("out", half / 2.0, half / 2.0));
+            layers.push(l);
+
+            let bass_in = b.enter - half * rb;
+            l = mk_layer(bn + "entering without bass", b, bass_in, tp, half, rb);
+            l.filters.push(#{ kind: "highpass", hz: bass_crossover_hz() });
+            l.fades.push(fade("in", 0.0, min(bl, half)));
+            l.fades.push(fade("out", half - short_fade_s(), short_fade_s()));
+            layers.push(l);
+
+            // The picture cuts between the two songs once a bar, B's share of the
+            // bar growing as the swap goes on.
+            let beat = bl / 4.0;
+            let nbars = seam.bars / 2;
+            if nbars < 1 { nbars = 1; }
+            let tt = tp;
+            for bar in 0..nbars {
+                let nb = min(4 * (bar + 1) / (nbars + 1) + 1, 4);
+                let a_beats = 4 - nb;
+                if nb < 4 {
+                    cuts.push(mk_cut(a, p + bar * bl * ra, tt, a_beats * beat, ra));
+                }
+                cuts.push(mk_cut(b, bass_in + (bar * bl + a_beats * beat) * rb, tt + a_beats * beat, nb * beat, rb));
+                tt += bl;
+            }
+            t = swap;
+        } else if seam.recipe == "echo_out" {
+            let bar_before = body - bl;
+            let l = mk_layer(an + "body", a, pos, t, bar_before, a.ratio);
+            l.ride = ride_of(a);
+            l.fades.push(fade("out", bar_before - short_fade_s(), short_fade_s()));
+            layers.push(l);
+
+            l = mk_layer(an + "echo", a, p - bl * ra, tp - bl, 3.0 * bl, ra);
+            l.filters.push(#{ kind: "echo", in_gain: 0.8, out_gain: 0.7,
+                delay_ms: (bl / 4.0 * 0.75 * 1000.0).to_int().to_float(), decay: 0.55 });
+            l.fades.push(fade("in", 0.0, short_fade_s()));
+            l.fades.push(fade("out", bl, 2.0 * bl));
+            layers.push(l);
+            t = tp;
+        } else {
+            let l = mk_layer(an + "body", a, pos, t, body, a.ratio);
+            l.ride = ride_of(a);
+            l.fades.push(fade("out", body - cut_fade_s(), cut_fade_s()));
+            layers.push(l);
+            t = tp;
+        }
+    }
+    let last = tracks[tracks.len() - 1];
+    let n = play_out(last, end_s - last.enter);
+    let l = mk_layer("last song (" + last.item.entry_id + ")", last, last.enter, t, n, last.ratio);
+    l.ride = ride_of(last);
+    l.fades.push(fade("out", n - last_fade_s(), last_fade_s()));
+    layers.push(l);
+    cuts.append(played_picture(last, t, end_s));
+    cuts.sort(|x, y| if x.out_start_s < y.out_start_s { -1 } else if x.out_start_s > y.out_start_s { 1 } else { 0 });
+    #{ layers: layers, cuts: cuts, duration_s: t + n }
 }
 
 fn conf(cfg, key, fallback) {
@@ -341,7 +526,7 @@ fn build(ctx) {
     let first = cands.remove(ctx.rng.int(0, cands.len() - 1));
 
     // Walk the set song by song, tracking where it is on the timeline exactly as
-    // the renderer lays it out (crates/etv-render/src/set.rs).
+    // `layout` lays it out.
     let songs = [first];
     let tracks = [#{ item: first, enter: entry_of(first, cfg), ratio: 1.0, ride: 0, at: 0.0 }];
     let seams = [];
@@ -396,11 +581,7 @@ fn build(ctx) {
         }
         let b_ratio = if pick.recipe == "bass_swap" { num(a.audio.bpm) * ra / num(b.audio.bpm) } else { 1.0 };
         let b_ride = if pick.recipe == "bass_swap" && (b_ratio - 1.0).abs() > 0.000001 { ride_bars_of(cfg) } else { 0 };
-        seams.push(#{ recipe: pick.recipe, out_s: out_s });
-        if pick.recipe == "bass_swap" {
-            seams[seams.len() - 1].bars = pick.bars;
-            seams[seams.len() - 1].sweep = pick.sweep;
-        }
+        seams.push(#{ recipe: pick.recipe, out_s: out_s, bars: pick.bars, sweep: pick.sweep });
         notes.push("seam " + seams.len() + " at " + (t + body) + "s: " + pick.recipe
             + (if pick.recipe == "bass_swap" { " " + pick.bars + " bars" + (if pick.sweep { " sweep" } else { "" }) } else { "" })
             + ", " + a.title + " (" + a.entry_id + ") out at source bar " + po + " -> " + b.title + " (" + b.entry_id + ") enters at "
@@ -410,34 +591,39 @@ fn build(ctx) {
         tracks.push(#{ item: b, enter: b_enter, ratio: b_ratio, ride: b_ride, at: t + body });
         t = landed;
     }
-    let last = tracks[tracks.len() - 1];
-    let set_s = t + play_out(last, end_s - last.enter);
+    validate_set(tracks, seams, end_s);
+    let lay = layout(tracks, seams, end_s);
+    let set_s = lay.duration_s;
 
     let ids = "";
     for s in songs { ids += s.entry_id + "|"; }
     let stem = "ch" + ctx.channel.number + "-set-" + fnv(ids + entry).to_hex();
-    let plan = #{
-        kind: "set",
-        tracks: [],
-        seams: seams,
-        end_s: end_s,
-        cards: [],
-        output: cfg.dir + "/" + stem + ".mp4",
-    };
     let fields = conf(cfg, "artist_field", "show");
+    let sources = [];
+    let cards = [];
+    let song_notes = [];
     for tr in tracks {
         let it = tr.item;
-        let track = #{ entry_id: it.entry_id, path: it.path, native_bpm: num(it.audio.bpm), enter_s: tr.enter, ratio: tr.ratio };
-        if tr.ride > 0 { track.ride_bars = tr.ride; }
-        plan.tracks.push(track);
+        sources.push(#{ id: it.entry_id, path: it.path });
         let card = #{
             at_s: tr.at,
             artist: (it[fields] ?? it.show ?? it.studio ?? "").to_string(),
             title: (it.title ?? "").to_string(),
         };
         if it.year != () { card.year = it.year; }
-        plan.cards.push(card);
+        cards.push(card);
+        song_notes.push(#{ entry_id: it.entry_id, title: (it.title ?? "").to_string(), native_bpm: num(it.audio.bpm),
+                           enter_s: tr.enter, ratio: tr.ratio, ride_bars: tr.ride, at_s: tr.at });
     }
+    let plan = #{
+        sources: sources,
+        layers: lay.layers,
+        cuts: lay.cuts,
+        duration_s: set_s,
+        cards: cards,
+        output: cfg.dir + "/" + stem + ".mp4",
+        notes: #{ entry: entry, end_s: end_s, songs: song_notes, seams: seams },
+    };
     let plan_path = cfg.dir + "/" + stem + ".plan.json";
     write_file(ctx, plan_path, to_json(plan));
     let text = "";

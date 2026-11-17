@@ -1,38 +1,46 @@
 {
-  "bpm": 120.0,
-  "key": "A minor",
-  "camelot": "8A",
-  "bar_seconds": 2.0,
-  "hooks": [
-    {
-      "entry_id": "fixture-a",
-      "path": "@DIR@/source.mp4",
-      "landing_s": 24.0,
-      "native_bpm": 100.0,
-      "semitones": 0,
-      "vocal_over_bars": 0,
-      "full_bars": 4
-    },
-    {
-      "entry_id": "fixture-b",
-      "path": "@DIR@/source.mp4",
-      "landing_s": 20.0,
-      "native_bpm": 130.0,
-      "semitones": -2,
-      "vocal_over_bars": 2,
-      "full_bars": 4
-    }
+  "sources": [
+    { "id": "fixture-a", "path": "@DIR@/source.mp4" },
+    { "id": "fixture-b", "path": "@DIR@/source.mp4" }
+  ],
+  "layers": [
+    { "name": "fixture-a vocals", "source": "fixture-a", "stem": "vocals",
+      "src_start_s": 24.0, "out_start_s": 0.0, "out_len_s": 8.0, "ratio": 1.2, "level_db": -20.0,
+      "fades": [ { "kind": "in", "start_s": 0.0, "len_s": 0.02 }, { "kind": "out", "start_s": 7.98, "len_s": 0.02 } ] },
+    { "name": "fixture-a instrumental", "source": "fixture-a", "stem": "instrumental",
+      "src_start_s": 24.0, "out_start_s": 0.0, "out_len_s": 8.0, "ratio": 1.2, "level_db": -17.0,
+      "fades": [ { "kind": "in", "start_s": 0.0, "len_s": 1.0 }, { "kind": "out", "start_s": 7.98, "len_s": 0.02 } ] },
+    { "name": "fixture-a instrumental under fixture-b", "source": "fixture-a", "stem": "instrumental",
+      "src_start_s": 33.6, "out_start_s": 8.0, "out_len_s": 4.0, "ratio": 1.2, "level_db": -17.0,
+      "fades": [ { "kind": "in", "start_s": 0.0, "len_s": 0.02 }, { "kind": "out", "start_s": 2.0, "len_s": 2.0 } ] },
+    { "name": "fixture-b vocals over fixture-a", "source": "fixture-b", "stem": "vocals",
+      "src_start_s": 20.0, "out_start_s": 8.0, "out_len_s": 4.0, "ratio": 0.9230769, "pitch": 0.8908987, "level_db": -19.0,
+      "fades": [ { "kind": "in", "start_s": 0.0, "len_s": 0.5 }, { "kind": "out", "start_s": 3.98, "len_s": 0.02 } ] },
+    { "name": "fixture-b vocals", "source": "fixture-b", "stem": "vocals",
+      "src_start_s": 23.6923077, "out_start_s": 12.0, "out_len_s": 8.0, "ratio": 0.9230769, "pitch": 0.8908987, "level_db": -20.0,
+      "fades": [ { "kind": "in", "start_s": 0.0, "len_s": 0.02 }, { "kind": "out", "start_s": 7.98, "len_s": 0.02 } ] },
+    { "name": "fixture-b instrumental", "source": "fixture-b", "stem": "instrumental",
+      "src_start_s": 23.6923077, "out_start_s": 12.0, "out_len_s": 8.0, "ratio": 0.9230769, "pitch": 0.8908987, "level_db": -17.0,
+      "fades": [ { "kind": "in", "start_s": 0.0, "len_s": 0.3 }, { "kind": "out", "start_s": 7.98, "len_s": 0.02 } ] }
   ],
   "cuts": [
-    { "entry_id": "fixture-a", "native_start_s": 24.0, "out_start_s": 0.0, "length_s": 3.0, "ratio": 0.8333 },
-    { "entry_id": "fixture-a", "native_start_s": 26.5, "out_start_s": 3.0, "length_s": 5.0, "ratio": 0.8333 },
-    { "entry_id": "fixture-b", "native_start_s": 20.0, "out_start_s": 8.0, "length_s": 4.0, "ratio": 1.0833 },
-    { "entry_id": "fixture-b", "native_start_s": 24.3, "out_start_s": 12.0, "length_s": 5.5, "ratio": 1.0833 },
-    { "entry_id": "fixture-a", "native_start_s": 30.0, "out_start_s": 17.5, "length_s": 2.5, "ratio": 1.0 }
+    { "source": "fixture-a", "src_start_s": 24.0, "out_start_s": 0.0, "out_len_s": 3.0, "ratio": 1.2 },
+    { "source": "fixture-a", "src_start_s": 26.5, "out_start_s": 3.0, "out_len_s": 5.0, "ratio": 1.2 },
+    { "source": "fixture-b", "src_start_s": 20.0, "out_start_s": 8.0, "out_len_s": 4.0, "ratio": 0.9230769 },
+    { "source": "fixture-b", "src_start_s": 24.3, "out_start_s": 12.0, "out_len_s": 5.5, "ratio": 0.9230769 },
+    { "source": "fixture-a", "src_start_s": 30.0, "out_start_s": 17.5, "out_len_s": 2.5 }
   ],
+  "duration_s": 20.0,
   "cards": [
     { "at_s": 0.0, "artist": "Fixture A", "title": "First Song", "year": 1999 },
     { "at_s": 8.0, "artist": "Fixture B", "title": "Second Song" }
   ],
-  "output": "@DIR@/out/chapter.mp4"
+  "output": "@DIR@/out/chapter.mp4",
+  "notes": {
+    "bpm": 120.0,
+    "sources": {
+      "fixture-a": { "native_bpm": 100.0, "landing_s": 24.0 },
+      "fixture-b": { "native_bpm": 130.0, "landing_s": 20.0 }
+    }
+  }
 }

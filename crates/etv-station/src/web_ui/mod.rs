@@ -689,7 +689,7 @@ mod tests {
             etv_render::plan::Plan::parse(&std::fs::read_to_string(fixture).unwrap()).unwrap();
         let queue = etv_render::queue::Queue::new(dir.path().join("queue"));
         let job = queue
-            .enqueue(&plan.into(), None, time::OffsetDateTime::now_utc())
+            .enqueue(&plan, None, time::OffsetDateTime::now_utc())
             .unwrap();
         state.options.health.renderer = Some(crate::renderer::RendererPaths {
             queue_dir: dir.path().join("queue"),
@@ -1283,7 +1283,7 @@ mod tests {
         let queue = etv_render::queue::Queue::new(root.join("queue"));
         let air_at = time::OffsetDateTime::now_utc() + time::Duration::minutes(40);
         let job = queue
-            .enqueue(&plan.into(), Some(air_at), time::OffsetDateTime::now_utc())
+            .enqueue(&plan, Some(air_at), time::OffsetDateTime::now_utc())
             .unwrap();
         f.state.options.health.renderer = Some(crate::renderer::RendererPaths {
             queue_dir: root.join("queue"),
@@ -1318,8 +1318,8 @@ mod tests {
         assert_eq!(chapters.len(), 2, "{body}");
         assert_eq!(chapters[0]["state"], "queued");
         assert_eq!(chapters[0]["hooks"], json!(["fixture-a", "fixture-b"]));
-        assert_eq!(chapters[0]["plan"]["bpm"], json!(120.0));
-        assert_eq!(chapters[0]["plan"]["hooks"][1]["entry_id"], "fixture-b");
+        assert_eq!(chapters[0]["plan"]["notes"]["bpm"], json!(120.0));
+        assert_eq!(chapters[0]["plan"]["sources"][1]["id"], "fixture-b");
         assert_eq!(chapters[1]["state"], "unqueued");
         assert_eq!(chapters[1]["plan"], Value::Null);
         assert_eq!(get_json(&mut f.state, "/api/channels/nope/chapters").0, 404);

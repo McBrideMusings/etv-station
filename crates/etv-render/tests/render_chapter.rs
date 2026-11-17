@@ -13,13 +13,11 @@ fn a_fixture_plan_renders_to_its_planned_length_with_a_steady_beat_across_the_se
     make_source_video(&dir.join("source.mp4"));
     let settings = settings(&dir);
     let plan = fixture_plan(&dir);
-    for hook in &plan.hooks {
-        seed_stems(&settings, hook);
-    }
+    seed_stems(&settings, &plan);
 
     render(&plan, &settings).unwrap_or_else(|e| panic!("render failed: {e}"));
 
-    // 10 bars x 2 s.
+    // 20 s planned.
     let length = duration_s(&plan.output);
     assert!(
         (length - 20.0).abs() < 0.05,
@@ -60,9 +58,7 @@ fn the_render_is_1080p() {
     make_source_video(&dir.join("source.mp4"));
     let settings = settings(&dir);
     let plan = fixture_plan(&dir);
-    for hook in &plan.hooks {
-        seed_stems(&settings, hook);
-    }
+    seed_stems(&settings, &plan);
     render(&plan, &settings).unwrap();
     let out = std::process::Command::new("ffprobe")
         .args([
@@ -87,10 +83,10 @@ fn a_plan_naming_a_missing_file_fails_with_that_path_in_the_job_state() {
     let settings = settings(&dir);
     std::fs::write(dir.join("source.mp4"), b"").unwrap();
     let mut plan = fixture_plan(&dir);
-    plan.hooks[1].path = dir.join("gone/song-b.mp4");
+    plan.sources[1].path = dir.join("gone/song-b.mp4");
     let queue = Queue::new(dir.join("queue"));
     queue
-        .enqueue(&plan.into(), None, OffsetDateTime::now_utc())
+        .enqueue(&plan, None, OffsetDateTime::now_utc())
         .unwrap();
 
     let job = process_next(&queue, &settings, u64::MAX, OffsetDateTime::now_utc).unwrap();
@@ -102,7 +98,7 @@ fn a_plan_naming_a_missing_file_fails_with_that_path_in_the_job_state() {
         "{:?}",
         job.last_error
     );
-    assert_eq!(job.failed_layer.as_deref(), Some("hook 2 (fixture-b)"));
+    assert_eq!(job.failed_layer.as_deref(), Some("source fixture-b"));
     let stored = queue.read(&job.id).unwrap();
     assert!(stored.last_error.unwrap().contains(&missing));
 }
@@ -122,23 +118,25 @@ fn with_demucs_absent_the_render_fails_naming_it() {
 }
 
 #[test]
-fn a_song_that_ends_inside_its_hook_is_refused() {
+fn a_stem_that_ends_inside_a_layer_is_refused() {
     let (_guard, dir) = temp();
     make_source_video(&dir.join("source.mp4"));
     let settings = settings(&dir);
     let plan = fixture_plan(&dir);
-    for hook in &plan.hooks {
-        seed_stems(&settings, hook);
-    }
-    // Replace hook b's stems with 10 s of audio where 24 s are needed.
-    let dir_b = etv_render::stems::stem_dir(&settings, &plan.hooks[1]);
+    seed_stems(&settings, &plan);
+    // Replace fixture-b's vocals with 10 s of audio; its reads run 19 s into the region.
+    let region = etv_render::stems::regions(&plan)
+        .into_iter()
+        .find(|r| r.source == "fixture-b")
+        .unwrap();
+    let dir_b = etv_render::stems::stem_dir(&settings, &region);
     write_click_wav(&dir_b.join("vocals.wav"), 130.0, 10.0, 1500.0);
 
     let err = render(&plan, &settings).unwrap_err();
 
-    assert_eq!(err.layer, "hook 2 (fixture-b) stems");
+    assert_eq!(err.layer, "fixture-b vocals over fixture-a");
     assert!(
-        err.message.contains("the song ends inside the hook"),
+        err.message.contains("the source ends inside the layer"),
         "{err}"
     );
 }

@@ -1,7 +1,7 @@
 //! Which of the programs the renderer shells out to are present, and why not.
 //!
 //! The renderer is optional: the station runs without any of this, and a
-//! channel whose chapters are not rendered airs its stand-in. So absence is a
+//! channel whose renders are not ready airs its stand-in. So absence is a
 //! reported state here, never a startup failure. `/api/health/renders` serves
 //! [`detect`]'s result to the dashboard's Health tab.
 
@@ -45,7 +45,7 @@ impl Dependency {
     }
 }
 
-/// The encoder a chapter's final pass uses.
+/// The encoder a render's final pass uses.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Encoder {
     pub name: &'static str,

@@ -169,6 +169,10 @@ There is deliberately no streaming fallback. A Plex entry whose path does not re
 
 Matches ETV-next's existing process model — it already uses files (`.ready`, `.heartbeat`) for signaling between server and channel subprocesses. No new protocol surface. The channel worker also appends playback lines (session start and stop, item started) to `.playback-events.jsonl` in the playout folder, which the station tails to fire the `playback_item_change`, `viewer_start` and `viewer_stop` hooks. `ls` shows you the state. Atomic emission via `rename(2)` means the consumer can't observe a half-written file.
 
+## The renderer mixes and cuts what a plan lists
+
+A bumper plugin can queue a rendered video ahead of air. It hands the renderer (`crates/etv-render`) one **render plan**: sources, audio layers, picture cuts, a duration, and `notes` that only the plugin reads (see the schema page's [Render plan](/schema#render-plan)). The renderer mixes the layers, cuts the picture and writes the file. It holds no concept of a transition, a recipe, a seam, a hook or a song's structure; the plugin resolves each of those into layers and cuts before the plan is written, and `crates/etv-render/tests/no_arrangement_in_core.rs` fails if the renderer's source names one (ADR 0023). A plugin that arranges songs differently writes a different plan, and the renderer is unchanged.
+
 ## Why Rust
 
 Because ETV-next is Rust and the vendored path-dep approach is essentially free in Rust. Any other language would either re-implement the schema models (drift risk) or codegen them (added build complexity, weaker typing). Sharing serde models on the producer and consumer side is the fastest path to "schema drift is impossible at compile time."

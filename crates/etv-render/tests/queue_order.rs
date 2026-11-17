@@ -79,7 +79,7 @@ fn the_sidecar_takes_the_soonest_airing_job_and_never_one_already_aired() {
 fn a_plan_enqueued_after_its_air_time_is_missed_until_given_a_later_one() {
     let (_guard, dir) = temp();
     let queue = Queue::new(dir.join("queue"));
-    let plan = etv_render::Document::from(fixture_plan(&dir));
+    let plan = fixture_plan(&dir);
     let now = OffsetDateTime::now_utc();
 
     let late = queue

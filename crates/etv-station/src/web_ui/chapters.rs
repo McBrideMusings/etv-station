@@ -81,8 +81,8 @@ pub(super) fn api_channel_chapters(state: &AppState, key: &str) -> Result<(u16, 
         let length = job.as_ref().map(|j| j.duration_s).or_else(|| {
             plan_text
                 .as_deref()
-                .and_then(|text| etv_render::Document::parse(text).ok())
-                .map(|p| p.duration_s())
+                .and_then(|text| etv_render::Plan::parse(text).ok())
+                .map(|p| p.duration_s)
         });
         let ends = length.map(|s| start + time::Duration::seconds_f64(s));
         let state = match (&job, ends) {

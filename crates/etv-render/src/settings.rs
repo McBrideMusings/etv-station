@@ -15,7 +15,7 @@ pub const FPS: u32 = 30;
 /// the render that needed it.
 #[derive(Debug, Clone)]
 pub struct Settings {
-    /// Stems and scratch files live under here. Rendered chapters land where
+    /// Stems and scratch files live under here. Rendered files land where
     /// each plan's `output` says.
     pub cache_dir: PathBuf,
     /// `ETV_RENDER_FFMPEG`: the ffmpeg to run.

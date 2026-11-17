@@ -1,6 +1,6 @@
 //! Acceptance tests for the megamix bumper (`examples/plugins/bumpers/megamix.rhai`):
 //! it reads audio facts through `ctx.catalog`, picks a tempo and key cluster,
-//! writes a chapter plan, queues it with the renderer and airs it as a pending
+//! writes a render plan, queues it with the renderer and airs it as a pending
 //! segment.
 //!
 //! The catalog, the facts, the renderer's `enqueue` and `ffmpeg` are all written
@@ -12,11 +12,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use etv_render::Plan;
+use etv_render::plan::{Curve, FadeKind, Stem};
 use etv_station::bumper::hook::{BumperInput, ChannelInfo, build};
 use etv_station::bumper::timeline::SegmentSource;
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source};
 use etv_station::history::{AiringKind, PlayRecord};
 use rhai::Map;
+use serde::Deserialize;
 use serde_json::json;
 use time::OffsetDateTime;
 
@@ -205,6 +207,39 @@ impl Fixture {
     }
 }
 
+/// What the plugin records in a plan's `notes` about the chapter.
+#[derive(Debug, Deserialize)]
+struct Notes {
+    bpm: f64,
+    camelot: String,
+    bar_seconds: f64,
+    hooks: Vec<NoteHook>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NoteHook {
+    entry_id: String,
+    landing_s: f64,
+    native_bpm: f64,
+    semitones: i32,
+    vocal_over_bars: u32,
+    full_bars: u32,
+}
+
+fn notes(plan: &Plan) -> Notes {
+    serde_json::from_value(plan.notes.clone()).expect("the plan's notes name the chapter")
+}
+
+/// The plan's sources that are not hooks: the Frame index shots.
+fn broll(plan: &Plan) -> Vec<String> {
+    let hooks = notes(plan).hooks;
+    plan.sources
+        .iter()
+        .filter(|s| !hooks.iter().any(|h| h.entry_id == s.id))
+        .map(|s| s.id.clone())
+        .collect()
+}
+
 /// Steps between two Camelot codes, as the plugin counts them.
 fn camelot_dist(a: &str, b: &str) -> i64 {
     let split = |c: &str| {
@@ -249,20 +284,21 @@ fn a_chapter_plan_passes_the_floor_semitone_camelot_and_bar_rules() {
     assert_eq!(plans.len(), 1, "one plan beside the render path");
     let plan = Plan::parse(&std::fs::read_to_string(&plans[0]).unwrap())
         .expect("the renderer accepts the plan");
+    let chapter = notes(&plan);
 
     assert!(
-        (3..=5).contains(&plan.hooks.len()),
+        (3..=5).contains(&chapter.hooks.len()),
         "{} hooks",
-        plan.hooks.len()
+        chapter.hooks.len()
     );
     let mut bars = 0;
     assert!(
-        !plan
+        !chapter
             .hooks
             .iter()
             .any(|h| h.entry_id == "mv-unsteady" || h.entry_id == "mv-weak")
     );
-    for hook in &plan.hooks {
+    for hook in &chapter.hooks {
         let song = SONGS
             .iter()
             .find(|s| s.0 == hook.entry_id)
@@ -277,10 +313,10 @@ fn a_chapter_plan_passes_the_floor_semitone_camelot_and_bar_rules() {
         );
         let landed = shifted(song.2, i64::from(hook.semitones));
         assert!(
-            camelot_dist(&landed, &plan.camelot) <= 1,
+            camelot_dist(&landed, &chapter.camelot) <= 1,
             "{} lands on {landed}, chapter is {}",
             song.0,
-            plan.camelot
+            chapter.camelot
         );
         assert_eq!(
             bars % 8,
@@ -293,14 +329,14 @@ fn a_chapter_plan_passes_the_floor_semitone_camelot_and_bar_rules() {
     }
     // The chapter tempo is the median of the cluster, 119.5-121 here.
     assert!(
-        (118.0..=122.0).contains(&plan.bpm),
+        (118.0..=122.0).contains(&chapter.bpm),
         "chapter bpm {}",
-        plan.bpm
+        chapter.bpm
     );
-    assert_eq!(plan.cards.len(), plan.hooks.len());
+    assert_eq!(plan.cards.len(), chapter.hooks.len());
     assert_eq!(
         plan.cards[0].artist,
-        format!("Artist {}", plan.hooks[0].entry_id)
+        format!("Artist {}", chapter.hooks[0].entry_id)
     );
 
     // The renderer's queue was handed this plan, with the chapter's air time:
@@ -331,7 +367,304 @@ fn a_chapter_plan_passes_the_floor_semitone_camelot_and_bar_rules() {
             .as_array()
             .unwrap()
             .len(),
-        plan.hooks.len()
+        chapter.hooks.len()
+    );
+}
+
+/// One layer as the plugin should lay it: (name, source, stem, src_start_s,
+/// out_start_s, out_len_s, ratio, pitch, level_db, fade in, fade out).
+type Expected = (String, String, Stem, f64, f64, f64, f64, f64, f64, f64, f64);
+
+/// The vocal-over seam, worked out from the chapter's notes: the first hook's
+/// vocal and instrumental; for each later hook, the previous instrumental
+/// carrying on under its vocal, then its own vocal and instrumental.
+fn expected_layers(c: &Notes) -> Vec<Expected> {
+    let bar = c.bar_seconds;
+    let mut out = Vec::new();
+    let mut at = 0u32;
+    for (i, h) in c.hooks.iter().enumerate() {
+        let lay = |name: String,
+                   k: &NoteHook,
+                   stem,
+                   from: u32,
+                   bars: u32,
+                   at_bar: u32,
+                   db,
+                   fi: f64,
+                   fo: f64| {
+            let len = f64::from(bars) * bar;
+            (
+                name,
+                k.entry_id.clone(),
+                stem,
+                k.landing_s + f64::from(from) * 240.0 / k.native_bpm,
+                f64::from(at_bar) * bar,
+                len,
+                c.bpm / k.native_bpm,
+                2f64.powf(f64::from(k.semitones) / 12.0),
+                db,
+                fi.min(len / 2.0),
+                fo.min(len / 2.0),
+            )
+        };
+        let label = format!("hook {} ({}) ", i + 1, h.entry_id);
+        let over = h.vocal_over_bars;
+        if i > 0 && over > 0 {
+            let prev = &c.hooks[i - 1];
+            out.push(lay(
+                format!(
+                    "hook {i} ({}) instrumental under the next vocal",
+                    prev.entry_id
+                ),
+                prev,
+                Stem::Instrumental,
+                prev.vocal_over_bars + prev.full_bars,
+                over,
+                at,
+                -17.0,
+                0.02,
+                bar,
+            ));
+            out.push(lay(
+                format!("{label}vocals over the previous song"),
+                h,
+                Stem::Vocals,
+                0,
+                over,
+                at,
+                -19.0,
+                0.5,
+                0.02,
+            ));
+        }
+        out.push(lay(
+            format!("{label}vocals"),
+            h,
+            Stem::Vocals,
+            over,
+            h.full_bars,
+            at + over,
+            -20.0,
+            0.02,
+            0.02,
+        ));
+        let inst_in = if i == 0 { 1.0 } else { 0.3 };
+        out.push(lay(
+            format!("{label}instrumental"),
+            h,
+            Stem::Instrumental,
+            over,
+            h.full_bars,
+            at + over,
+            -17.0,
+            inst_in,
+            0.02,
+        ));
+        at += over + h.full_bars;
+    }
+    out
+}
+
+#[test]
+fn the_layers_are_the_vocal_over_seam_and_the_picture_runs_at_the_audios_speed() {
+    let f = Fixture::new();
+    build(
+        &plugin_path(),
+        &f.input("/nonexistent/etv-station", 600_000),
+    )
+    .unwrap();
+    let (_, plan) = only_plan(&f);
+    let chapter = notes(&plan);
+    assert!(chapter.hooks.len() >= 3);
+
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+    let want = expected_layers(&chapter);
+    assert_eq!(plan.layers.len(), want.len(), "{:#?}", plan.layers);
+    for (l, w) in plan.layers.iter().zip(&want) {
+        assert_eq!((&l.name, &l.source, l.stem), (&w.0, &w.1, w.2));
+        assert!(
+            close(l.src_start_s, w.3) && close(l.out_start_s, w.4) && close(l.out_len_s, w.5),
+            "{}: read {} at {} for {}, want {w:?}",
+            l.name,
+            l.src_start_s,
+            l.out_start_s,
+            l.out_len_s
+        );
+        assert!(
+            close(l.ratio, w.6) && close(l.pitch, w.7),
+            "{}: ratio {} pitch {}",
+            l.name,
+            l.ratio,
+            l.pitch
+        );
+        assert!(
+            l.ride.is_none() && l.filters.is_empty() && l.gain_db == 0.0,
+            "{}",
+            l.name
+        );
+        assert_eq!(l.level_db, Some(w.8), "{}", l.name);
+        let [fade_in, fade_out] = &l.fades[..] else {
+            panic!("{}: {:?}", l.name, l.fades);
+        };
+        assert_eq!((fade_in.kind, fade_out.kind), (FadeKind::In, FadeKind::Out));
+        assert_eq!(
+            (fade_in.curve, fade_out.curve),
+            (Curve::Linear, Curve::Linear)
+        );
+        assert!(
+            close(fade_in.start_s, 0.0) && close(fade_in.len_s, w.9),
+            "{}",
+            l.name
+        );
+        assert!(
+            close(fade_out.len_s, w.10) && close(fade_out.start_s, w.5 - w.10),
+            "{}",
+            l.name
+        );
+    }
+
+    let bars: u32 = chapter
+        .hooks
+        .iter()
+        .map(|h| h.vocal_over_bars + h.full_bars)
+        .sum();
+    assert!(close(
+        plan.duration_s,
+        f64::from(bars) * chapter.bar_seconds
+    ));
+    // A hook's picture is read at its audio's speed: source seconds per chapter
+    // second is the chapter tempo over the song's own.
+    // Each four-bar piece p reads p * 4 of the song's own bars past its landing.
+    for cut in &plan.cuts {
+        let h = chapter
+            .hooks
+            .iter()
+            .find(|h| h.entry_id == cut.source)
+            .unwrap();
+        assert!(close(cut.ratio, chapter.bpm / h.native_bpm), "{cut:?}");
+        let p = ((cut.out_start_s / chapter.bar_seconds).round() as u32
+            % (h.vocal_over_bars + h.full_bars))
+            / 4;
+        let native_bar = 240.0 / h.native_bpm;
+        assert!(
+            close(cut.src_start_s, h.landing_s + f64::from(p * 4) * native_bar),
+            "{cut:?}"
+        );
+    }
+    // Every hook's stems are one span, 4 bars before its landing to 18 after,
+    // whichever part of it this chapter reads.
+    for h in &chapter.hooks {
+        let s = plan.sources.iter().find(|s| s.id == h.entry_id).unwrap();
+        let sep = s.separate.expect("a hook source names its stem span");
+        let native_bar = 240.0 / h.native_bpm;
+        assert!(close(sep.start_s, h.landing_s - 4.0 * native_bar), "{s:?}");
+        assert!(close(sep.len_s, 22.0 * native_bar), "{s:?}");
+    }
+}
+
+/// The plugin's `chapter_layers`, called directly with the two hooks the
+/// renderer's own layer tests used before the layout moved into the plugin:
+/// `a` at 100 bpm landing at 30 s with 4 full bars, `b` at 120 bpm two
+/// semitones down with 2 vocal-over bars and 4 full bars, in a 120 bpm chapter.
+/// Every number below is the one those tests pinned, read in source seconds.
+#[test]
+fn chapter_layers_put_each_stem_where_the_renderer_used_to() {
+    let mut engine = rhai::Engine::new();
+    // The host's limits (hooks.rs): the plugin nests deeper than rhai's default.
+    engine.set_max_expr_depths(128, 64);
+    let ast = engine.compile_file(plugin_path()).unwrap();
+    let hook = |id: &str, bpm: f64, semis: i64, over: i64, full: i64| {
+        let mut m = Map::new();
+        m.insert("entry_id".into(), id.to_string().into());
+        m.insert("landing_s".into(), 30.0_f64.into());
+        m.insert("native_bpm".into(), bpm.into());
+        m.insert("vocal_over_bars".into(), over.into());
+        m.insert("full_bars".into(), full.into());
+        m.insert("ratio".into(), (120.0 / bpm).into());
+        m.insert("pitch".into(), 2f64.powf(semis as f64 / 12.0).into());
+        rhai::Dynamic::from_map(m)
+    };
+    let hooks: rhai::Array = vec![hook("a", 100.0, 0, 0, 4), hook("b", 120.0, -2, 2, 4)];
+    let out: rhai::Array = engine
+        .call_fn(
+            &mut rhai::Scope::new(),
+            &ast,
+            "chapter_layers",
+            (hooks, 2.0_f64),
+        )
+        .unwrap();
+    let layers: Vec<serde_json::Value> = out
+        .into_iter()
+        .map(|d| rhai::serde::from_dynamic(&d).unwrap())
+        .collect();
+    let row = |l: &serde_json::Value| {
+        (
+            l["name"].as_str().unwrap().to_string(),
+            l["stem"].as_str().unwrap().to_string(),
+            l["src_start_s"].as_f64().unwrap(),
+            l["out_start_s"].as_f64().unwrap(),
+            l["out_len_s"].as_f64().unwrap(),
+            l["level_db"].as_f64().unwrap(),
+        )
+    };
+    let got: Vec<_> = layers.iter().map(row).collect();
+    let want = [
+        ("hook 1 (a) vocals", "vocals", 30.0, 0.0, 8.0, -20.0),
+        (
+            "hook 1 (a) instrumental",
+            "instrumental",
+            30.0,
+            0.0,
+            8.0,
+            -17.0,
+        ),
+        // After a's 4 bars of 2.4 s: 30 + 9.6.
+        (
+            "hook 1 (a) instrumental under the next vocal",
+            "instrumental",
+            39.6,
+            8.0,
+            4.0,
+            -17.0,
+        ),
+        (
+            "hook 2 (b) vocals over the previous song",
+            "vocals",
+            30.0,
+            8.0,
+            4.0,
+            -19.0,
+        ),
+        // b runs at the chapter tempo: 2 seam bars of 2 s in.
+        ("hook 2 (b) vocals", "vocals", 34.0, 12.0, 8.0, -20.0),
+        (
+            "hook 2 (b) instrumental",
+            "instrumental",
+            34.0,
+            12.0,
+            8.0,
+            -17.0,
+        ),
+    ];
+    assert_eq!(got.len(), want.len(), "{got:#?}");
+    for (g, w) in got.iter().zip(want) {
+        assert_eq!((g.0.as_str(), g.1.as_str()), (w.0, w.1));
+        for (x, y) in [(g.2, w.2), (g.3, w.3), (g.4, w.4), (g.5, w.5)] {
+            assert!((x - y).abs() < 1e-9, "{g:?} vs {w:?}");
+        }
+    }
+    // a is stretched 100 -> 120 bpm; b is two semitones down: 2^(-2/12).
+    assert!((layers[0]["ratio"].as_f64().unwrap() - 1.2).abs() < 1e-9);
+    assert!((layers[2]["ratio"].as_f64().unwrap() - 1.2).abs() < 1e-9);
+    assert!((layers[4]["pitch"].as_f64().unwrap() - 0.890899).abs() < 1e-6);
+    // The under layer fades out over one chapter bar; the seam vocal fades in over 0.5 s.
+    assert_eq!(
+        layers[2]["fades"][1],
+        json!({"kind": "out", "start_s": 2.0, "len_s": 2.0})
+    );
+    assert_eq!(
+        layers[3]["fades"][0],
+        json!({"kind": "in", "start_s": 0.0, "len_s": 0.5})
     );
 }
 
@@ -466,8 +799,9 @@ fn frame_index_shots_replace_the_other_hooks_pictures() {
         .iter()
         .map(|v| v.as_str().unwrap().to_string())
         .collect();
-    assert_eq!(pool.len(), SONGS.len() - plan.hooks.len(), "{pool:?}");
-    for hook in &plan.hooks {
+    let hooks = notes(&plan).hooks;
+    assert_eq!(pool.len(), SONGS.len() - hooks.len(), "{pool:?}");
+    for hook in &hooks {
         let i = SONGS.iter().position(|s| s.0 == hook.entry_id).unwrap();
         assert!(
             !pool.contains(&format!("{}", 9000 + i)),
@@ -475,22 +809,22 @@ fn frame_index_shots_replace_the_other_hooks_pictures() {
             hook.entry_id
         );
     }
-    assert_eq!(body["draw"]["n"], plan.hooks.len() * 2);
+    assert_eq!(body["draw"]["n"], hooks.len() * 2);
 
-    let ids: Vec<&str> = plan.broll.iter().map(|b| b.entry_id.as_str()).collect();
+    let ids = broll(&plan);
     assert_eq!(ids, ["mv-unsteady", "mv-weak"]);
     let shots: Vec<_> = plan
         .cuts
         .iter()
-        .filter(|c| ids.contains(&c.entry_id.as_str()))
+        .filter(|c| ids.contains(&c.source))
         .collect();
     assert_eq!(
         shots.len(),
         2,
         "the unknown item and the short shot are dropped"
     );
-    assert_eq!((shots[0].native_start_s, shots[0].ratio), (10.0, 1.0));
-    assert_eq!(shots[1].native_start_s, 50.0);
+    assert_eq!((shots[0].src_start_s, shots[0].ratio), (10.0, 1.0));
+    assert_eq!(shots[1].src_start_s, 50.0);
     let audit_path = plan_path
         .to_string_lossy()
         .replace(".plan.json", ".audit.txt");
@@ -588,9 +922,10 @@ fn a_card_without_the_artist_field_reads_it_from_the_extras_fields() {
         .iter()
         .map(|v| v.as_str().unwrap())
         .collect();
-    let hooks: Vec<&str> = plan.hooks.iter().map(|h| h.entry_id.as_str()).collect();
+    let chapter = notes(&plan);
+    let hooks: Vec<&str> = chapter.hooks.iter().map(|h| h.entry_id.as_str()).collect();
     assert_eq!(asked, hooks, "one call, every hook's entry id");
-    for (card, hook) in plan.cards.iter().zip(&plan.hooks) {
+    for (card, hook) in plan.cards.iter().zip(&chapter.hooks) {
         assert_eq!(card.artist, format!("Extra {}", hook.entry_id));
     }
 }
@@ -632,8 +967,7 @@ fn an_extra_is_searched_by_its_entry_id_and_found_by_it() {
         "{pool:?}"
     );
     let (_, plan) = only_plan(&f);
-    let ids: Vec<&str> = plan.broll.iter().map(|b| b.entry_id.as_str()).collect();
-    assert_eq!(ids, ["mv-unsteady", "mv-weak"]);
+    assert_eq!(broll(&plan), ["mv-unsteady", "mv-weak"]);
 }
 
 #[test]
@@ -644,7 +978,7 @@ fn an_unreachable_explorer_leaves_the_hooks_own_pictures() {
     input.config.as_mut().unwrap()["phrase"] = json!("anything");
     build(&plugin_path(), &input).unwrap();
     let (_, plan) = only_plan(&f);
-    assert!(plan.broll.is_empty());
+    assert!(broll(&plan).is_empty());
 }
 
 /// Serves one OpenAI-style chat completion whose message text is `content`,
@@ -722,7 +1056,7 @@ fn a_model_pick_sets_the_chapters_hooks_in_its_order() {
         ["mv-d", "mv-a", "mv-b"]
     );
     let plan = Plan::parse(&std::fs::read_to_string(&f.plans()[0]).unwrap()).unwrap();
-    let ids: Vec<&str> = plan.hooks.iter().map(|h| h.entry_id.as_str()).collect();
+    let ids: Vec<String> = notes(&plan).hooks.into_iter().map(|h| h.entry_id).collect();
     assert_eq!(ids, ["mv-d", "mv-a", "mv-b"]);
     assert!(sent.contains("slow-burn eighties, nothing sad"), "{sent}");
     assert!(

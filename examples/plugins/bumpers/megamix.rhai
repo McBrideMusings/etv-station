@@ -42,8 +42,9 @@
 //                    explorer that is ungranted, unreachable or finds nothing, leaves
 //                    the alternating hook pictures
 //
-// Beside each render it writes <stem>.plan.json (the renderer's plan) and
-// <stem>.audit.txt (one seam line per hook, which `admin audit` and
+// Beside each render it writes <stem>.plan.json (the renderer's plan: audio
+// layers and picture cuts, with the chapter's tempo, key and hooks in its
+// `notes`) and <stem>.audit.txt (one seam line per hook, which `admin audit` and
 // `GET /api/channels/<n>/chapters` show).
 //
 // The segment is named `chapter:<job>|<entry>|<entry>...`: `GET
@@ -58,8 +59,15 @@
 fn hooks() { ["bumper"] }
 fn capabilities() { ["probe", "catalog_read", "exec", "http"] }
 
-// Bars after the landing bar that the renderer separates from a song.
+// Bars after the landing bar a chapter may read from a song: its own bars plus
+// the next hook's vocal-over, which plays over this song's instrumental.
 fn region_bars() { 18 }
+
+// Bars before the landing bar that are split into stems with the rest, so the
+// separator has context: a song's stems are one span, landing - 4 bars to
+// landing + region_bars(), whatever part of it a chapter reads, so every
+// chapter that uses the song shares one separation.
+fn lead_bars() { 4 }
 
 fn num(v) { v * 1.0 }
 
@@ -113,7 +121,7 @@ fn eligible(item, cfg) {
     if grid == () || grid.beats == () || grid.beats < conf(cfg, "steady_beats", 32) { return false; }
     let native_bar = 240.0 / num(a.bpm);
     if item.duration_ms == () { return false; }
-    // The renderer separates 18 bars from the landing bar on.
+    // A chapter reads up to region_bars() bars from the landing bar on.
     num(item.duration_ms) / 1000.0 - num(a.landing_bar_s) >= region_bars() * native_bar
 }
 
@@ -458,7 +466,72 @@ fn extras_artists(ctx, cfg, chosen, field) {
     artists
 }
 
-// The plan the renderer reads (docs/schema.md § Chapter plan), and the card copy.
+// A fade in at the start and a fade out at the end of a `len_s`-second layer,
+// each at most half the layer.
+fn edge_fades(len_s, fade_in, fade_out) {
+    let fi = if fade_in < len_s / 2.0 { fade_in } else { len_s / 2.0 };
+    let fo = if fade_out < len_s / 2.0 { fade_out } else { len_s / 2.0 };
+    [
+        #{ kind: "in", start_s: 0.0, len_s: fi },
+        #{ kind: "out", start_s: len_s - fo, len_s: fo },
+    ]
+}
+
+// `bars` bars of hook `h`'s `stem`, read from `from_bar` bars past its landing
+// and placed at chapter bar `at_bar`, stretched to the chapter tempo and
+// shifted to its key.
+fn hook_layer(name, h, stem, from_bar, bars, at_bar, bar_s, level_db, fade_in, fade_out) {
+    let native_bar = 240.0 / h.native_bpm;
+    let len_s = bars * bar_s;
+    #{
+        name: name,
+        source: h.entry_id,
+        stem: stem,
+        src_start_s: h.landing_s + from_bar * native_bar,
+        out_start_s: at_bar * bar_s,
+        out_len_s: len_s,
+        ratio: h.ratio,
+        pitch: h.pitch,
+        level_db: level_db,
+        fades: edge_fades(len_s, fade_in, fade_out),
+    }
+}
+
+// The chapter's audio. The first hook is its vocal and instrumental together.
+// Every later hook opens with `vocal_over_bars` bars of its vocal over the
+// previous song's instrumental, which carries on from where its own bars ended
+// and fades out over one bar; then its own vocal and instrumental play together.
+fn chapter_layers(hooks, bar_s) {
+    let vocal_db = -20.0;
+    let seam_vocal_db = -19.0;
+    let instrumental_db = -17.0;
+    let layers = [];
+    let at = 0;
+    for i in 0..hooks.len() {
+        let h = hooks[i];
+        let label = "hook " + (i + 1) + " (" + h.entry_id + ") ";
+        let over = h.vocal_over_bars;
+        if i > 0 && over > 0 {
+            let prev = hooks[i - 1];
+            layers.push(hook_layer("hook " + i + " (" + prev.entry_id + ") instrumental under the next vocal",
+                prev, "instrumental", prev.vocal_over_bars + prev.full_bars, over, at, bar_s,
+                instrumental_db, 0.02, bar_s));
+            layers.push(hook_layer(label + "vocals over the previous song",
+                h, "vocals", 0, over, at, bar_s, seam_vocal_db, 0.5, 0.02));
+        }
+        let full_at = at + over;
+        let instrumental_in = if i == 0 { 1.0 } else { 0.3 };
+        layers.push(hook_layer(label + "vocals",
+            h, "vocals", over, h.full_bars, full_at, bar_s, vocal_db, 0.02, 0.02));
+        layers.push(hook_layer(label + "instrumental",
+            h, "instrumental", over, h.full_bars, full_at, bar_s, instrumental_db, instrumental_in, 0.02));
+        at += over + h.full_bars;
+    }
+    layers
+}
+
+// The plan the renderer reads (docs/schema.md § Render plan), and the card copy.
+// The chapter's tempo, key and hooks go in `notes`, for the audit.
 fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem, shots) {
     let bar_s = 240.0 / chapter_bpm;
     let over = conf(cfg, "vocal_over_bars", 2);
@@ -470,6 +543,7 @@ fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem, shots) {
     let hooks = [];
     let cards = [];
     let cuts = [];
+    let sources = [];
     let fields = conf(cfg, "artist_field", "show");
     let extra_artists = extras_artists(ctx, cfg, chosen, fields);
     for i in 0..chosen.len() {
@@ -477,14 +551,29 @@ fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem, shots) {
         let a = item.audio;
         let move_by = best_shift(a.camelot, chapter.audio.camelot, max_shift);
         let vocal_over = if i == 0 { 0 } else { over };
+        let native_bpm = num(a.bpm);
         hooks.push(#{
             entry_id: item.entry_id,
-            path: item.path,
             landing_s: num(a.landing_bar_s),
-            native_bpm: num(a.bpm),
+            landing_bar: a.landing_bar,
+            native_bpm: native_bpm,
             semitones: move_by.semitones,
             vocal_over_bars: vocal_over,
             full_bars: shape.bars - vocal_over,
+            // Source seconds per chapter second, and the pitch ratio of the shift.
+            ratio: chapter_bpm / native_bpm,
+            pitch: 2.0 ** (move_by.semitones / 12.0),
+        });
+        let native_bar = 240.0 / native_bpm;
+        let sep_start = num(a.landing_bar_s) - lead_bars() * native_bar;
+        if sep_start < 0.0 { sep_start = 0.0; }
+        sources.push(#{
+            id: item.entry_id,
+            path: item.path,
+            separate: #{
+                start_s: sep_start,
+                len_s: num(a.landing_bar_s) + region_bars() * native_bar - sep_start,
+            },
         });
         let card = #{
             at_s: i * shape.bars * bar_s,
@@ -509,42 +598,43 @@ fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem, shots) {
                 next_shot += 1;
                 broll[shot.entry_id] = shot.path;
                 cuts.push(#{
-                    entry_id: shot.entry_id,
-                    native_start_s: shot.in_s,
+                    source: shot.entry_id,
+                    src_start_s: shot.in_s,
                     out_start_s: out_start,
-                    length_s: piece_s,
-                    ratio: 1.0,
+                    out_len_s: piece_s,
                 });
                 continue;
             }
             let other = (i + 1 + p / 2) % chosen.len();
             let src = if p % 2 == 0 || other == i { i } else { other };
             let h = hooks[src];
-            let ratio = h.native_bpm / chapter_bpm;
             cuts.push(#{
-                entry_id: h.entry_id,
-                native_start_s: h.landing_s + p * piece_s * ratio,
+                source: h.entry_id,
+                src_start_s: h.landing_s + p * piece_s * h.ratio,
                 out_start_s: out_start,
-                length_s: piece_s,
-                ratio: ratio,
+                out_len_s: piece_s,
+                ratio: h.ratio,
             });
         }
     }
-    let sources = [];
-    for id in broll.keys() { sources.push(#{ entry_id: id, path: broll[id] }); }
-    sources.sort(|a, b| if a.entry_id < b.entry_id { -1 } else if a.entry_id > b.entry_id { 1 } else { 0 });
-    let plan = #{
-        bpm: chapter_bpm,
-        key: chapter.audio.key + " " + chapter.audio.scale,
-        camelot: chapter.audio.camelot,
-        bar_seconds: bar_s,
-        hooks: hooks,
+    let shot_ids = broll.keys();
+    shot_ids.sort(|a, b| if a < b { -1 } else if a > b { 1 } else { 0 });
+    for id in shot_ids { sources.push(#{ id: id, path: broll[id] }); }
+    #{
+        sources: sources,
+        layers: chapter_layers(hooks, bar_s),
         cuts: cuts,
+        duration_s: chosen.len() * shape.bars * bar_s,
         cards: cards,
         output: dir + "/" + stem + ".mp4",
-    };
-    if sources.len() > 0 { plan.broll = sources; }
-    plan
+        notes: #{
+            bpm: chapter_bpm,
+            key: chapter.audio.key + " " + chapter.audio.scale,
+            camelot: chapter.audio.camelot,
+            bar_seconds: bar_s,
+            hooks: hooks,
+        },
+    }
 }
 
 fn cfg_dir_of(path) {
@@ -556,18 +646,19 @@ fn cfg_dir_of(path) {
 // One line per hook for `admin audit`, written beside the render as <stem>.audit.txt.
 fn seam_notes(plan, chosen, bars) {
     let text = "";
-    for i in 0..plan.hooks.len() {
-        let h = plan.hooks[i];
+    let hooks = plan.notes.hooks;
+    for i in 0..hooks.len() {
+        let h = hooks[i];
         let item = chosen[i];
         let shift = if h.semitones > 0 { "+" + h.semitones } else { h.semitones.to_string() };
         text += "seam " + (i + 1) + " at bar " + (i * bars) + ": " + item.title + " (" + h.entry_id + ") lands source bar "
             + item.audio.landing_bar + " at " + h.landing_s + "s, " + shift + " semitones, vocal over " + h.vocal_over_bars + " bars\n";
     }
     let hooked = #{};
-    for h in plan.hooks { hooked[h.entry_id] = true; }
+    for h in hooks { hooked[h.entry_id] = true; }
     for cut in plan.cuts {
-        if hooked.contains(cut.entry_id) { continue; }
-        text += "broll at " + cut.out_start_s + "s: " + cut.entry_id + " from " + cut.native_start_s + "s, " + cut.length_s + "s\n";
+        if hooked.contains(cut.source) { continue; }
+        text += "broll at " + cut.out_start_s + "s: " + cut.source + " from " + cut.src_start_s + "s, " + cut.out_len_s + "s\n";
     }
     text
 }
@@ -714,9 +805,9 @@ fn build(ctx) {
 
     let names = "chapter:" + (if job == () { "unqueued-" + stem } else { job });
     for d in drawn { names += "|" + d.entry_id; }
-    log("megamix: chapter=" + names + " bpm=" + chapter_bpm + " key=" + plan.key + " bars=" + (fitted.hooks * fitted.bars) + " queued=" + (job != ()));
-    for i in 0..plan.hooks.len() {
-        let h = plan.hooks[i];
+    log("megamix: chapter=" + names + " bpm=" + chapter_bpm + " key=" + plan.notes.key + " bars=" + (fitted.hooks * fitted.bars) + " queued=" + (job != ()));
+    for i in 0..plan.notes.hooks.len() {
+        let h = plan.notes.hooks[i];
         log("megamix: seam=" + i + " bar=" + (i * fitted.bars) + " entry=" + h.entry_id + " landing_s=" + h.landing_s + " semitones=" + h.semitones);
     }
 
@@ -730,7 +821,7 @@ fn build(ctx) {
     }
     seg = seg.fixed_ms(chapter_ms).name(names);
     if cfg.card_script != () {
-        seg = seg.overlay(cfg.card_script, #{ cards: plan.cards, bar_s: plan.bar_seconds });
+        seg = seg.overlay(cfg.card_script, #{ cards: plan.cards, bar_s: bar_s });
     }
     t.push(seg);
     t

@@ -8,7 +8,7 @@
 //! A job exists once its state file does, and `enqueue` writes that file last,
 //! so the sidecar never sees a state without its plan. Both are written to a
 //! temporary name and renamed into place. The job's id is a hash of the plan,
-//! so enqueueing the same chapter twice is one job.
+//! so enqueueing the same plan twice is one job.
 
 use std::fs;
 use std::io::Write;
@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::cache;
-use crate::document::Document;
+use crate::plan::Plan;
 use crate::render::{self, Timings};
 use crate::settings::Settings;
 
@@ -65,18 +65,18 @@ pub struct JobState {
     pub id: String,
     pub status: Status,
     pub output: PathBuf,
-    /// How long the rendered chapter plays.
+    /// How long the rendered file plays.
     pub duration_s: f64,
     #[serde(with = "time::serde::rfc3339")]
     pub enqueued_at: OffsetDateTime,
-    /// When the chapter airs. Eviction needs it; a job without one is never evicted.
+    /// When the render airs. Eviction needs it; a job without one is never evicted.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub air_at: Option<OffsetDateTime>,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub started_at: Option<OffsetDateTime>,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub finished_at: Option<OffsetDateTime>,
-    /// The part of the chapter that stopped the last attempt.
+    /// The part of the plan that stopped the last attempt.
     #[serde(default)]
     pub failed_layer: Option<String>,
     #[serde(default)]
@@ -174,7 +174,7 @@ impl Queue {
     /// by the sidecar's next pass.
     pub fn enqueue(
         &self,
-        plan: &Document,
+        plan: &Plan,
         air_at: Option<OffsetDateTime>,
         now: OffsetDateTime,
     ) -> Result<JobState, QueueError> {
@@ -202,14 +202,14 @@ impl Queue {
             let state = fresh_state(&id, plan, air_at, now, attempts);
             write_atomic(&self.plan_path(&id), &json).map_err(|e| self.io(e))?;
             self.write(&state)?;
-            tracing::info!(event = "render.enqueued", id = %id, retry = true, status = state.status.as_str(), "requeued a chapter");
+            tracing::info!(event = "render.enqueued", id = %id, retry = true, status = state.status.as_str(), "requeued a render");
             return Ok(state);
         }
 
         write_atomic(&self.plan_path(&id), &json).map_err(|e| self.io(e))?;
         let state = fresh_state(&id, plan, air_at, now, 0);
         self.write(&state)?;
-        tracing::info!(event = "render.enqueued", id = %id, output = %plan.output().display(), kind = plan.kind(), status = state.status.as_str(), "queued a plan");
+        tracing::info!(event = "render.enqueued", id = %id, output = %plan.output.display(), status = state.status.as_str(), "queued a plan");
         Ok(state)
     }
 
@@ -231,7 +231,7 @@ impl Queue {
     }
 
     /// Mark every queued job whose air time has come as missed, returning their
-    /// ids. Rendering one would help nobody: the station swaps a chapter in
+    /// ids. Rendering one would help nobody: the station swaps a render in
     /// only before it airs.
     pub fn mark_missed(&self, jobs: &mut [JobState], now: OffsetDateTime) -> Vec<String> {
         let mut missed = Vec::new();
@@ -254,7 +254,7 @@ impl Queue {
             }
             job.status = Status::Missed;
             let written = self.write(job).map_err(|e| e.to_string()).err();
-            tracing::warn!(event = "render.missed", id = %job.id, air_at = ?job.air_at, write_error = ?written, "air time came before the chapter rendered; not rendering it");
+            tracing::warn!(event = "render.missed", id = %job.id, air_at = ?job.air_at, write_error = ?written, "air time came before the plan rendered; not rendering it");
             if written.is_none() {
                 missed.push(job.id.clone());
             }
@@ -285,7 +285,7 @@ pub fn pick_next(jobs: &[JobState], now: OffsetDateTime) -> Option<&JobState> {
 
 fn fresh_state(
     id: &str,
-    plan: &Document,
+    plan: &Plan,
     air_at: Option<OffsetDateTime>,
     now: OffsetDateTime,
     attempts: u32,
@@ -297,8 +297,8 @@ fn fresh_state(
         } else {
             Status::Queued
         },
-        output: plan.output().to_path_buf(),
-        duration_s: plan.duration_s(),
+        output: plan.output.clone(),
+        duration_s: plan.duration_s,
         enqueued_at: now,
         air_at,
         started_at: None,
@@ -313,7 +313,7 @@ fn fresh_state(
 }
 
 /// Sixteen hex characters of the plan's SHA-256.
-pub fn job_id(plan: &Document) -> String {
+pub fn job_id(plan: &Plan) -> String {
     let bytes = serde_json::to_vec(plan).expect("a plan serializes");
     let digest = Sha256::digest(bytes);
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
@@ -342,8 +342,8 @@ pub fn process_next(
     tracing::info!(event = "render.job_start", id = %job.id, attempt = job.attempts, "job running");
 
     let outcome = match fs::read_to_string(queue.plan_path(&job.id)) {
-        Ok(text) => match Document::parse(&text) {
-            Ok(plan) => render::render_document(&plan, settings),
+        Ok(text) => match Plan::parse(&text) {
+            Ok(plan) => render::render(&plan, settings),
             Err(e) => Err(crate::RenderError::new("plan", e.to_string())),
         },
         Err(e) => Err(crate::RenderError::new(
@@ -370,7 +370,7 @@ pub fn process_next(
     let _ = queue.write(&job);
     let evicted = cache::enforce_cap(queue, settings, cap_bytes, now());
     if !evicted.is_empty() {
-        tracing::info!(event = "render.evicted", ids = ?evicted, "evicted chapters over the cache cap");
+        tracing::info!(event = "render.evicted", ids = ?evicted, "evicted renders over the cache cap");
     }
     Some(job)
 }
@@ -384,7 +384,7 @@ pub fn run_sidecar(
     poll: Duration,
 ) {
     let recovered = queue.recover_interrupted();
-    tracing::info!(event = "render.sidecar_start", queue = %queue.dir.display(), cache = %settings.cache_dir.display(), cap_bytes, recovered, "chapter renderer watching its queue");
+    tracing::info!(event = "render.sidecar_start", queue = %queue.dir.display(), cache = %settings.cache_dir.display(), cap_bytes, recovered, "renderer watching its queue");
     let now = OffsetDateTime::now_utc;
     cache::enforce_cap(queue, settings, cap_bytes, now());
     while !stop.load(Ordering::Relaxed) {

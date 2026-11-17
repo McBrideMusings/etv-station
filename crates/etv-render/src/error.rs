@@ -1,9 +1,9 @@
 use std::fmt;
 
-/// A render that did not finish, and the part of the chapter that stopped it.
+/// A render that did not finish, and the part of the plan that stopped it.
 ///
-/// `layer` is what a person reads to know where to look: `hook 2 (song-b)
-/// vocals`, `cut 14 (song-c)`, `dependency demucs`, `file`. It is stored in the
+/// `layer` is what a person reads to know where to look: `layer 2 (b
+/// vocals)`, `cut 14 (c)`, `dependency demucs`, `file`. It is stored in the
 /// job's state file and served by `/api/health/renders` exactly as written.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderError {

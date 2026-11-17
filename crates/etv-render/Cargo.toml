@@ -2,7 +2,7 @@
 name = "etv-render"
 version = "0.1.0"
 edition = "2024"
-description = "Chapter renderer: turns a chapter plan into a video file, and drains a queue of plans ahead of air"
+description = "Renderer: turns a plan of audio layers and picture cuts into a video file, and drains a queue of plans ahead of air"
 
 [dependencies]
 serde = { workspace = true }

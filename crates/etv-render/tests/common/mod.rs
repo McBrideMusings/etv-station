@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use etv_render::plan::{Hook, Plan};
+use etv_render::plan::Plan;
 use etv_render::{Settings, stems};
 
 pub const RATE: u32 = 44_100;
@@ -40,11 +40,16 @@ pub fn make_source_video(path: &Path) {
 
 /// A stereo WAV with a short decaying tone on every beat of `bpm`.
 pub fn write_click_wav(path: &Path, bpm: f64, seconds: f64, freq: f64) {
+    write_click_wav_at(path, bpm, seconds, freq, 0.0);
+}
+
+/// [`write_click_wav`] with a beat falling at `phase_s` (and every beat apart).
+pub fn write_click_wav_at(path: &Path, bpm: f64, seconds: f64, freq: f64, phase_s: f64) {
     let frames = (seconds * f64::from(RATE)) as usize;
     let beat = 60.0 / bpm;
     let mut data = Vec::with_capacity(frames * 4);
     for n in 0..frames {
-        let t = n as f64 / f64::from(RATE);
+        let t = n as f64 / f64::from(RATE) - phase_s.rem_euclid(beat);
         let since = t - (t / beat).floor() * beat;
         let v = if since < 0.02 {
             (2.0 * std::f64::consts::PI * freq * since).sin() * (1.0 - since / 0.02) * 0.8
@@ -73,12 +78,19 @@ pub fn write_click_wav(path: &Path, bpm: f64, seconds: f64, freq: f64) {
     std::fs::write(path, out).unwrap();
 }
 
-/// Put a hook's stems where the renderer looks for them, so Demucs is not run.
-pub fn seed_stems(settings: &Settings, hook: &Hook) {
-    let dir = stems::stem_dir(settings, hook);
-    let (_, len) = stems::region(hook);
-    write_click_wav(&dir.join(stems::VOCALS), hook.native_bpm, len, 1500.0);
-    write_click_wav(&dir.join(stems::NO_VOCALS), hook.native_bpm, len, 600.0);
+/// Put every separated region's stems where the renderer looks for them, so
+/// Demucs is not run: click tracks at each source's tempo, with a beat on its
+/// landing, both read from the fixture's `notes`.
+pub fn seed_stems(settings: &Settings, plan: &Plan) {
+    for region in stems::regions(plan) {
+        let facts = &plan.notes["sources"][&region.source];
+        let bpm = facts["native_bpm"].as_f64().expect("notes give native_bpm");
+        let landing = facts["landing_s"].as_f64().expect("notes give landing_s");
+        let phase = landing - region.start_s;
+        let dir = stems::stem_dir(settings, &region);
+        write_click_wav_at(&dir.join(stems::VOCALS), bpm, region.len_s, 1500.0, phase);
+        write_click_wav_at(&dir.join(stems::NO_VOCALS), bpm, region.len_s, 600.0, phase);
+    }
 }
 
 /// The checked-in fixture plan with `@DIR@` replaced by `dir`.

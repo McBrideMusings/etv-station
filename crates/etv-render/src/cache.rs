@@ -1,10 +1,10 @@
-//! Keeping rendered chapters and their stems under a size cap.
+//! Keeping rendered files and their stems under a size cap.
 //!
 //! The cache is every `done` job's output file plus every stem directory under
 //! `<cache>/stems`. Over the cap, stems no live job refers to go first, then
-//! chapters in air-time order, oldest first. Only a chapter that has finished
+//! renders in air-time order, oldest first. Only a render that has finished
 //! airing is removed: one that has not aired yet is needed, and one with no air
-//! time is never removed, since nothing says it is safe. A chapter is also
+//! time is never removed, since nothing says it is safe. A render is also
 //! protected from thirty minutes before it airs until it has finished.
 
 use std::collections::BTreeSet;
@@ -17,7 +17,7 @@ use time::OffsetDateTime;
 use crate::queue::{JobState, Queue, Status};
 use crate::settings::Settings;
 
-/// How long before air a chapter is off limits to eviction.
+/// How long before air a render is off limits to eviction.
 pub const PROTECT_BEFORE_AIR: Duration = Duration::from_secs(30 * 60);
 
 fn dir_bytes(path: &Path) -> u64 {
@@ -73,7 +73,7 @@ pub fn protected(job: &JobState, now: OffsetDateTime) -> bool {
     }
 }
 
-/// Whether `job`'s chapter has finished airing at `now`. A job with no air time has not.
+/// Whether `job`'s render has finished airing at `now`. A job with no air time has not.
 fn has_aired(job: &JobState, now: OffsetDateTime) -> bool {
     match job.air_at {
         None => false,
@@ -81,7 +81,7 @@ fn has_aired(job: &JobState, now: OffsetDateTime) -> bool {
     }
 }
 
-/// Bytes the cache holds now: every `done` chapter's file and every stem directory.
+/// Bytes the cache holds now: every `done` render's file and every stem directory.
 pub fn used_bytes(queue: &Queue, settings: &Settings) -> u64 {
     let stems_root = settings.cache_dir.join("stems");
     queue.list().iter().map(output_size).sum::<u64>()
@@ -99,7 +99,7 @@ fn output_size(job: &JobState) -> u64 {
     }
 }
 
-/// Bring the cache under `cap_bytes`, returning the ids of the chapters removed.
+/// Bring the cache under `cap_bytes`, returning the ids of the renders removed.
 pub fn enforce_cap(
     queue: &Queue,
     settings: &Settings,

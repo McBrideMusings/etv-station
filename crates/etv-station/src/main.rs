@@ -271,22 +271,23 @@ enum Command {
     /// Overlaps and gaps in the source are written as published and reported.
     ImportArcs(ImportArcsArgs),
 
-    /// Render one chapter plan to its output file now, and exit non-zero with
+    /// Render one plan to its output file now, and exit non-zero with
     /// the failing layer named if it cannot. Needs the renderer's cache
     /// directory (`renderer.cache_dir` or `ETV_RENDER_CACHE_DIR`).
     Render {
-        /// The chapter plan (JSON); the format is in docs/schema.md.
+        /// The render plan (JSON): sources, audio layers and picture cuts; the
+        /// format is docs/schema.md § Render plan.
         plan: PathBuf,
     },
 
-    /// Put a chapter plan on the renderer's queue and print its job id at once.
+    /// Put a render plan on the renderer's queue and print its job id at once.
     /// The same plan queued twice is one job. Needs `renderer.queue_dir` or
     /// `ETV_RENDER_QUEUE_DIR`.
     Enqueue {
-        /// The chapter plan (JSON); the format is in docs/schema.md.
+        /// The render plan (JSON); the format is docs/schema.md § Render plan.
         plan: PathBuf,
-        /// When the chapter airs (RFC 3339). Cache eviction orders by it and
-        /// never removes a chapter within 30 minutes of it.
+        /// When the render airs (RFC 3339). Cache eviction orders by it and
+        /// never removes a render within 30 minutes of it.
         #[arg(long, value_name = "TIME")]
         air_at: Option<String>,
     },
