@@ -21,6 +21,10 @@ pub struct RendererConfig {
     /// aired chapter is evicted. `ETV_RENDER_CACHE_CAP_GB` overrides. Default 20.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_cap_gb: Option<u64>,
+    /// How many minutes before a pending file airs the sidecar queues its
+    /// plan. `ETV_RENDER_LEAD_MINUTES` overrides. Default 120.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_minutes: Option<u64>,
 }
 
 impl RendererConfig {
@@ -150,7 +154,7 @@ pub struct StationConfig {
 
     /// Where the chapter renderer's queue and cache live and how large the
     /// cache may grow (`renderer:` in the station config). Unset leaves the
-    /// renderer unconfigured: `enqueue` refuses, `render-sidecar` exits, and the
+    /// renderer unconfigured: `render-sidecar` exits, and the
     /// dashboard's Health tab says so. Each key has an `ETV_RENDER_*` override.
     #[serde(default, skip_serializing_if = "RendererConfig::is_empty")]
     pub renderer: RendererConfig,

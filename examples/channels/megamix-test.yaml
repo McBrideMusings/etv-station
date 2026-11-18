@@ -43,5 +43,3 @@ rule:
             expr: 'item.library == "Music Videos"'
             card_script: ../overlays/hook_card.rhai
             dir: tmp/chapters
-            enqueue: target/debug/etv-station
-            enqueue_args: ["--config", "examples/station-megamix.yaml"]

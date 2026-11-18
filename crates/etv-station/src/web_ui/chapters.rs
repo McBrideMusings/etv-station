@@ -1,11 +1,12 @@
 //! `GET /api/channels/{ch}/chapters`: the chapters a channel's bumper plugin has
-//! queued, with the plan each was rendered from.
+//! laid, with the plan each was rendered from.
 //!
-//! A plugin names a chapter's bumper segment `chapter:<job>|<entry>|<entry>...`,
-//! where `<job>` is the id `etv-station enqueue` printed. The airings ledger
-//! holds one bumper row per scheduled segment, so a chapter is in it from the
-//! generation that laid it, and the renderer's queue holds its plan and state.
-//! This joins the two; it writes nothing.
+//! A plugin names a chapter's bumper segment `chapter:<stem>|<entry>|<entry>...`,
+//! where `<stem>` is the file stem of the render the segment is pending on. The
+//! airings ledger holds one bumper row per scheduled segment, so a chapter is in
+//! it from the generation that laid it; the render sidecar queues its plan once
+//! its air time is within the lead, and the queue then holds the job whose
+//! output has that stem. This joins the two; it writes nothing.
 
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -23,9 +24,9 @@ const ROW_LIMIT: usize = 1000;
 
 /// `{channel, renderer, chapters: [{name, start, job, hooks, state, render, plan, notes}]}`
 /// in air order. `state` is `failed` (at any time), `airing`, `aired`, `queued`,
-/// `running`, `rendered`, `unqueued` (the plugin could not reach the renderer)
-/// or `unknown` (the renderer is not configured here, or has no record of the
-/// job). `stand_in` is true while the chapter's slot is airing before its
+/// `running`, `rendered`, `superseded`, `waiting` (no job yet: it airs beyond
+/// the sidecar's lead) or `unknown` (the renderer is not configured here, or
+/// has no record of a chapter airing now). `stand_in` is true while the chapter's slot is airing before its
 /// render is done, so the black stand-in is what viewers see.
 pub(super) fn api_channel_chapters(state: &AppState, key: &str) -> Result<(u16, Value), String> {
     let (station, index) = match find_channel(state, key)? {
@@ -61,6 +62,17 @@ pub(super) fn api_channel_chapters(state: &AppState, key: &str) -> Result<(u16, 
     };
     let truncated = rows.len() >= ROW_LIMIT;
     let queue = state.options.health.renderer.as_ref().map(|r| r.queue());
+    // The newest job per output stem; `list` is oldest enqueue first.
+    let jobs: HashMap<String, etv_render::queue::JobState> = queue
+        .as_ref()
+        .map(|q| q.list())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|job| {
+            let stem = job.output.file_stem()?.to_str()?.to_string();
+            Some((stem, job))
+        })
+        .collect();
 
     let mut chapters = Vec::new();
     for row in rows {
@@ -68,13 +80,14 @@ pub(super) fn api_channel_chapters(state: &AppState, key: &str) -> Result<(u16, 
             continue;
         };
         let mut parts = rest.split('|');
-        let job_id = parts.next().unwrap_or_default();
+        let stem = parts.next().unwrap_or_default();
         let hooks: Vec<&str> = parts.collect();
         let start = row.record.start;
-        let job = queue.as_ref().and_then(|q| q.read(job_id));
+        let job = jobs.get(stem).cloned();
         let plan_text = queue
             .as_ref()
-            .and_then(|q| std::fs::read_to_string(q.plan_path(job_id)).ok());
+            .zip(job.as_ref())
+            .and_then(|(q, job)| std::fs::read_to_string(q.plan_path(&job.id)).ok());
         let plan: Option<Value> = plan_text
             .as_deref()
             .and_then(|text| serde_json::from_str(text).ok());
@@ -95,7 +108,7 @@ pub(super) fn api_channel_chapters(state: &AppState, key: &str) -> Result<(u16, 
                 "rendered".to_string()
             }
             (Some(job), _) => job.status.as_str().to_string(),
-            (None, _) if job_id.starts_with("unqueued-") => "unqueued".to_string(),
+            (None, _) if queue.is_some() && start > now => "waiting".to_string(),
             (None, _) => "unknown".to_string(),
         };
         let on_air = start <= now && ends.is_none_or(|end| now < end);
@@ -110,7 +123,7 @@ pub(super) fn api_channel_chapters(state: &AppState, key: &str) -> Result<(u16, 
         chapters.push(json!({
             "name": row.record.entry_id,
             "start": start.format(&Rfc3339).map_err(|e| e.to_string())?,
-            "job": job_id,
+            "job": job.as_ref().map(|j| j.id.clone()),
             "hooks": hooks,
             "state": state,
             "stand_in": stand_in,

@@ -9,6 +9,10 @@
 //! so the sidecar never sees a state without its plan. Both are written to a
 //! temporary name and renamed into place. The job's id is a hash of the plan,
 //! so enqueueing the same plan twice is one job.
+//!
+//! The queue follows the schedule ([`Queue::sync`]): a file the schedule airs
+//! within the lead is queued from the plan its pending segment names, and a
+//! queued job the schedule no longer airs there is superseded.
 
 use std::fs;
 use std::io::Write;
@@ -36,16 +40,20 @@ pub enum Status {
     Evicted,
     /// Its air time came before the sidecar reached it, so it was never rendered.
     Missed,
+    /// Queued, then the schedule stopped airing its file within the lead: a
+    /// newer generation replaced it. Queued again if the schedule names it again.
+    Superseded,
 }
 
 impl Status {
-    pub const ALL: [Status; 6] = [
+    pub const ALL: [Status; 7] = [
         Status::Queued,
         Status::Running,
         Status::Done,
         Status::Failed,
         Status::Evicted,
         Status::Missed,
+        Status::Superseded,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -56,6 +64,7 @@ impl Status {
             Status::Failed => "failed",
             Status::Evicted => "evicted",
             Status::Missed => "missed",
+            Status::Superseded => "superseded",
         }
     }
 }
@@ -140,6 +149,13 @@ impl Queue {
     pub fn write(&self, state: &JobState) -> Result<(), QueueError> {
         let json = serde_json::to_vec_pretty(state).map_err(|e| self.io(e))?;
         write_atomic(&self.state_path(&state.id), &json).map_err(|e| self.io(e))
+    }
+
+    /// Delete a job: its state first, so no reader ever finds a state without
+    /// its plan, then its plan.
+    fn remove(&self, id: &str) -> Result<(), QueueError> {
+        fs::remove_file(self.state_path(id)).map_err(|e| self.io(e))?;
+        fs::remove_file(self.plan_path(id)).map_err(|e| self.io(e))
     }
 
     /// Every job, oldest enqueue first. A state file that does not parse is
@@ -263,6 +279,127 @@ impl Queue {
     }
 }
 
+/// A file the schedule airs that a plan makes: what [`Queue::sync`] reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wanted {
+    pub output: PathBuf,
+    /// The plan that makes `output`; `None` when the schedule names a pending
+    /// file nothing here renders.
+    pub plan: Option<PathBuf>,
+    pub air_at: OffsetDateTime,
+}
+
+/// What one [`Queue::sync`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SyncCounts {
+    /// Files the schedule airs within the lead.
+    pub wanted: usize,
+    pub enqueued: usize,
+    pub superseded: usize,
+    /// Superseded jobs deleted because their air time has passed.
+    pub removed: usize,
+    /// Plans that could not be read or did not make the file that names them.
+    pub unreadable_plans: usize,
+}
+
+/// Plans already found unreadable, with the modification time they had then,
+/// so one is read again only after it changes.
+pub type UnreadablePlans = std::collections::HashMap<PathBuf, Option<std::time::SystemTime>>;
+
+impl Queue {
+    /// Make the queue follow the schedule up to `horizon`. `wanted` is every
+    /// file the schedule airs between `now` and `horizon`.
+    ///
+    /// - A queued job with an air time still ahead whose file is not in
+    ///   `wanted` is superseded: the schedule replaced it, or it airs past the
+    ///   horizon and is queued again once the horizon reaches it. A queued job
+    ///   whose air time has come is left for [`Queue::mark_missed`].
+    /// - A superseded job whose air time has passed is deleted, plan and state.
+    /// - A wanted file with a plan and no queued, running, done or failed job
+    ///   is queued from that plan. A failed job is not retried here, so a plan
+    ///   that cannot render does not loop.
+    pub fn sync(
+        &self,
+        wanted: &[Wanted],
+        now: OffsetDateTime,
+        unreadable: &mut UnreadablePlans,
+    ) -> SyncCounts {
+        let mut counts = SyncCounts {
+            wanted: wanted.len(),
+            ..SyncCounts::default()
+        };
+        let airs: std::collections::HashSet<&Path> =
+            wanted.iter().map(|w| w.output.as_path()).collect();
+        let mut covered: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for mut job in self.list() {
+            if job.status == Status::Superseded && is_past(job.air_at, now) {
+                // Its air time is gone, so no schedule can name it again.
+                if self.remove(&job.id).is_ok() {
+                    counts.removed += 1;
+                }
+                continue;
+            }
+            if job.status == Status::Queued
+                && job.air_at.is_some_and(|air| air > now)
+                && !airs.contains(job.output.as_path())
+            {
+                job.status = Status::Superseded;
+                if self.write(&job).is_ok() {
+                    counts.superseded += 1;
+                    tracing::info!(event = "render.superseded", id = %job.id, output = %job.output.display(), air_at = ?job.air_at, "the schedule no longer airs this file within the lead; not rendering it");
+                }
+                continue;
+            }
+            if matches!(
+                job.status,
+                Status::Queued | Status::Running | Status::Done | Status::Failed
+            ) {
+                covered.insert(job.output);
+            }
+        }
+        for w in wanted {
+            let Some(plan_path) = &w.plan else { continue };
+            if covered.contains(&w.output) {
+                continue;
+            }
+            let modified = fs::metadata(plan_path).and_then(|m| m.modified()).ok();
+            if unreadable.get(plan_path) == Some(&modified) {
+                continue;
+            }
+            let plan = fs::read_to_string(plan_path)
+                .map_err(|e| e.to_string())
+                .and_then(|text| Plan::parse(&text).map_err(|e| e.to_string()))
+                .and_then(|plan| {
+                    if plan.output == w.output {
+                        Ok(plan)
+                    } else {
+                        Err(format!(
+                            "it makes {}, not the scheduled {}",
+                            plan.output.display(),
+                            w.output.display()
+                        ))
+                    }
+                });
+            match plan.and_then(|plan| {
+                self.enqueue(&plan, Some(w.air_at), now)
+                    .map_err(|e| e.to_string())
+            }) {
+                Ok(_) => {
+                    unreadable.remove(plan_path);
+                    covered.insert(w.output.clone());
+                    counts.enqueued += 1;
+                }
+                Err(error) => {
+                    unreadable.insert(plan_path.clone(), modified);
+                    counts.unreadable_plans += 1;
+                    tracing::warn!(event = "render.plan_unreadable", plan = %plan_path.display(), output = %w.output.display(), error = %error, "cannot queue the plan a scheduled file names; skipping it until the plan changes");
+                }
+            }
+        }
+        counts
+    }
+}
+
 fn is_past(air_at: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
     air_at.is_some_and(|air| air <= now)
 }
@@ -375,19 +512,51 @@ pub fn process_next(
     Some(job)
 }
 
-/// Drain the queue until `stop` is set, one job at a time.
+/// What the schedule airs from a given instant through the sidecar's lead,
+/// or why it could not be read.
+pub type Schedule<'a> = dyn Fn(OffsetDateTime) -> Result<Vec<Wanted>, String> + 'a;
+
+/// Drain the queue until `stop` is set, one job at a time, bringing the queue
+/// in line with `schedule` at most once every `sync_every`.
 pub fn run_sidecar(
     queue: &Queue,
     settings: &Settings,
     cap_bytes: u64,
     stop: &AtomicBool,
     poll: Duration,
+    schedule: &Schedule<'_>,
+    sync_every: Duration,
 ) {
     let recovered = queue.recover_interrupted();
     tracing::info!(event = "render.sidecar_start", queue = %queue.dir.display(), cache = %settings.cache_dir.display(), cap_bytes, recovered, "renderer watching its queue");
     let now = OffsetDateTime::now_utc;
     cache::enforce_cap(queue, settings, cap_bytes, now());
+    let mut unreadable = UnreadablePlans::new();
+    let mut synced: Option<std::time::Instant> = None;
     while !stop.load(Ordering::Relaxed) {
+        if synced.is_none_or(|t| t.elapsed() >= sync_every) {
+            synced = Some(std::time::Instant::now());
+            let at = now();
+            match schedule(at) {
+                Ok(wanted) => {
+                    let c = queue.sync(&wanted, at, &mut unreadable);
+                    if c.enqueued + c.superseded + c.removed + c.unreadable_plans > 0 {
+                        tracing::info!(
+                            event = "render.sync",
+                            wanted = c.wanted,
+                            enqueued = c.enqueued,
+                            superseded = c.superseded,
+                            removed = c.removed,
+                            unreadable_plans = c.unreadable_plans,
+                            "brought the queue in line with the schedule"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(event = "render.schedule_unreadable", error = %error, "cannot read the schedule; the queue is left as it is until the next pass");
+                }
+            }
+        }
         if process_next(queue, settings, cap_bytes, now).is_none() {
             std::thread::sleep(poll);
         }

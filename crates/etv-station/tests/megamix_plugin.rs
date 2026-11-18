@@ -1,11 +1,11 @@
 //! Acceptance tests for the megamix bumper (`examples/plugins/bumpers/megamix.rhai`):
 //! it reads audio facts through `ctx.catalog`, picks a tempo and key cluster,
-//! writes a render plan, queues it with the renderer and airs it as a pending
-//! segment.
+//! writes a render plan and airs it as a pending segment that names the plan,
+//! which the render sidecar queues as the chapter's air time nears.
 //!
-//! The catalog, the facts, the renderer's `enqueue` and `ffmpeg` are all written
-//! fresh by this file: the two programs are shell stubs, so the test proves the
-//! plugin's arguments and the plan it wrote rather than a real render.
+//! The catalog, the facts and `ffmpeg` are all written fresh by this file:
+//! `ffmpeg` is a shell stub, so the test proves the plan the plugin wrote and
+//! the segment it laid rather than a real render.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -152,7 +152,7 @@ impl Fixture {
         }
     }
 
-    fn input(&self, enqueue: &str, gap_ms: u64) -> BumperInput {
+    fn input(&self, gap_ms: u64) -> BumperInput {
         let ffmpeg = stub(
             self.dir.path(),
             "ffmpeg",
@@ -169,7 +169,6 @@ impl Fixture {
             config: Some(json!({
                 "expr": "item.library == \"Music Videos\"",
                 "dir": self.work,
-                "enqueue": enqueue,
                 "ffmpeg": ffmpeg,
                 "floor": 2.5,
                 "card_script": "overlays/hook_card.rhai",
@@ -269,16 +268,7 @@ fn shifted(code: &str, semitones: i64) -> String {
 #[test]
 fn a_chapter_plan_passes_the_floor_semitone_camelot_and_bar_rules() {
     let f = Fixture::new();
-    let args_log = f.dir.path().join("enqueue.args");
-    let job = stub(
-        f.dir.path(),
-        "enqueue",
-        &format!(
-            "printf '%s\\n' \"$@\" > {}\necho job-77",
-            args_log.display()
-        ),
-    );
-    let built = build(&plugin_path(), &f.input(job.to_str().unwrap(), 600_000)).unwrap();
+    let built = build(&plugin_path(), &f.input(600_000)).unwrap();
 
     let plans = f.plans();
     assert_eq!(plans.len(), 1, "one plan beside the render path");
@@ -339,28 +329,25 @@ fn a_chapter_plan_passes_the_floor_semitone_camelot_and_bar_rules() {
         format!("Artist {}", chapter.hooks[0].entry_id)
     );
 
-    // The renderer's queue was handed this plan, with the chapter's air time:
-    // the next programme's start (1_800_000_000) less the 600 s gap.
-    let args: Vec<String> = std::fs::read_to_string(args_log)
-        .unwrap()
-        .lines()
-        .map(String::from)
-        .collect();
-    assert_eq!(args[0], "enqueue");
-    assert_eq!(Path::new(&args[1]), plans[0]);
-    assert_eq!(&args[2..], ["--air-at", "2027-01-15T07:50:00Z"]);
-
-    // One pending segment named for the queued job and its hooks.
+    // One pending segment named for the render's stem and its hooks, naming
+    // the plan the render sidecar queues as its air time nears.
     let segment = &built.timeline.segments[0];
+    let stem = plan.output.file_stem().unwrap().to_str().unwrap();
     assert!(
-        segment.name.starts_with("chapter:job-77|"),
+        segment.name.starts_with(&format!("chapter:{stem}|")),
         "{}",
         segment.name
     );
-    let SegmentSource::Pending { path, stand_in } = &segment.source else {
+    let SegmentSource::Pending {
+        path,
+        stand_in,
+        plan: named,
+    } = &segment.source
+    else {
         panic!("expected a pending segment, got {:?}", segment.source);
     };
     assert_eq!(path, &plan.output);
+    assert_eq!(named.as_deref(), Some(plans[0].as_path()));
     assert!(stand_in.exists(), "the stand-in file was made");
     assert_eq!(
         segment.overlay.as_ref().unwrap().vars["cards"]
@@ -468,11 +455,7 @@ fn expected_layers(c: &Notes) -> Vec<Expected> {
 #[test]
 fn the_layers_are_the_vocal_over_seam_and_the_picture_runs_at_the_audios_speed() {
     let f = Fixture::new();
-    build(
-        &plugin_path(),
-        &f.input("/nonexistent/etv-station", 600_000),
-    )
-    .unwrap();
+    build(&plugin_path(), &f.input(600_000)).unwrap();
     let (_, plan) = only_plan(&f);
     let chapter = notes(&plan);
     assert!(chapter.hooks.len() >= 3);
@@ -671,7 +654,7 @@ fn chapter_layers_put_each_stem_where_the_renderer_used_to() {
 #[test]
 fn a_chapter_laid_earlier_in_the_pass_keeps_its_songs_out_of_the_next() {
     let f = Fixture::new();
-    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    let mut input = f.input(600_000);
     input.config.as_mut().unwrap()["hooks_min"] = json!(2);
     input.config.as_mut().unwrap()["hooks_max"] = json!(2);
 
@@ -696,24 +679,6 @@ fn a_chapter_laid_earlier_in_the_pass_keeps_its_songs_out_of_the_next() {
         next.iter().all(|s| !used.contains(s)),
         "{next:?} reuses a song from {used:?}"
     );
-}
-
-#[test]
-fn a_build_with_the_renderer_absent_still_emits_a_timeline() {
-    let f = Fixture::new();
-    let built = build(
-        &plugin_path(),
-        &f.input("/nonexistent/etv-station", 600_000),
-    )
-    .unwrap();
-    let segment = &built.timeline.segments[0];
-    assert!(
-        segment.name.starts_with("chapter:unqueued-"),
-        "{}",
-        segment.name
-    );
-    assert!(matches!(segment.source, SegmentSource::Pending { .. }));
-    assert_eq!(f.plans().len(), 1, "the plan is still written");
 }
 
 /// A stand-in for the plex-db-ex explorer: answers every request with `reply`
@@ -782,7 +747,7 @@ fn frame_index_shots_replace_the_other_hooks_pictures() {
             {"item_id":"9999","in_ms":0,"out_ms":20000,"drawn":1}
         ]}"#,
     );
-    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    let mut input = f.input(600_000);
     input.config.as_mut().unwrap()["plexdb_url"] = json!(url);
     input.config.as_mut().unwrap()["phrase"] = json!("a neon city at night");
     build(&plugin_path(), &input).unwrap();
@@ -906,7 +871,7 @@ fn extras_explorer() -> (String, std::sync::mpsc::Receiver<String>) {
 fn a_card_without_the_artist_field_reads_it_from_the_extras_fields() {
     let f = Fixture::new();
     let (url, requests) = extras_explorer();
-    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    let mut input = f.input(600_000);
     input.config.as_mut().unwrap()["plexdb_url"] = json!(url);
     input.config.as_mut().unwrap()["artist_field"] = json!("artist");
     build(&plugin_path(), &input).unwrap();
@@ -941,7 +906,7 @@ fn an_extra_is_searched_by_its_entry_id_and_found_by_it() {
             {"item_id":"mv-weak","in_ms":50000,"out_ms":70000,"drawn":1}
         ]}"#,
     );
-    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    let mut input = f.input(600_000);
     input.config.as_mut().unwrap()["plexdb_url"] = json!(url);
     let conn = rusqlite::Connection::open(f.dir.path().join("catalog.db")).unwrap();
     conn.execute(
@@ -973,7 +938,7 @@ fn an_extra_is_searched_by_its_entry_id_and_found_by_it() {
 #[test]
 fn an_unreachable_explorer_leaves_the_hooks_own_pictures() {
     let f = Fixture::new();
-    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    let mut input = f.input(600_000);
     input.config.as_mut().unwrap()["plexdb_url"] = json!("http://127.0.0.1:9");
     input.config.as_mut().unwrap()["phrase"] = json!("anything");
     build(&plugin_path(), &input).unwrap();
@@ -1028,7 +993,7 @@ fn model_server(content: &str) -> (String, std::thread::JoinHandle<String>) {
 }
 
 fn model_input(f: &Fixture, url: &str) -> BumperInput {
-    let mut input = f.input("/nonexistent/etv-station", 600_000);
+    let mut input = f.input(600_000);
     let cfg = input.config.as_mut().unwrap();
     cfg["ranker"] = json!("model");
     cfg["model_url"] = json!(url);
@@ -1092,11 +1057,7 @@ fn a_rejected_model_pick_falls_back_to_the_rule() {
             !hooks.iter().any(|h| h == "mv-weak" || h == "mv-unsteady"),
             "{reply}: {hooks:?}"
         );
-        let rule = build(
-            &plugin_path(),
-            &f.input("/nonexistent/etv-station", 600_000),
-        )
-        .unwrap();
+        let rule = build(&plugin_path(), &f.input(600_000)).unwrap();
         assert_eq!(
             built.timeline.segments[0].name, rule.timeline.segments[0].name,
             "{reply}: the fallback is the rule's chapter"

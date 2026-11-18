@@ -30,9 +30,6 @@
 //                    and the `http` grant)
 //   card_script:     overlay script that draws the card copy, relative to the
 //                    channel config's directory; unset carries no overlay
-//   enqueue:         program run as `<enqueue> <enqueue_args...> enqueue <plan> --air-at <t>`,
-//                    default "etv-station"
-//   enqueue_args:    extra arguments before `enqueue`, default []
 //   ffmpeg:          program that makes the stand-in, default "ffmpeg"
 //   plexdb_url:      base URL of the plex-db-ex explorer, e.g. "http://host:8765"; with
 //                    `phrase`, the picture between a hook's own cuts is drawn from the
@@ -47,8 +44,11 @@
 // `notes`) and <stem>.audit.txt (one seam line per hook, which `admin audit` and
 // `GET /api/channels/<n>/chapters` show).
 //
-// The segment is named `chapter:<job>|<entry>|<entry>...`: `GET
-// /api/channels/<n>/chapters` joins the job id to the renderer's queue, and this
+// The segment is pending on <stem>.mp4 and names <stem>.plan.json as the plan
+// that makes it; the render sidecar queues that plan as the chapter's air time
+// nears. The segment is named `chapter:<stem>|<entry>|<entry>...`: `GET
+// /api/channels/<n>/chapters` joins the stem to the renderer job whose output
+// it names, and this
 // script reads the entries back from `ctx.airings` to keep a song out of the
 // next `tail` chapters; that includes chapters laid earlier in the same
 // generation pass, before they reach the ledger.
@@ -339,25 +339,6 @@ fn fnv(text) {
         h = ((h ^ ch.to_int()) * 16777619) & 0xFFFFFFFF;
     }
     h
-}
-
-fn pad2(n) { if n < 10 { "0" + n } else { n.to_string() } }
-
-// Unix seconds as an RFC 3339 UTC time, the form `enqueue --air-at` reads.
-fn rfc3339(secs) {
-    let days = secs / 86400;
-    let rem = secs % 86400;
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    if m <= 2 { y += 1; }
-    y.to_string() + "-" + pad2(m) + "-" + pad2(d) + "T" + pad2(rem / 3600) + ":" + pad2((rem % 3600) / 60) + ":" + pad2(rem % 60) + "Z"
 }
 
 // Bars per hook and the hook count that fit `gap_s`, or () when fewer than
@@ -670,32 +651,6 @@ fn write_file(ctx, path, text) {
     if r.code != 0 { throw "megamix: could not write " + path + ": " + r.stderr; }
 }
 
-// The id the renderer filed the plan under, or () when the renderer is absent.
-fn enqueue(ctx, cfg, plan_path, air_at) {
-    let program = conf(cfg, "enqueue", "etv-station");
-    let args = [];
-    for a in conf(cfg, "enqueue_args", []) { args.push(a); }
-    args.push("enqueue");
-    args.push(plan_path);
-    if air_at != () {
-        args.push("--air-at");
-        args.push(rfc3339(air_at));
-    }
-    try {
-        let r = ctx.exec(program, args);
-        if r.code == 0 {
-            // trim() works in place
-            let id = r.stdout;
-            id.trim();
-            return id;
-        }
-        log("megamix: enqueue failed code=" + r.code + " stderr=" + r.stderr);
-    } catch (e) {
-        log("megamix: enqueue unavailable: " + e);
-    }
-    ()
-}
-
 // A ten-second black clip with a brown-noise bed; a pending chapter loops it.
 fn stand_in(ctx, cfg) {
     let path = cfg.dir + "/stand-in.mp4";
@@ -799,13 +754,11 @@ fn build(ctx) {
     let notes = seam_notes(plan, drawn, fitted.bars);
     write_file(ctx, cfg.dir + "/" + stem + ".audit.txt", notes);
 
-    let air_at = if ctx.next == () { () } else { ctx.next.start - ctx.gap_ms / 1000 };
-    let job = enqueue(ctx, cfg, plan_path, air_at);
     let chapter_ms = (fitted.hooks * fitted.bars * bar_s * 1000.0).round().to_int();
 
-    let names = "chapter:" + (if job == () { "unqueued-" + stem } else { job });
+    let names = "chapter:" + stem;
     for d in drawn { names += "|" + d.entry_id; }
-    log("megamix: chapter=" + names + " bpm=" + chapter_bpm + " key=" + plan.notes.key + " bars=" + (fitted.hooks * fitted.bars) + " queued=" + (job != ()));
+    log("megamix: chapter=" + names + " bpm=" + chapter_bpm + " key=" + plan.notes.key + " bars=" + (fitted.hooks * fitted.bars));
     for i in 0..plan.notes.hooks.len() {
         let h = plan.notes.hooks[i];
         log("megamix: seam=" + i + " bar=" + (i * fitted.bars) + " entry=" + h.entry_id + " landing_s=" + h.landing_s + " semitones=" + h.semitones);
@@ -817,7 +770,7 @@ fn build(ctx) {
     if standing == () {
         seg = seg.black().looped();
     } else {
-        seg = seg.pending(plan.output, standing).looped().own_audio();
+        seg = seg.pending(plan.output, standing, plan_path).looped().own_audio();
     }
     seg = seg.fixed_ms(chapter_ms).name(names);
     if cfg.card_script != () {

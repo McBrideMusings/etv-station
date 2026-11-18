@@ -1600,6 +1600,13 @@ fn resolve_block(
             window_start,
             score_env,
             fill,
+            match include.align {
+                Some(crate::config::Align::Every(every)) => Some(crate::pattern::Grid {
+                    every,
+                    tz: scoring.tz.unwrap_or(time_tz::timezones::db::UTC),
+                }),
+                _ => None,
+            },
             channel_rule,
             score_cache,
         )

@@ -1256,6 +1256,36 @@ pub struct BlockBuild {
     pub lists: BTreeMap<String, Vec<crate::resume::FrozenList>>,
 }
 
+/// The `align:` grid of the block a pattern walk lays: every programme airs
+/// until the next line, so a budgeted walk counts the slot, not the runtime.
+#[derive(Debug, Clone, Copy)]
+pub struct Grid {
+    pub every: Duration,
+    pub tz: &'static time_tz::Tz,
+}
+
+/// `laid` after `drawn` airs from `window_start + laid`: each programme's
+/// runtime, then up to the next grid line when the block has one.
+fn advance_laid(
+    laid: Duration,
+    runtimes: &PoolRuntime<'_>,
+    drawn: &[String],
+    window_start: time::OffsetDateTime,
+    grid: Option<Grid>,
+) -> Duration {
+    let Some(grid) = grid else {
+        return laid + runtimes.runtime_of(drawn);
+    };
+    drawn.iter().fold(laid, |laid, id| {
+        let ends = window_start
+            + time::Duration::seconds_f64(
+                (laid + runtimes.runtime_of(std::slice::from_ref(id))).as_secs_f64(),
+            );
+        let line = crate::bumper::fill::boundary_at_or_after(ends, grid.every, grid.tz);
+        Duration::try_from(line - window_start).unwrap_or(laid)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     catalog: &Catalog,
@@ -1283,6 +1313,7 @@ pub fn build(
         window_start,
         score_env,
         fill,
+        None,
         channel_rule,
         &mut crate::score::ScoreCache::default(),
     )
@@ -1305,6 +1336,7 @@ pub fn build_with_cache(
     window_start: time::OffsetDateTime,
     score_env: crate::score::ScoreEnv<'_>,
     fill: Option<Duration>,
+    grid: Option<Grid>,
     channel_rule: Option<ChannelRule<'_>>,
     score_cache: &mut crate::score::ScoreCache,
 ) -> Result<BlockBuild, String> {
@@ -1571,7 +1603,7 @@ pub fn build_with_cache(
                 progress.push(at);
             }
             if measure {
-                laid += runtimes[idx].runtime_of(&drawn);
+                laid = advance_laid(laid, &runtimes[idx], &drawn, window_start, grid);
             }
             if let Some(guide) = &runtimes[idx].cfg.guide {
                 for id in &drawn {
@@ -4936,6 +4968,39 @@ mod tests {
         );
     }
 
+    /// A block on an `align:` grid airs each programme until the next line, so
+    /// the window buys slots, not runtimes. Hour-long movies on a three-hour
+    /// grid: a four-hour window holds two slots (0-3h, 3-6h), where counting
+    /// runtime alone laid four movies that the grid then stretched to twelve
+    /// hours.
+    #[test]
+    fn an_aligned_block_spends_the_window_by_grid_slot() {
+        let cat = hourly_movies(24);
+        let mut movies = movies_pool();
+        movies.advance = Advance::Resume;
+        let BlockBuild { ids, .. } = build_with_cache(
+            &cat,
+            &[movies],
+            &[],
+            &[step("movies", 1)],
+            None,
+            None,
+            &GenerationState::empty(),
+            &crate::variety::Variety::fixed(0),
+            time::OffsetDateTime::UNIX_EPOCH,
+            test_env(),
+            Some(Duration::from_secs(4 * 3600)),
+            Some(Grid {
+                every: Duration::from_secs(3 * 3600),
+                tz: time_tz::timezones::db::UTC,
+            }),
+            None,
+            &mut crate::score::ScoreCache::default(),
+        )
+        .expect("pattern builds");
+        assert_eq!(ids, vec!["mov-01", "mov-02"]);
+    }
+
     /// An item the catalog never measured is counted at the pool's mean, not at
     /// zero. Half-measured, the pool still stops at four hours — counting the
     /// unmeasured ones as free would let it run to the end of the list, which
@@ -5690,6 +5755,7 @@ fn audit(ctx, picks, workspace) { #{} }
                     inputs: &inputs,
                     base_dir: std::path::Path::new("."),
                 },
+                None,
                 None,
                 None,
                 cache,

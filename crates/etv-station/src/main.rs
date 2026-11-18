@@ -280,20 +280,9 @@ enum Command {
         plan: PathBuf,
     },
 
-    /// Put a render plan on the renderer's queue and print its job id at once.
-    /// The same plan queued twice is one job. Needs `renderer.queue_dir` or
-    /// `ETV_RENDER_QUEUE_DIR`.
-    Enqueue {
-        /// The render plan (JSON); the format is docs/schema.md § Render plan.
-        plan: PathBuf,
-        /// When the render airs (RFC 3339). Cache eviction orders by it and
-        /// never removes a render within 30 minutes of it.
-        #[arg(long, value_name = "TIME")]
-        air_at: Option<String>,
-    },
-
-    /// Watch the renderer's queue and render plans one at a time until killed.
-    /// The container entrypoint runs this beside the daemon.
+    /// Queue the plans the schedule's pending segments name as their air time
+    /// nears, and render them one at a time until killed. The container
+    /// entrypoint runs this beside the daemon.
     RenderSidecar,
 }
 
@@ -408,19 +397,11 @@ fn main() -> ExitCode {
     }
 
     // The renderer's commands read the `renderer:` section when `--config` is
-    // given and the environment when it is not, so a plugin's `ctx.exec` can
-    // call `enqueue` without knowing where the station config lives.
+    // given and the environment when it is not.
     match &cli.command {
         Some(Command::Render { plan }) => {
             init_tracing(cli.log_format);
             return etv_station::renderer::cli::render(cli.config.as_deref(), plan);
-        }
-        Some(Command::Enqueue { plan, air_at }) => {
-            return etv_station::renderer::cli::enqueue(
-                cli.config.as_deref(),
-                plan,
-                air_at.as_deref(),
-            );
         }
         Some(Command::RenderSidecar) => {
             init_tracing(cli.log_format);

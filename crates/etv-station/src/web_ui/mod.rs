@@ -695,6 +695,7 @@ mod tests {
             queue_dir: dir.path().join("queue"),
             cache_dir: dir.path().join("cache"),
             cache_cap_bytes: 1_000_000,
+            lead: time::Duration::minutes(120),
         });
         let (status, body) = get_json(&mut state, "/api/health/renders");
         assert_eq!(status, 200, "{body}");
@@ -1270,7 +1271,8 @@ mod tests {
     }
 
     /// A queued chapter shows up in `/api/channels/{ch}/chapters` with its plan,
-    /// and a chapter whose plugin never reached the renderer says so.
+    /// joined by its render's stem, and a chapter airing beyond the sidecar's
+    /// lead, with no job yet, is waiting.
     #[test]
     fn chapters_list_the_queued_chapter_with_its_plan() {
         use crate::history::{AiringKind, HistoryDb, PlayRecord};
@@ -1289,7 +1291,9 @@ mod tests {
             queue_dir: root.join("queue"),
             cache_dir: root.join("cache"),
             cache_cap_bytes: 1_000_000,
+            lead: time::Duration::minutes(120),
         });
+        let stem = plan.output.file_stem().unwrap().to_str().unwrap();
         let history = HistoryDb::open(root.join("out/history.db")).unwrap();
         let row = |name: String, start: time::OffsetDateTime| PlayRecord {
             entry_id: name,
@@ -1302,9 +1306,9 @@ mod tests {
             .record(
                 "a",
                 &[
-                    row(format!("chapter:{}|fixture-a|fixture-b", job.id), air_at),
+                    row(format!("chapter:{stem}|fixture-a|fixture-b"), air_at),
                     row(
-                        "chapter:unqueued-ch1-ab12|fixture-a".into(),
+                        "chapter:ch1-ab12|fixture-a".into(),
                         air_at + time::Duration::minutes(5),
                     ),
                     row("megamix-idle".into(), air_at + time::Duration::minutes(9)),
@@ -1320,7 +1324,8 @@ mod tests {
         assert_eq!(chapters[0]["hooks"], json!(["fixture-a", "fixture-b"]));
         assert_eq!(chapters[0]["plan"]["notes"]["bpm"], json!(120.0));
         assert_eq!(chapters[0]["plan"]["sources"][1]["id"], "fixture-b");
-        assert_eq!(chapters[1]["state"], "unqueued");
+        assert_eq!(chapters[0]["job"], json!(job.id));
+        assert_eq!(chapters[1]["state"], "waiting");
         assert_eq!(chapters[1]["plan"], Value::Null);
         assert_eq!(get_json(&mut f.state, "/api/channels/nope/chapters").0, 404);
     }

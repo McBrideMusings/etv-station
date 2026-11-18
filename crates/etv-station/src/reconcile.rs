@@ -48,7 +48,8 @@
 //! [`crate::atomic::atomic_write_json`], so a crash mid-sweep cannot leave a
 //! half-written file for the channel worker to read.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ersatztv_playout::playout::{Playout, PlayoutItem, PlayoutItemSource};
@@ -383,6 +384,115 @@ fn stable_since_last_tick(prev: &PendingSeen, next: &mut PendingSeen, real: &Pat
     prev.get(real) == Some(&stamp)
 }
 
+/// A file a pending segment names, as the schedule stands now: the earliest
+/// time it airs, and the plan that makes it when the plugin named one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingFile {
+    pub path: PathBuf,
+    pub plan: Option<PathBuf>,
+    pub airs_at: OffsetDateTime,
+}
+
+/// The pending items of each playout file [`pending_files`] has parsed, kept
+/// with the modification time and size the file had then. A file is parsed
+/// again only when either changes; playout files are replaced whole by a
+/// rename, so a rewrite always moves them.
+#[derive(Debug, Default)]
+pub struct PendingScan {
+    files: HashMap<PathBuf, (std::time::SystemTime, u64, Vec<PendingFile>)>,
+}
+
+/// Every pending item in a playout file, each at its own start.
+fn pending_items(path: &Path) -> Result<Vec<PendingFile>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let playout: Playout = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+    Ok(playout
+        .items
+        .iter()
+        .filter_map(|item| {
+            let pending = item.metadata.as_ref()?.get(PENDING_KEY)?;
+            let real = pending.get("path")?.as_str()?;
+            Some(PendingFile {
+                path: PathBuf::from(real),
+                plan: pending
+                    .get("plan")
+                    .and_then(|p| p.as_str())
+                    .map(PathBuf::from),
+                airs_at: item.start,
+            })
+        })
+        .collect())
+}
+
+/// Every pending file a channel under `output_base` airs after `from` and
+/// before `until`. Reads only the playout files whose names overlap that span,
+/// and parses only those that changed since `scan` last saw them.
+///
+/// All or nothing: any channel folder or overlapping file that cannot be read
+/// or parsed fails the whole answer, because a partial list reads as "these
+/// files are no longer scheduled" to a caller that drops what is missing.
+pub fn pending_files(
+    output_base: &Path,
+    from: OffsetDateTime,
+    until: OffsetDateTime,
+    scan: &mut PendingScan,
+) -> Result<Vec<PendingFile>, String> {
+    let read_dir = |dir: &Path| {
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))
+    };
+    let mut seen: HashMap<PathBuf, (std::time::SystemTime, u64, Vec<PendingFile>)> = HashMap::new();
+    let mut earliest: HashMap<PathBuf, PendingFile> = HashMap::new();
+    for channel in read_dir(output_base)? {
+        let channel = channel.map_err(|e| format!("cannot read {}: {e}", output_base.display()))?;
+        if !channel.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        for file in read_dir(&channel.path())? {
+            let file =
+                file.map_err(|e| format!("cannot read {}: {e}", channel.path().display()))?;
+            let name = file.file_name();
+            let Some((start, finish)) = name.to_str().and_then(crate::scan::chunk_span) else {
+                continue;
+            };
+            if finish <= from || start >= until {
+                continue;
+            }
+            let path = file.path();
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let modified = meta
+                .modified()
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let items = match scan.files.remove(&path) {
+                Some((m, len, items)) if m == modified && len == meta.len() => items,
+                _ => pending_items(&path)?,
+            };
+            for found in &items {
+                if found.airs_at <= from || found.airs_at >= until {
+                    continue;
+                }
+                let found = found.clone();
+                earliest
+                    .entry(found.path.clone())
+                    .and_modify(|e| {
+                        if found.airs_at < e.airs_at {
+                            *e = found.clone();
+                        }
+                    })
+                    .or_insert(found);
+            }
+            seen.insert(path, (modified, meta.len(), items));
+        }
+    }
+    // Files outside the span or gone from disk drop out of the scan.
+    scan.files = seen;
+    let mut out: Vec<PendingFile> = earliest.into_values().collect();
+    out.sort_by(|a, b| a.airs_at.cmp(&b.airs_at).then_with(|| a.path.cmp(&b.path)));
+    Ok(out)
+}
+
 /// A pending item's `(real file, loop)`, from its `metadata.pending`.
 fn pending_of(item: &PlayoutItem) -> Option<(String, bool)> {
     let pending = item.metadata.as_ref()?.get(PENDING_KEY)?;
@@ -489,7 +599,7 @@ pub fn swap_pending_items(
             len,
             loop_,
             start,
-            slot_ms,
+            finish,
         );
         let Some(mut template) = copy_item(&group[0]) else {
             items.extend(group);
@@ -1203,6 +1313,94 @@ mod tests {
         it
     }
 
+    /// The schedule's pending files between two instants: each file once, at
+    /// its earliest airing, with the plan its segment names. A file the window
+    /// cannot read fails the whole answer; one outside the window is not read.
+    #[tokio::test]
+    async fn pending_files_lists_each_scheduled_file_once_and_fails_whole() {
+        let base = TempDir::new().unwrap();
+        let channel = TempDir::new_in(base.path()).unwrap();
+        let with_plan = |id: &str, path: &str, start: OffsetDateTime| {
+            let mut it = pending_item(id, path, true, start, 600);
+            it.metadata.as_mut().unwrap()[PENDING_KEY]["plan"] =
+                serde_json::json!(format!("{path}.plan.json"));
+            it
+        };
+        write_playout(
+            &channel,
+            vec![
+                with_plan("b:0", "/r/early.mp4", datetime!(2026-08-16 11:00 UTC)),
+                with_plan("b:1", "/r/x.mp4", datetime!(2026-08-16 14:00 UTC)),
+                with_plan("b:2", "/r/x.mp4", datetime!(2026-08-16 13:00 UTC)),
+                pending_item(
+                    "b:3",
+                    "/r/y.mp4",
+                    false,
+                    datetime!(2026-08-16 13:30 UTC),
+                    60,
+                ),
+                with_plan("b:4", "/r/late.mp4", datetime!(2026-08-16 20:00 UTC)),
+            ],
+        )
+        .await;
+        let (from, until) = (
+            datetime!(2026-08-16 12:00 UTC),
+            datetime!(2026-08-16 15:00 UTC),
+        );
+        let mut scan = PendingScan::default();
+        let expected = vec![
+            PendingFile {
+                path: "/r/x.mp4".into(),
+                plan: Some("/r/x.mp4.plan.json".into()),
+                airs_at: datetime!(2026-08-16 13:00 UTC),
+            },
+            PendingFile {
+                path: "/r/y.mp4".into(),
+                plan: None,
+                airs_at: datetime!(2026-08-16 13:30 UTC),
+            },
+        ];
+        assert_eq!(
+            pending_files(base.path(), from, until, &mut scan).unwrap(),
+            expected
+        );
+        assert_eq!(
+            pending_files(base.path(), from, until, &mut scan).unwrap(),
+            expected,
+            "an unchanged file answers the same from the scan"
+        );
+
+        // A new generation rewrites the file: x now airs only at 14:00.
+        write_playout(
+            &channel,
+            vec![
+                with_plan("b:0", "/r/early.mp4", datetime!(2026-08-16 11:00 UTC)),
+                with_plan("b:1", "/r/x.mp4", datetime!(2026-08-16 14:00 UTC)),
+                with_plan("b:4", "/r/late.mp4", datetime!(2026-08-16 20:00 UTC)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            pending_files(base.path(), from, until, &mut scan).unwrap(),
+            vec![PendingFile {
+                path: "/r/x.mp4".into(),
+                plan: Some("/r/x.mp4.plan.json".into()),
+                airs_at: datetime!(2026-08-16 14:00 UTC),
+            }],
+            "a rewritten file is parsed again"
+        );
+
+        let other = TempDir::new_in(base.path()).unwrap();
+        let corrupt = |name: &str| std::fs::write(other.path().join(name), "{ not json").unwrap();
+        corrupt("20260817T000000.000000000Z_20260817T060000.000000000Z.json");
+        assert!(
+            pending_files(base.path(), from, until, &mut scan).is_ok(),
+            "outside the window"
+        );
+        corrupt("20260816T120000.000000000Z_20260816T180000.000000000Z.json");
+        assert!(pending_files(base.path(), from, until, &mut scan).is_err());
+    }
+
     fn len_4s(_: &Path) -> Option<u64> {
         Some(4_000)
     }
@@ -1624,6 +1822,7 @@ mod tests {
             source: SegmentSource::Pending {
                 path: real.into(),
                 stand_in: "/stand/in.mp4".into(),
+                plan: None,
             },
             duration: Dur::Fixed(12_000),
             loop_: true,
@@ -1693,5 +1892,33 @@ mod tests {
             ]
         );
         assert!(no_pending(&short));
+    }
+
+    /// A slot whose ends sit a fraction of a millisecond apart from a whole
+    /// count — a generation that began at `now` — swaps to copies whose last
+    /// one still finishes where the slot did. Ending short left a hole that
+    /// the roll tick's coverage check answered by wiping and regenerating the
+    /// channel's schedule.
+    #[test]
+    fn a_swap_finishes_where_the_slot_did_to_the_nanosecond() {
+        let dir = TempDir::new().unwrap();
+        let real = real_file(&dir);
+        let at = datetime!(2026-08-16 13:00:00 UTC);
+        let now = datetime!(2026-08-16 12:00:00 UTC);
+        let mut stand_in = emitted_looping_stand_in(&real, at);
+        let slot_end = stand_in.last().unwrap().finish + time::Duration::microseconds(916);
+        stand_in.last_mut().unwrap().finish = slot_end;
+        for len_ms in [len_20s, len_4s] {
+            let mut items: Vec<PlayoutItem> = stand_in.iter().filter_map(copy_item).collect();
+            assert_eq!(
+                swap_items(&mut items, "c", now, len_ms, &mut |_| true).len(),
+                1
+            );
+            assert_eq!(items.first().unwrap().start, at);
+            assert_eq!(items.last().unwrap().finish, slot_end);
+            for pair in items.windows(2) {
+                assert_eq!(pair[0].finish, pair[1].start);
+            }
+        }
     }
 }

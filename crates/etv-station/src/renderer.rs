@@ -12,15 +12,18 @@ use etv_render::queue::Queue;
 
 use crate::config::station::RendererConfig;
 
-/// What a plugin that queues a chapter names the bumper segment it airs it in:
-/// `chapter:<job>|<entry>|<entry>...`, `<job>` being the id `enqueue` printed
-/// (or `unqueued-<stem>` when it could not reach the renderer). The airings
-/// ledger carries the name, so `GET /api/channels/{ch}/chapters` can join a
-/// scheduled slot to the queue's plan and state.
+/// What a plugin that lays a chapter names the bumper segment it airs it in:
+/// `chapter:<stem>|<entry>|<entry>...`, `<stem>` being the file stem of the
+/// render the segment is pending on. The airings ledger carries the name, so
+/// `GET /api/channels/{ch}/chapters` can join a scheduled slot to the queue
+/// job whose output has that stem.
 pub const CHAPTER_SEGMENT_PREFIX: &str = "chapter:";
 
 /// Gigabytes the cache may take when `cache_cap_gb` is unset.
 pub const DEFAULT_CACHE_CAP_GB: u64 = 20;
+
+/// Minutes before air the sidecar queues a plan when `lead_minutes` is unset.
+pub const DEFAULT_LEAD_MINUTES: u64 = 120;
 
 /// The renderer's resolved locations. Environment variables replace the
 /// station config's `renderer:` section, key by key.
@@ -29,6 +32,8 @@ pub struct RendererPaths {
     pub queue_dir: PathBuf,
     pub cache_dir: PathBuf,
     pub cache_cap_bytes: u64,
+    /// How long before a pending file airs its plan is queued.
+    pub lead: time::Duration,
 }
 
 impl RendererPaths {
@@ -47,6 +52,12 @@ impl RendererPaths {
             })?,
             None => config.cache_cap_gb.unwrap_or(DEFAULT_CACHE_CAP_GB),
         };
+        let lead_minutes = match var("ETV_RENDER_LEAD_MINUTES") {
+            Some(raw) => raw.trim().parse::<u64>().map_err(|_| {
+                format!("ETV_RENDER_LEAD_MINUTES must be a whole number of minutes, got {raw:?}")
+            })?,
+            None => config.lead_minutes.unwrap_or(DEFAULT_LEAD_MINUTES),
+        };
         let mut missing = Vec::new();
         if queue.is_none() {
             missing.push("queue_dir (ETV_RENDER_QUEUE_DIR)");
@@ -59,6 +70,7 @@ impl RendererPaths {
                 queue_dir: PathBuf::from(queue),
                 cache_dir: PathBuf::from(cache),
                 cache_cap_bytes: cap_gb.saturating_mul(1_000_000_000),
+                lead: time::Duration::minutes(lead_minutes as i64),
             }),
             _ => Err(format!(
                 "the chapter renderer is not configured: set renderer.{}",
@@ -89,7 +101,30 @@ mod tests {
             queue_dir: queue.map(String::from),
             cache_dir: cache.map(String::from),
             cache_cap_gb: cap,
+            lead_minutes: None,
         }
+    }
+
+    #[test]
+    fn the_lead_defaults_to_two_hours_and_the_environment_replaces_it() {
+        let config = cfg(Some("/q"), Some("/c"), None);
+        let paths = RendererPaths::resolve(&config, |_| None).unwrap();
+        assert_eq!(paths.lead, time::Duration::minutes(120));
+        let set = RendererConfig {
+            lead_minutes: Some(45),
+            ..config.clone()
+        };
+        assert_eq!(
+            RendererPaths::resolve(&set, |_| None).unwrap().lead,
+            time::Duration::minutes(45)
+        );
+        let env = |k: &str| (k == "ETV_RENDER_LEAD_MINUTES").then(|| "30".to_string());
+        assert_eq!(
+            RendererPaths::resolve(&set, env).unwrap().lead,
+            time::Duration::minutes(30)
+        );
+        let bad = |k: &str| (k == "ETV_RENDER_LEAD_MINUTES").then(|| "soon".to_string());
+        assert!(RendererPaths::resolve(&set, bad).is_err());
     }
 
     #[test]
@@ -123,9 +158,9 @@ mod tests {
     }
 }
 
-/// The command-line side: `render`, `enqueue` and `render-sidecar`. Each reads
-/// only the station config's `renderer:` section, so none of them loads
-/// channels or opens the catalog.
+/// The command-line side: `render` and `render-sidecar`. Each reads the
+/// station config's `renderer:` section; the sidecar also reads `output_base`
+/// for the schedule. Neither loads channels or opens the catalog.
 pub mod cli {
     use std::path::Path;
     use std::process::ExitCode;
@@ -134,13 +169,14 @@ pub mod cli {
 
     use etv_render::Plan;
     use time::OffsetDateTime;
-    use time::format_description::well_known::Rfc3339;
 
     use super::RendererPaths;
     use crate::config::{self, RendererConfig};
 
-    /// How often the sidecar looks for a new plan when the queue is empty.
+    /// How often the sidecar looks for a new job when the queue is empty.
     const POLL: Duration = Duration::from_secs(2);
+    /// How often the sidecar reads the schedule to bring its queue in line.
+    const SYNC_EVERY: Duration = Duration::from_secs(30);
 
     fn paths(config_path: Option<&Path>) -> Result<RendererPaths, String> {
         let section = match config_path {
@@ -180,51 +216,24 @@ pub mod cli {
         }
     }
 
-    /// `enqueue <plan.json>`: put the plan on the queue and print its job id.
-    pub fn enqueue(config_path: Option<&Path>, plan_path: &Path, air_at: Option<&str>) -> ExitCode {
-        let run = || -> Result<String, String> {
-            let paths = paths(config_path)?;
-            let plan = read_plan(plan_path)?;
-            let air_at = air_at
-                .map(|raw| {
-                    OffsetDateTime::parse(raw, &Rfc3339)
-                        .map_err(|e| format!("--air-at must be an RFC 3339 time like 2026-10-23T19:00:00Z, got {raw:?}: {e}"))
-                })
-                .transpose()?;
-            let job = paths
-                .queue()
-                .enqueue(&plan, air_at, OffsetDateTime::now_utc())
-                .map_err(|e| e.to_string())?;
-            if job.status == etv_render::queue::Status::Missed {
-                eprintln!(
-                    "enqueue: job {} is missed: its air time {} has passed, so it will not render",
-                    job.id,
-                    air_at
-                        .and_then(|t| t.format(&Rfc3339).ok())
-                        .unwrap_or_default()
-                );
-            }
-            Ok(job.id)
-        };
-        match run() {
-            Ok(id) => {
-                println!("{id}");
-                ExitCode::SUCCESS
-            }
-            Err(message) => {
-                eprintln!("enqueue failed: {message}");
-                ExitCode::FAILURE
-            }
-        }
-    }
-
     /// `render-sidecar`: render queued plans one at a time until killed.
     /// Exit status `render-sidecar` returns when no queue or cache is
     /// configured, so the container entrypoint can tell it from a crash.
     pub const NOT_CONFIGURED: u8 = 78;
 
     pub fn sidecar(config_path: Option<&Path>) -> ExitCode {
-        let paths = match paths(config_path) {
+        let Some(config_path) = config_path else {
+            eprintln!("render-sidecar: needs --config, to read the schedule under output_base");
+            return ExitCode::from(NOT_CONFIGURED);
+        };
+        let station = match config::read_station(config_path) {
+            Ok(station) => station,
+            Err(e) => {
+                eprintln!("render-sidecar: cannot read the station config: {e}");
+                return ExitCode::from(NOT_CONFIGURED);
+            }
+        };
+        let paths = match RendererPaths::from_env(&station.renderer) {
             Ok(p) => p,
             Err(message) => {
                 eprintln!("render-sidecar: {message}");
@@ -237,6 +246,22 @@ pub mod cli {
             eprintln!("render-sidecar: cannot create the queue and cache directories: {e}");
             return ExitCode::FAILURE;
         }
+        let output_base = station.output_base.clone();
+        let lead = paths.lead;
+        let scan = std::cell::RefCell::new(crate::reconcile::PendingScan::default());
+        let schedule = move |now: OffsetDateTime| {
+            let mut scan = scan.borrow_mut();
+            crate::reconcile::pending_files(&output_base, now, now + lead, &mut scan).map(|files| {
+                files
+                    .into_iter()
+                    .map(|f| etv_render::queue::Wanted {
+                        output: f.path,
+                        plan: f.plan,
+                        air_at: f.airs_at,
+                    })
+                    .collect()
+            })
+        };
         let stop = AtomicBool::new(false);
         etv_render::queue::run_sidecar(
             &paths.queue(),
@@ -244,6 +269,8 @@ pub mod cli {
             paths.cache_cap_bytes,
             &stop,
             POLL,
+            &schedule,
+            SYNC_EVERY,
         );
         ExitCode::SUCCESS
     }

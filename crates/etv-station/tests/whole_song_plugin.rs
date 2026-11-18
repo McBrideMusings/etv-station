@@ -1,12 +1,12 @@
 //! Acceptance tests for the whole-song bumper (`examples/plugins/bumpers/whole_song.rhai`):
 //! it reads audio facts through `ctx.catalog`, walks a set of whole songs, picks a
 //! seam recipe per pair by rule, writes a render plan the renderer accepts (the
-//! layers and cuts, with the songs and seams in `notes`), queues it and airs it as
-//! a pending segment.
+//! layers and cuts, with the songs and seams in `notes`) and airs it as a pending
+//! segment naming that plan, which the render sidecar queues as air time nears.
 //!
-//! The catalog and facts are written fresh by this file; `enqueue` and `ffmpeg`
-//! are shell stubs, so the test proves the plugin's plan and arguments rather than
-//! a real render.
+//! The catalog and facts are written fresh by this file; `ffmpeg` is a shell
+//! stub, so the test proves the plugin's plan and segment rather than a real
+//! render.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -140,7 +140,6 @@ impl Fixture {
     }
 
     fn input(&self, songs: &[Song], entry: &str, gap_ms: u64) -> BumperInput {
-        let enqueue = stub(self.dir.path(), "enqueue", "echo job-9");
         let ffmpeg = stub(
             self.dir.path(),
             "ffmpeg",
@@ -158,7 +157,6 @@ impl Fixture {
             config: Some(json!({
                 "expr": "item.library == \"Music Videos\"",
                 "dir": self.work,
-                "enqueue": enqueue,
                 "ffmpeg": ffmpeg,
                 "entry": entry,
             })),
@@ -262,15 +260,25 @@ fn a_set_plan_fills_the_gap_with_songs_entering_at_their_landing_bars() {
     assert_eq!(plan.cards.len(), n.songs.len());
 
     let segment = &built.timeline.segments[0];
+    let stem = plan.output.file_stem().unwrap().to_str().unwrap();
     assert!(
-        segment.name.starts_with("chapter:job-9|"),
+        segment.name.starts_with(&format!("chapter:{stem}|")),
         "{}",
         segment.name
     );
-    let SegmentSource::Pending { path, stand_in } = &segment.source else {
+    let SegmentSource::Pending {
+        path,
+        stand_in,
+        plan: named,
+    } = &segment.source
+    else {
         panic!("expected a pending segment, got {:?}", segment.source);
     };
     assert_eq!(path, &plan.output);
+    assert_eq!(
+        named.as_deref(),
+        Some(plan.output.with_extension("plan.json").as_path())
+    );
     assert!(stand_in.exists());
     let etv_station::bumper::timeline::Duration::Fixed(aired_ms) = segment.duration else {
         panic!("expected a fixed slot, got {:?}", segment.duration);
@@ -330,22 +338,6 @@ fn a_start_entry_plays_each_song_from_its_first_second_and_never_bass_swaps() {
     for seam in &n.seams {
         assert_ne!(seam.recipe, "bass_swap", "{seam:?}");
     }
-}
-
-#[test]
-fn a_build_with_the_renderer_absent_still_emits_a_timeline() {
-    let f = Fixture::new();
-    let mut input = f.input(&four_songs(), "landing", 600_000);
-    input.config.as_mut().unwrap()["enqueue"] = json!("/nonexistent/etv-station");
-    let built = build(&plugin_path(), &input).unwrap();
-    let segment = &built.timeline.segments[0];
-    assert!(
-        segment.name.starts_with("chapter:unqueued-"),
-        "{}",
-        segment.name
-    );
-    assert!(matches!(segment.source, SegmentSource::Pending { .. }));
-    f.plan();
 }
 
 #[test]

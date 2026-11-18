@@ -271,7 +271,7 @@ impl Plan {
     }
 
     /// Structure and arithmetic only: every rule here holds without touching a
-    /// disk, so `enqueue` can refuse a malformed plan at once. A named file that
+    /// disk, so queueing can refuse a malformed plan at once. A named file that
     /// does not exist is the renderer's finding, recorded against the job.
     pub fn validate(&self) -> Result<(), PlanError> {
         let bad = |msg: String| Err(PlanError::Invalid(msg));

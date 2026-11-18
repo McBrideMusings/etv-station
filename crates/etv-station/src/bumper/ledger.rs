@@ -116,6 +116,7 @@ mod tests {
                 SegmentSource::Pending {
                     path: "/r/real.mp4".into(),
                     stand_in: "/r/stand.mp4".into(),
+                    plan: None,
                 },
                 3_000,
             )],

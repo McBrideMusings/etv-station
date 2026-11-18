@@ -136,7 +136,7 @@ fn first_gap_airs_the_stand_in_pending_then_the_landed_render_airs() {
     let f = Fixture::new();
     let first = build(&plugin_path(), &f.input(json!({}), BOTH)).unwrap();
     let seg = &first.timeline.segments[0];
-    let SegmentSource::Pending { path, stand_in } = &seg.source else {
+    let SegmentSource::Pending { path, stand_in, .. } = &seg.source else {
         panic!("expected pending, got {:?}", seg.source);
     };
     assert_eq!(stand_in, &f.stand_in);

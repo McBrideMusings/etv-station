@@ -33,5 +33,3 @@ rule:
             expr: 'item.library == "Music Videos"'
             dir: tmp/sets
             entry: landing
-            enqueue: target/debug/etv-station
-            enqueue_args: ["--config", "examples/station-megamix.yaml"]

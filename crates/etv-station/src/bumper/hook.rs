@@ -1364,6 +1364,20 @@ fn bumper_engine(host: Host) -> rhai::Engine {
                     SegmentSource::Pending {
                         path: PathBuf::from(path),
                         stand_in: PathBuf::from(stand_in),
+                        plan: None,
+                    },
+                )
+            },
+        )
+        .register_fn(
+            "pending",
+            |s: &mut SegmentBuilder, path: &str, stand_in: &str, plan: &str| {
+                s.set_source(
+                    "pending",
+                    SegmentSource::Pending {
+                        path: PathBuf::from(path),
+                        stand_in: PathBuf::from(stand_in),
+                        plan: Some(PathBuf::from(plan)),
                     },
                 )
             },
@@ -1577,7 +1591,8 @@ fn build(ctx) {
             built.timeline.segments[0].source,
             SegmentSource::Pending {
                 path: "/r/real.mp4".into(),
-                stand_in: "/r/stand.mp4".into()
+                stand_in: "/r/stand.mp4".into(),
+                plan: None,
             }
         );
         assert_eq!(built.timeline.segments[0].name, "pending0");

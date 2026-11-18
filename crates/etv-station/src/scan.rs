@@ -31,17 +31,7 @@ pub async fn scan_output_folder(folder: &Path) -> Result<Vec<DiscoveredFile>, St
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if !name.ends_with(".json") {
-            continue;
-        }
-        let stem = &name[..name.len() - ".json".len()];
-        let Some((start_s, finish_s)) = split_start_finish(stem) else {
-            continue;
-        };
-        let Ok(start) = OffsetDateTime::parse(start_s, &DATE_FORMAT) else {
-            continue;
-        };
-        let Ok(finish) = OffsetDateTime::parse(finish_s, &DATE_FORMAT) else {
+        let Some((start, finish)) = chunk_span(name) else {
             continue;
         };
         out.push(DiscoveredFile {
@@ -265,6 +255,16 @@ pub async fn first_coverage_gap(
         }
     }
     Ok(None)
+}
+
+/// The span a playout file's name claims, `{start}_{finish}.json`, or `None`
+/// for any other file.
+pub fn chunk_span(name: &str) -> Option<(OffsetDateTime, OffsetDateTime)> {
+    let stem = name.strip_suffix(".json")?;
+    let (start_s, finish_s) = split_start_finish(stem)?;
+    let start = OffsetDateTime::parse(start_s, &DATE_FORMAT).ok()?;
+    let finish = OffsetDateTime::parse(finish_s, &DATE_FORMAT).ok()?;
+    Some((start, finish))
 }
 
 fn split_start_finish(stem: &str) -> Option<(&str, &str)> {

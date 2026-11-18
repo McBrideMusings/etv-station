@@ -71,10 +71,11 @@ impl<'a> From<&'a EmitContext<'a>> for Media<'a> {
     }
 }
 
-/// Fill `duration_ms` from `path` starting at `in_ms`. `window_ms` is how much
+/// Fill `begin..end` from `path` starting at `in_ms`. `window_ms` is how much
 /// of the file one play covers. A looping span longer than its window repeats
 /// the window, one item per repeat (`#n`); anything else is a single padded
-/// item ([`push_local_padded`]).
+/// item ([`push_local_padded`]). The last item finishes at `end` exactly, so a
+/// span whose ends carry sub-millisecond time leaves no hole behind it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn push_local_span(
     items: &mut Vec<PlayoutItem>,
@@ -85,10 +86,11 @@ pub(crate) fn push_local_span(
     window_ms: u64,
     loop_: bool,
     begin: OffsetDateTime,
-    duration_ms: u64,
+    end: OffsetDateTime,
 ) {
+    let duration_ms = span_ms(begin, end);
     if !(loop_ && window_ms > 0 && duration_ms > window_ms) {
-        push_local_padded(items, media, id_base, path, in_ms, begin, duration_ms);
+        push_local_padded(items, media, id_base, path, in_ms, begin, end);
         return;
     }
     let mut parts = vec![window_ms; (duration_ms / window_ms) as usize];
@@ -96,9 +98,14 @@ pub(crate) fn push_local_span(
     if tail > 0 {
         parts.push(tail);
     }
+    let last = parts.len() - 1;
     let mut at = begin;
     for (n, len) in parts.into_iter().enumerate() {
-        let finish = at + Duration::milliseconds(len as i64);
+        let finish = if n == last {
+            end
+        } else {
+            at + Duration::milliseconds(len as i64)
+        };
         let id = format!("{id_base}#{n}");
         let source = PlayoutItemSource::local(
             path.to_string_lossy().into_owned(),
@@ -110,9 +117,14 @@ pub(crate) fn push_local_span(
     }
 }
 
-/// Push one Local item playing `path` from `in_ms` for `duration_ms`. When the
-/// file ends sooner, the item is cut at the file's end and a black item
-/// (`#pad`) covers the rest.
+/// Whole milliseconds from `begin` to `end`, zero when `end` is not after it.
+fn span_ms(begin: OffsetDateTime, end: OffsetDateTime) -> u64 {
+    (end - begin).whole_milliseconds().max(0) as u64
+}
+
+/// Push one Local item playing `path` from `in_ms` across `begin..end`. When
+/// the file ends sooner, the item is cut at the file's end and a black item
+/// (`#pad`) covers the rest up to `end`.
 fn push_local_padded(
     items: &mut Vec<PlayoutItem>,
     media: &Media<'_>,
@@ -120,8 +132,9 @@ fn push_local_padded(
     path: &Path,
     in_ms: u64,
     begin: OffsetDateTime,
-    duration_ms: u64,
+    end: OffsetDateTime,
 ) {
+    let duration_ms = span_ms(begin, end);
     let playable = (media.len_ms)(path).map(|len| len.saturating_sub(in_ms));
     if playable.is_none() {
         tracing::warn!(
@@ -135,7 +148,11 @@ fn push_local_padded(
     let file_ms = playable.map_or(duration_ms, |p| p.min(duration_ms));
     let mut at = begin;
     if file_ms > 0 {
-        let finish = at + Duration::milliseconds(file_ms as i64);
+        let finish = if file_ms == duration_ms {
+            end
+        } else {
+            at + Duration::milliseconds(file_ms as i64)
+        };
         let source = PlayoutItemSource::local(
             path.to_string_lossy().into_owned(),
             Some(in_ms),
@@ -154,7 +171,7 @@ fn push_local_padded(
             window_ms = duration_ms,
             "a bumper file ends before its window; the rest is black"
         );
-        let finish = begin + Duration::milliseconds(duration_ms as i64);
+        let finish = end;
         let id = if file_ms == 0 {
             id.to_string()
         } else {
@@ -204,7 +221,7 @@ pub fn emit_timeline(
                     window,
                     seg.segment.loop_,
                     begin,
-                    seg.duration_ms,
+                    begin + Duration::milliseconds(seg.duration_ms as i64),
                 );
             }
             SegmentSource::Render { path, .. } => {
@@ -215,7 +232,7 @@ pub fn emit_timeline(
                     path,
                     0,
                     begin,
-                    seg.duration_ms,
+                    begin + Duration::milliseconds(seg.duration_ms as i64),
                 );
             }
             SegmentSource::Pending { stand_in, .. } => {
@@ -235,7 +252,7 @@ pub fn emit_timeline(
                     window,
                     seg.segment.loop_,
                     begin,
-                    seg.duration_ms,
+                    begin + Duration::milliseconds(seg.duration_ms as i64),
                 );
             }
             SegmentSource::Http { url, in_ms, .. } => {
@@ -300,11 +317,14 @@ pub fn emit_timeline(
                 "segment": seg.segment.name,
                 "vars": seg.segment.overlay.as_ref().map(|o| &o.vars),
             });
-            if let SegmentSource::Pending { path, .. } = &seg.segment.source {
+            if let SegmentSource::Pending { path, plan, .. } = &seg.segment.source {
                 metadata[PENDING_KEY] = json!({
                     "path": path,
                     "loop": seg.segment.loop_,
                 });
+                if let Some(plan) = plan {
+                    metadata[PENDING_KEY]["plan"] = json!(plan);
+                }
             }
             item.metadata = Some(metadata);
         }
@@ -1105,6 +1125,7 @@ mod tests {
             SegmentSource::Pending {
                 path: "/r/real.mp4".into(),
                 stand_in: "/r/stand.mp4".into(),
+                plan: Some("/r/real.plan.json".into()),
             },
             Dur::Fixed(4_000),
         );
@@ -1124,6 +1145,7 @@ mod tests {
         let meta = items[0].metadata.as_ref().unwrap();
         assert_eq!(meta[PENDING_KEY]["path"], "/r/real.mp4");
         assert_eq!(meta[PENDING_KEY]["loop"], true);
+        assert_eq!(meta[PENDING_KEY]["plan"], "/r/real.plan.json");
     }
 
     #[test]
@@ -1134,6 +1156,7 @@ mod tests {
                 SegmentSource::Pending {
                     path: "/r/real.mp4".into(),
                     stand_in: "/r/stand.mp4".into(),
+                    plan: None,
                 },
                 Dur::Fixed(10_000),
             );

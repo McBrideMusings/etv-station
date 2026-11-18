@@ -22,9 +22,6 @@
 //   artist_field:    item field holding the artist for the card, default "show"
 //   card_script:     overlay script that draws the card copy, relative to the
 //                    channel config's directory; unset carries no overlay
-//   enqueue:         program run as `<enqueue> <enqueue_args...> enqueue <plan> --air-at <t>`,
-//                    default "etv-station"
-//   enqueue_args:    extra arguments before `enqueue`, default []
 //   ffmpeg:          program that makes the stand-in, default "ffmpeg"
 //
 // The recipe per seam, as the autodj spike's round 4 settled it: echo_out when the
@@ -38,7 +35,9 @@
 // ride before its seam or the end of the set keeps the swap's tempo instead.
 //
 // Beside each render it writes <stem>.plan.json and <stem>.audit.txt (one line
-// per seam). The segment is named `chapter:<job>|<entry>|...` so `GET
+// per seam). The segment is pending on <stem>.mp4 with <stem>.plan.json
+// as its plan, which the render sidecar queues as the set's air time nears. It is
+// named `chapter:<stem>|<entry>|...` so `GET
 // /api/channels/<n>/chapters`, `admin audit` and the `tail` check read it the
 // way they read a megamix chapter.
 fn hooks() { ["bumper"] }
@@ -292,25 +291,6 @@ fn fnv(text) {
     h
 }
 
-fn pad2(n) { if n < 10 { "0" + n } else { n.to_string() } }
-
-// Unix seconds as an RFC 3339 UTC time, the form `enqueue --air-at` reads.
-fn rfc3339(secs) {
-    let days = secs / 86400;
-    let rem = secs % 86400;
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    if m <= 2 { y += 1; }
-    y.to_string() + "-" + pad2(m) + "-" + pad2(d) + "T" + pad2(rem / 3600) + ":" + pad2((rem % 3600) / 60) + ":" + pad2(rem % 60) + "Z"
-}
-
 // The song's bar grid: seconds of its first bar and of each bar after it, as the
 // analyzer numbered them (bar 0 is the first downbeat at or after 0 s).
 fn bar_seconds(item) { 4.0 * num(item.audio.beat_grid.slope) }
@@ -429,32 +409,6 @@ fn write_file(ctx, path, text) {
     if made.code != 0 { throw "whole_song: could not make the folder for " + path + ": " + made.stderr; }
     let r = ctx.exec("sh", ["-c", "printf %s \"$1\" > \"$2\"", "sh", text, path]);
     if r.code != 0 { throw "whole_song: could not write " + path + ": " + r.stderr; }
-}
-
-// The id the renderer filed the plan under, or () when the renderer is absent.
-fn enqueue(ctx, cfg, plan_path, air_at) {
-    let program = conf(cfg, "enqueue", "etv-station");
-    let args = [];
-    for a in conf(cfg, "enqueue_args", []) { args.push(a); }
-    args.push("enqueue");
-    args.push(plan_path);
-    if air_at != () {
-        args.push("--air-at");
-        args.push(rfc3339(air_at));
-    }
-    try {
-        let r = ctx.exec(program, args);
-        if r.code == 0 {
-            // trim() works in place
-            let id = r.stdout;
-            id.trim();
-            return id;
-        }
-        log("whole_song: enqueue failed code=" + r.code + " stderr=" + r.stderr);
-    } catch (e) {
-        log("whole_song: enqueue unavailable: " + e);
-    }
-    ()
 }
 
 // A ten-second black clip with a brown-noise bed; a pending set loops it.
@@ -631,13 +585,11 @@ fn build(ctx) {
     if text == "" { text = "no seams: " + songs[0].title + " (" + songs[0].entry_id + ") fills the gap\n"; }
     write_file(ctx, cfg.dir + "/" + stem + ".audit.txt", text);
 
-    let air_at = if ctx.next == () { () } else { ctx.next.start - ctx.gap_ms / 1000 };
-    let job = enqueue(ctx, cfg, plan_path, air_at);
     let set_ms = (set_s * 1000.0).round().to_int();
 
-    let names = "chapter:" + (if job == () { "unqueued-" + stem } else { job });
+    let names = "chapter:" + stem;
     for s in songs { names += "|" + s.entry_id; }
-    log("whole_song: set=" + names + " songs=" + songs.len() + " seconds=" + set_s + " queued=" + (job != ()));
+    log("whole_song: set=" + names + " songs=" + songs.len() + " seconds=" + set_s);
     for n in notes { log("whole_song: " + n); }
 
     let t_line = timeline();
@@ -646,7 +598,7 @@ fn build(ctx) {
     if standing == () {
         seg = seg.black().looped();
     } else {
-        seg = seg.pending(plan.output, standing).looped().own_audio();
+        seg = seg.pending(plan.output, standing, plan_path).looped().own_audio();
     }
     seg = seg.fixed_ms(set_ms).name(names);
     if cfg.card_script != () {
