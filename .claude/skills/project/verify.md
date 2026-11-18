@@ -694,6 +694,32 @@ Expect, for a film with a Plex trailer, an `http` item whose `uri` starts `{{PLE
 
 Channels › Graphics plays those items through `etv-overlay watch --item`, one process per item, and joins them into one mp4. Prove it from the API: `POST /api/channels/<ch>/graphics/render` with `{"kind":"bumper","script":"<abs path>","gap":"8s"}`, then `tools/ui-get.sh /api/renders/<render>` and expect `duration` of `8.0` (agreeing with `ffprobe` on the file under the `ui-renders` directory beside the catalog) and a `log` that names each `etv-overlay watch` invocation. A script that throws gives `state: "failed"` with its message in `log`.
 
+## Verifying the megamix (channel 103)
+
+A queued job, a `render.done` event and a chapter in state `rendered` or `aired` prove that the renderer ran. They say nothing about what the chapter plays. Before you call the megamix working, read the rendered chapters' plans and report two numbers for each one: how many seconds each song plays, and how many seconds the picture shows a song whose vocal is not in the mix. Then compare those numbers with what pierce asked for.
+
+```sh
+tools/ui-get.sh /api/channels/103-megamix/chapters --prod > /private/tmp/claude/etv-station/chapters.json
+python3 -I - /private/tmp/claude/etv-station/chapters.json <<'EOF'
+import json, sys
+for ch in json.load(open(sys.argv[1]))["chapters"]:
+    if ch["state"] not in ("rendered", "aired"): continue
+    p = ch.get("plan") or {}
+    if "notes" not in p: print(ch["name"][:22], ch["state"], "plan has no layers (older format, or none): render it again before judging"); continue
+    bar = p["notes"]["bar_seconds"]
+    per_song = [round((h["vocal_over_bars"] + h["full_bars"]) * bar, 1) for h in p["notes"]["hooks"]]
+    bad, t = 0.0, 0.0
+    while t < p["duration_s"]:
+        heard = {l["source"] for l in p["layers"] if l["stem"] == "vocals" and l["out_start_s"] <= t < l["out_start_s"] + l["out_len_s"]}
+        shown = [k["source"] for k in p["cuts"] if k["out_start_s"] <= t < k["out_start_s"] + k["out_len_s"]]
+        if shown and shown[0] not in heard: bad += 0.01
+        t += 0.01
+    print(ch["name"][:22], ch["state"], "per-song s", per_song, "unheard song on screen %.1f of %.1f s" % (bad, p["duration_s"]))
+EOF
+```
+
+Each line names a chapter, its seconds per song and its seconds of picture showing a song you cannot hear. If any number contradicts what pierce asked for (song length, cut rate, the on-screen song's own audio being heard), the megamix is not working, however clean the queue looks. Say so, and give the numbers.
+
 ## Verifying the block card and pool labels
 
 A pool's `label:`/`advisory:` ride on every item it draws as
