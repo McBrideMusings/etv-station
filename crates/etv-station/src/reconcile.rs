@@ -402,27 +402,34 @@ pub struct PendingScan {
     files: HashMap<PathBuf, (std::time::SystemTime, u64, Vec<PendingFile>)>,
 }
 
-/// Every pending item in a playout file, each at its own start.
-fn pending_items(path: &Path) -> Result<Vec<PendingFile>, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+/// Every pending item in a playout file, each at its own start; `None` when
+/// the file is gone, since the schedule no longer holds it.
+fn pending_items(path: &Path) -> Result<Option<Vec<PendingFile>>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
     let playout: Playout = serde_json::from_slice(&bytes)
         .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
-    Ok(playout
-        .items
-        .iter()
-        .filter_map(|item| {
-            let pending = item.metadata.as_ref()?.get(PENDING_KEY)?;
-            let real = pending.get("path")?.as_str()?;
-            Some(PendingFile {
-                path: PathBuf::from(real),
-                plan: pending
-                    .get("plan")
-                    .and_then(|p| p.as_str())
-                    .map(PathBuf::from),
-                airs_at: item.start,
+    Ok(Some(
+        playout
+            .items
+            .iter()
+            .filter_map(|item| {
+                let pending = item.metadata.as_ref()?.get(PENDING_KEY)?;
+                let real = pending.get("path")?.as_str()?;
+                Some(PendingFile {
+                    path: PathBuf::from(real),
+                    plan: pending
+                        .get("plan")
+                        .and_then(|p| p.as_str())
+                        .map(PathBuf::from),
+                    airs_at: item.start,
+                })
             })
-        })
-        .collect())
+            .collect(),
+    ))
 }
 
 /// Every pending file a channel under `output_base` airs after `from` and
@@ -459,15 +466,22 @@ pub fn pending_files(
                 continue;
             }
             let path = file.path();
-            let meta = file
-                .metadata()
-                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            // A file deleted since the listing (a regeneration replaced the
+            // chunk) is no longer in the schedule, so it is skipped.
+            let meta = match file.metadata() {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+            };
             let modified = meta
                 .modified()
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             let items = match scan.files.remove(&path) {
                 Some((m, len, items)) if m == modified && len == meta.len() => items,
-                _ => pending_items(&path)?,
+                _ => match pending_items(&path)? {
+                    Some(items) => items,
+                    None => continue,
+                },
             };
             for found in &items {
                 if found.airs_at <= from || found.airs_at >= until {
@@ -1399,6 +1413,16 @@ mod tests {
         );
         corrupt("20260816T120000.000000000Z_20260816T180000.000000000Z.json");
         assert!(pending_files(base.path(), from, until, &mut scan).is_err());
+    }
+
+    /// A playout file deleted between the listing and the read is no longer in
+    /// the schedule: it reads as nothing, not as an error that fails the pass.
+    #[test]
+    fn a_playout_file_gone_before_the_read_holds_nothing() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(pending_items(&dir.path().join("gone.json")), Ok(None));
+        std::fs::write(dir.path().join("bad.json"), "{ not json").unwrap();
+        assert!(pending_items(&dir.path().join("bad.json")).is_err());
     }
 
     fn len_4s(_: &Path) -> Option<u64> {
