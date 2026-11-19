@@ -76,10 +76,17 @@ const SERVICES: &[(&str, &str)] = &[
 
 /// The environment variables a plugin may name as `{{NAME}}` in a
 /// [`call`]'s URL: where the station reaches Plex and Tautulli, and the
-/// credential for each. The value is substituted here, in the station, so a
+/// credential for each, and where it reaches the plex-db-ex explorer (no
+/// credential: ADR 0024). The value is substituted here, in the station, so a
 /// script can reach a service without ever holding its credential; the
 /// response is the script's to read.
-pub const URL_ENV: &[&str] = &["PLEX_URL", "PLEX_TOKEN", "TAUTULLI_URL", "TAUTULLI_API_KEY"];
+pub const URL_ENV: &[&str] = &[
+    "PLEX_URL",
+    "PLEX_TOKEN",
+    "TAUTULLI_URL",
+    "TAUTULLI_API_KEY",
+    crate::plexdb_ex::URL_ENV,
+];
 
 /// `url` with each `{{NAME}}` for a [`URL_ENV`] name replaced by that
 /// variable's value. Any other `{{...}}` is left as written. A named variable
@@ -118,12 +125,12 @@ fn expand_url_with(url: &str, lookup: impl Fn(&str) -> Option<String>) -> Result
     Ok(out)
 }
 
-/// The host `url` reaches, for a log line: each service's `{{..._URL}}` is
-/// filled in (left as written when unset), and the credentials, path and
-/// query are dropped.
+/// The host `url` reaches, for a log line: each `{{..._URL}}` is filled in
+/// (left as written when unset), and the credentials, path and query are
+/// dropped.
 pub fn display_host(url: &str) -> String {
     let mut shown = url.to_string();
-    for (url_var, _) in SERVICES {
+    for url_var in URL_ENV.iter().filter(|v| v.ends_with("_URL")) {
         let value = std::env::var(url_var).unwrap_or_default();
         if !value.is_empty() {
             shown = shown.replace(&format!("{{{{{url_var}}}}}"), &value);
@@ -134,8 +141,9 @@ pub fn display_host(url: &str) -> String {
 
 /// `method` `url` with `body` (sent only when non-empty), returning the
 /// response body as text. A 4xx/5xx status, a transport failure and a timeout
-/// are all errors. `{{PLEX_URL}}`, `{{PLEX_TOKEN}}`, `{{TAUTULLI_URL}}` and
-/// `{{TAUTULLI_API_KEY}}` in `url` are filled from the environment ([`URL_ENV`]).
+/// are all errors. `{{PLEX_URL}}`, `{{PLEX_TOKEN}}`, `{{TAUTULLI_URL}}`,
+/// `{{TAUTULLI_API_KEY}}` and `{{PLEXDB_EX_URL}}` in `url` are filled from the
+/// environment ([`URL_ENV`]).
 pub fn call(url: &str, method: &str, body: &str, timeout: Duration) -> Result<String, String> {
     call_with(url, method, body, &[], timeout)
 }
@@ -415,6 +423,17 @@ pub(crate) mod tests {
         assert!(e.contains("PLEX_URL is not set"), "{e}");
         let empty = expand_url_with("{{PLEX_TOKEN}}", |_| Some(String::new())).unwrap_err();
         assert!(empty.contains("PLEX_TOKEN is not set"), "{empty}");
+    }
+
+    #[test]
+    fn a_url_names_the_plexdb_explorer_by_placeholder() {
+        let env = |name: &str| (name == "PLEXDB_EX_URL").then(|| "http://px.lan:5194".to_string());
+        assert_eq!(
+            expand_url_with("{{PLEXDB_EX_URL}}/taste", env).unwrap(),
+            "http://px.lan:5194/taste"
+        );
+        let unset = expand_url_with("{{PLEXDB_EX_URL}}/taste", |_| None).unwrap_err();
+        assert!(unset.contains("PLEXDB_EX_URL is not set"), "{unset}");
     }
 
     #[test]

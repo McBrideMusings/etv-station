@@ -1234,9 +1234,10 @@ function audioHint(a) {
 
 function drawAudioHealth(a) {
   if (!a || a.error) return '';
-  const s = a.snapshot || {};
-  const where = s.path ? ` Snapshot ${esc(s.path)}${s.mtime ? `, written ${bothClocks(s.mtime)}` : ''}.` : '';
-  const line = `Audio facts: ${esc(a.with_facts)} of ${esc(a.in_snapshot)} snapshot entries have them, ${esc(a.without_facts)} do not (${esc(a.entries)} live catalog entries).${where}`;
+  const x = a.explorer || {};
+  const where = x.url ? ` Explorer ${esc(x.url)}.` : '';
+  const counting = a.counting ? ' Counting now; reload in a minute.' : '';
+  const line = `Audio facts: ${esc(a.with_facts)} of ${esc(a.in_store)} entries in plex-db-ex have them, ${esc(a.without_facts)} do not (${esc(a.entries)} live catalog entries).${where}${counting}`;
   return a.problem ? `<div class="notice">${line} ${esc(a.problem)}</div>` : `<p class="muted">${line}</p>`;
 }
 

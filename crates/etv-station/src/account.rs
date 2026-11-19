@@ -7,7 +7,7 @@
 //! whatever service it reaches itself — is the plugin's (ADR 0014).
 //!
 //! Plex's own `/accounts` is the only source consulted, so the id that comes
-//! back is already in the id space `plexdb_reader` keys its store on.
+//! back is already in the id space plex-db-ex keys `/accounts/{id}/taste` on.
 
 use crate::catalog::ingest::plex::PlexAccount;
 

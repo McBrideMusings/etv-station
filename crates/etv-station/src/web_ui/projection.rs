@@ -8,13 +8,12 @@
 //! ([`SimCache::spawn`]) runs queued jobs one at a time.
 //!
 //! The key is a content hash of: the channel file, every `.rhai` script it
-//! names plus the scripts those import (and the size and mtime of the
-//! datastores a pool is granted, too large to read), `station.yaml`, the state
+//! names plus the scripts those import, `station.yaml`, the state
 //! the projection starts from (the `.resume` sidecar and the recent airings),
 //! the channel's resolved candidate set (entry ids and durations) and
 //! [`crate::simulate::SIMULATOR_REVISION`], and the draft's edit set (a draft
-//! with no edit hashes as no draft, so it shares the deployed projection). No file mtime outside the datastore
-//! stamp, no catalog mtime and no binary build time is in it, so the same
+//! with no edit hashes as no draft, so it shares the deployed projection). No file
+//! mtime, no catalog mtime and no binary build time is in it, so the same
 //! inputs give the same projection across deploys and across midnight. The
 //! cache directory lives on the data volume beside the catalog.
 
@@ -176,6 +175,7 @@ struct Inner {
 
 pub struct SimCache {
     station_path: PathBuf,
+    explorer: Option<crate::plexdb_ex::Explorer>,
     catalog_path: PathBuf,
     dir: PathBuf,
     inner: Mutex<Inner>,
@@ -200,43 +200,12 @@ fn sha_hex(parts: &[&[u8]]) -> String {
     format!("{:x}", h.finalize())
 }
 
-fn mtime_ns(path: &Path) -> Option<u128> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-}
-
 /// Every string in `value` that names a `.rhai` script.
 fn collect_scripts(value: &Value, out: &mut Vec<String>) {
     match value {
         Value::String(s) if s.ends_with(".rhai") => out.push(s.clone()),
         Value::Array(a) => a.iter().for_each(|v| collect_scripts(v, out)),
         Value::Object(o) => o.values().for_each(|v| collect_scripts(v, out)),
-        _ => {}
-    }
-}
-
-/// Every `path` of a `datastores:` grant in `value`.
-fn collect_datastores(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::Array(a) => a.iter().for_each(|v| collect_datastores(v, out)),
-        Value::Object(o) => {
-            for (k, v) in o {
-                if k == "datastores" {
-                    if let Value::Array(grants) = v {
-                        out.extend(
-                            grants
-                                .iter()
-                                .filter_map(|g| g.get("path")?.as_str().map(str::to_string)),
-                        );
-                    }
-                } else {
-                    collect_datastores(v, out);
-                }
-            }
-        }
         _ => {}
     }
 }
@@ -294,22 +263,6 @@ fn script_files(config_path: &Path, config: &ChannelConfig) -> Vec<PathBuf> {
     scripts
 }
 
-/// The datastores (plexdb snapshots) a channel's pools are granted, sorted.
-fn datastore_files(config: &ChannelConfig) -> Vec<PathBuf> {
-    let mut grants = Vec::new();
-    if let Ok(v) = serde_json::to_value(config) {
-        collect_datastores(&v, &mut grants);
-    }
-    // Grants are stored as written (`${VAR}`); the plexdb file is the expanded path.
-    let mut out: Vec<PathBuf> = grants
-        .into_iter()
-        .map(|p| PathBuf::from(config::expand_process_env(&p).unwrap_or(p)))
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
-
 /// What a projection starts from, as one digest: where it starts, the
 /// `.resume` sidecar's bytes, the recent airings and the two cursors.
 pub fn frontier_digest(
@@ -354,17 +307,13 @@ pub fn digests(
         Ok(bytes) => sha_hex(&[b"file", &bytes]),
         Err(_) => sha_hex(&[b"absent"]),
     };
-    let mut scripts: Vec<String> = script_files(config_path, config)
+    let scripts: Vec<String> = script_files(config_path, config)
         .iter()
         .map(|p| {
             let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
             format!("{}={}", name.unwrap_or_default(), file(p))
         })
         .collect();
-    scripts.extend(datastore_files(config).iter().map(|p| {
-        let len = std::fs::metadata(p).map(|m| m.len()).ok();
-        format!("{}={len:?}@{:?}", p.display(), mtime_ns(p))
-    }));
     let scripts = sha_hex(&[scripts.join("\n").as_bytes()]);
     BTreeMap::from([
         (
@@ -396,9 +345,15 @@ pub fn changed_inputs(old: &Digests, new: &Digests) -> Vec<String> {
 }
 
 impl SimCache {
-    pub fn new(station_path: PathBuf, catalog_path: PathBuf, dir: PathBuf) -> Arc<Self> {
+    pub fn new(
+        station_path: PathBuf,
+        catalog_path: PathBuf,
+        dir: PathBuf,
+        explorer: Option<crate::plexdb_ex::Explorer>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             station_path,
+            explorer,
             catalog_path,
             dir,
             inner: Mutex::new(Inner::default()),
@@ -674,6 +629,7 @@ impl SimCache {
                 Some(tz),
                 ledger,
                 req.resume.clone(),
+                self.explorer.clone(),
             )
         }))
         .unwrap_or_else(|_| Err("the projection panicked; see the log".to_string()))
@@ -687,7 +643,7 @@ mod tests {
     fn cache(tag: &str) -> Arc<SimCache> {
         let dir = std::env::temp_dir().join(format!("etv-projection-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        SimCache::new("station.yaml".into(), "catalog.db".into(), dir)
+        SimCache::new("station.yaml".into(), "catalog.db".into(), dir, None)
     }
 
     fn digests_of(config: &str) -> Digests {
@@ -755,7 +711,12 @@ mod tests {
         let c = cache("disk");
         assert!(matches!(c.lookup(request("a", 7, "c1")), Lookup::Pending));
         finish(&c, request("a", 7, "c1"));
-        let fresh = SimCache::new("station.yaml".into(), "catalog.db".into(), c.dir.clone());
+        let fresh = SimCache::new(
+            "station.yaml".into(),
+            "catalog.db".into(),
+            c.dir.clone(),
+            None,
+        );
         assert!(matches!(
             fresh.lookup(request("a", 7, "c1")),
             Lookup::Ready(_)
@@ -782,16 +743,11 @@ mod tests {
     }
 
     #[test]
-    fn imports_are_found_and_datastores_collected() {
+    fn imports_are_found() {
         assert_eq!(
             imported_modules("import \"shared/util\" as u;\n  import \"b\" as b;\nlet x = 1;"),
             ["shared/util", "b"]
         );
-        let v: Value =
-            serde_json::json!({"pools":[{"datastores":[{"name":"d","path":"/x/plex.db"}]}]});
-        let mut out = Vec::new();
-        collect_datastores(&v, &mut out);
-        assert_eq!(out, ["/x/plex.db"]);
     }
 
     #[test]

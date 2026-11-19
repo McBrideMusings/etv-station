@@ -11,9 +11,9 @@
 #
 # WHAT IT DELIBERATELY DOES NOT NEED. A tool that re-scores pools locally is the
 # counterexample this exists to avoid: it needs a local copy of catalog.db and
-# the plexdb snapshot, and its most common outcome on a dev Mac is a message
-# telling you to scp two databases. `--audit` reads chunk JSON and nothing else
-# — no catalog, no plexdb snapshot, no plugin evaluation (ADR 0011) — so this
+# a plex-db-ex explorer, and its most common outcome on a dev Mac is a message
+# telling you to scp a database. `--audit` reads chunk JSON and nothing else
+# — no catalog, no plex-db-ex explorer, no plugin evaluation (ADR 0011) — so this
 # wrapper never copies a database anywhere and never needs one present.
 #
 # THE PER-CHANNEL REPORT IS ONE REMOTE CALL, NOT TWO (etv-station-400). The

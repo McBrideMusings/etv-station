@@ -953,15 +953,6 @@ fn resolve_blocks(
                 *path = expand_env(path, channel_path, env)?;
             }
         }
-
-        // A pool's datastore grants (#167) name their location the same way —
-        // `${VAR}`, never a literal — expanded here before validation ever
-        // tries to open one.
-        for pool in &mut include.pools {
-            for grant in &mut pool.datastores {
-                grant.path = expand_env(&grant.path, channel_path, env)?;
-            }
-        }
     }
 
     Ok(())
@@ -1000,7 +991,7 @@ fn expand_env(input: &str, ctx: &Path, env: EnvLookup<'_>) -> Result<String, Con
 }
 
 /// Expand every `${VAR}` in `raw` from the process environment, for tools that
-/// read a raw config (`read_channel`) and need a datastore path resolved the
+/// read a raw config (`read_channel`) and need a `${VAR}` resolved the
 /// way [`load`] resolves it. The error is the bare message, without a path.
 pub fn expand_process_env(raw: &str) -> Result<String, String> {
     expand_env(raw, Path::new(""), &process_env).map_err(|e| match e {
@@ -1267,41 +1258,10 @@ mod tests {
         None
     }
 
-    /// A minimal but real plexdb store at the reader shape `plexdb-reader`
-    /// understands — just enough for the sample `foryou.yaml` channel's
-    /// `movies` pool to open its granted `taste` datastore at load. Its
-    /// contents are never read here; this test only proves the whole example
-    /// station still loads end to end, not what the plugin scores.
-    fn write_minimal_taste_store() -> PathBuf {
-        // `keep()` hands back the directory and gives up deleting it: the
-        // fixture has to outlive this call, and a `tempdir()` still owned here
-        // would clean itself up on drop.
-        let path = tempfile::tempdir().unwrap().keep().join("taste.db");
-        let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch(&format!(
-            "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version (version) VALUES ({version});
-             CREATE TABLE reader_shape (version INTEGER NOT NULL);
-             INSERT INTO reader_shape (version) VALUES ({version});",
-            version = plexdb_reader::SUPPORTED_READER_SHAPE,
-        ))
-        .unwrap();
-        path
-    }
-
     #[test]
     fn loads_example_fixture() {
-        // The `foryou.yaml` sample's movies pool references
-        // ${PLEXDB_SNAPSHOT_PATH} (#254) — hand the loader a table holding it
-        // rather than exporting it into the running process.
-        let taste_store = write_minimal_taste_store();
-        // Bound rather than passed inline: `env_map` returns an `impl Fn` that
-        // captures its argument's lifetime, so a temporary array would be
-        // freed while the returned lookup still borrowed it.
-        let vars = [("PLEXDB_SNAPSHOT_PATH", taste_store.to_str().unwrap())];
-        let env = env_map(&vars);
         let path = examples_station();
-        let loaded = load_with_env(&path, &env).expect("examples/station.yaml should load");
+        let loaded = load_with_env(&path, &no_env).expect("examples/station.yaml should load");
         let ch = loaded
             .channels
             .iter()
@@ -1408,26 +1368,6 @@ mod tests {
         let inc = &config.rule.blocks[0];
         assert_eq!(inc.pools.len(), 1);
         assert_eq!(inc.pattern.len(), 1);
-    }
-
-    /// A pool's datastore grant (#167) names its location as `${VAR}`, never
-    /// a literal — expanded the same way an item's local `source.path` is,
-    /// so validation's open-check sees a real filesystem path.
-    #[test]
-    fn resolve_blocks_expands_a_pool_datastore_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let channel_path = dir.path().join("channel.yaml");
-        std::fs::write(
-            &channel_path,
-            "number: 1\nname: x\nrule:\n  blocks:\n    - mode: \"all\"\n      pools:\n        - name: \"shows\"\n          plugin: \"scorer.rhai\"\n          datastores:\n            - name: \"taste_db\"\n              path: \"${TASTE_DB_PATH}\"\n      pattern:\n        - pool: \"shows\"\n          take: 1\n",
-        )
-        .unwrap();
-
-        let env = env_map(&[("TASTE_DB_PATH", "/srv/taste.db")]);
-        let mut config: ChannelConfig = read_config_file(&channel_path).unwrap();
-        resolve_blocks(&mut config, &channel_path, &env).unwrap();
-        let inc = &config.rule.blocks[0];
-        assert_eq!(inc.pools[0].datastores[0].path, "/srv/taste.db");
     }
 
     #[test]
@@ -1905,7 +1845,7 @@ mod tests {
     }
 
     /// Captures every tracing event emitted during `f` as its fields, keyed by
-    /// field name. Mirrors `validate.rs`'s `capture_datastore_age_events` — a
+    /// field name. A
     /// `%`-(Display-)formatted field, such as `keys`, `path` or `error`, is
     /// recorded via `record_debug` and stored as its Display text; a plain
     /// string field, such as `event`, arrives via `record_str`.
@@ -2090,56 +2030,6 @@ mod tests {
         .expect("station loads");
         assert_eq!(station.station.tz, "UTC");
         assert_eq!(station.channels.len(), 1);
-    }
-
-    /// Under the inspection loader a channel whose failure quotes an unset
-    /// `${VAR}`'s placeholder is dropped as `UnsetEnv` naming it; one that read
-    /// the variable but failed for another reason, or read none, is `Invalid`.
-    #[test]
-    fn a_drop_after_an_unset_env_read_is_typed_unset_env() {
-        let dir = tempfile::tempdir().unwrap();
-        let body = |number: i64, name: &str, plugin: &str| {
-            format!(
-                "number: {number}\nname: {name}\nrule:\n  blocks:\n    - mode: \"all\"\n      pools:\n        - name: \"shows\"\n          plugin: \"{plugin}\"\n          datastores:\n            - name: \"taste_db\"\n              path: \"${{ETV_TEST_NEVER_SET_VAR}}\"\n      pattern:\n        - pool: \"shows\"\n          take: 1\n"
-            )
-        };
-        let unset_body = body(2, "unset", "scorer.rhai");
-        let harmless_body = body(3, "harmless", "missing.rhai");
-        let station_path = write_min_station(
-            dir.path(),
-            &[
-                ("a.yaml", &channel_body(Some(1), Some("a"))),
-                ("b.yaml", &unset_body),
-                ("e.yaml", &harmless_body),
-                ("c.yaml", &channel_body(None, Some("c"))),
-            ],
-        );
-
-        std::fs::write(
-            dir.path().join("channels/scorer.rhai"),
-            r#"fn hooks() { ["pool_provider"] }
-fn capabilities() { [#{ datastore: "taste_db" }] }
-fn audit(ctx, picks, workspace) { #{} }"#,
-        )
-        .unwrap();
-        let station = load_for_inspection(&station_path).expect("station loads");
-        let cause = |file: &str| {
-            station
-                .dropped
-                .iter()
-                .find(|d| d.config_path.ends_with(file))
-                .unwrap_or_else(|| panic!("{file} not dropped: {:?}", station.dropped))
-                .cause
-                .clone()
-        };
-        assert_eq!(
-            cause("b.yaml"),
-            DropCause::UnsetEnv {
-                vars: vec!["ETV_TEST_NEVER_SET_VAR".to_string()]
-            }
-        );
-        assert_eq!(cause("e.yaml"), DropCause::Invalid);
-        assert_eq!(cause("c.yaml"), DropCause::Invalid);
     }
 
     /// A `fonts:` entry naming a file that is not there fails the load,

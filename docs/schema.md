@@ -767,7 +767,7 @@ temperature: 0                 # optional — every channel with no temperature:
 | `hooks` | no — default empty | list of [event hooks](#event-hooks) that run for the whole station |
 | `catalog_refresh_secs` | no — default `900` | seconds a freshly ingested catalog is trusted without contacting Plex at all. A restart inside this window reuses the sqlite file as it stands, which is what makes an edit-restart loop cheap. `0` re-checks Plex on every start. |
 | `full_sweep_after_secs` | no — default `86400` | seconds before a delta ingest is escalated to a full re-read. A delta asks Plex only for records touched since the last pass and therefore cannot express a *deletion* — an item removed from the library simply stops being mentioned. Only a full pass notices those. `0` disables delta ingest: every pass is full. |
-| `extras_url` | no — default unset | base URL of a Plex DB-EX server, written as a `${VAR}` reference expanded at load (an unset variable fails the load, as a datastore path does). Each catalog refresh reads `GET {extras_url}/api/extras/items` — the whole listing on a full pass, `?since=<cursor>` on a delta — and writes every released extra with a live primary file as an entry: `entry_id` is the store's `item_id`, `library` its library's name, `type` the library's declared type, plus `title`, `year`, `duration_ms` and one `extras` source holding the primary path. The pass follows `catalog_refresh_secs` and `full_sweep_after_secs`, aged from its own last pass. Only a full read marks an extra that stopped being listed (or lost its file) missing; a Plex DB-EX that cannot be reached leaves the catalog as it is. Nothing of Plex DB-EX is compiled in. Unset fetches nothing. |
+| `extras_url` | no — default unset | base URL of a Plex DB-EX server, written as a `${VAR}` reference expanded at load (an unset variable fails the load). Each catalog refresh reads `GET {extras_url}/api/extras/items` — the whole listing on a full pass, `?since=<cursor>` on a delta — and writes every released extra with a live primary file as an entry: `entry_id` is the store's `item_id`, `library` its library's name, `type` the library's declared type, plus `title`, `year`, `duration_ms` and one `extras` source holding the primary path. The pass follows `catalog_refresh_secs` and `full_sweep_after_secs`, aged from its own last pass. Only a full read marks an extra that stopped being listed (or lost its file) missing; a Plex DB-EX that cannot be reached leaves the catalog as it is. Nothing of Plex DB-EX is compiled in. Unset fetches nothing. |
 | `idle_grace_seconds` | no — default `90` | seconds a channel's worker stays warm after its last viewer leaves, so surfing back to it skips the cold start. Written into every `channelN.json`; ETV-next's worker reads it. `90` is also the floor — a smaller value is raised to it, because the overlay renderer exits after 60s without a reader and must stay under the worker's lifetime. A warm channel keeps its ffmpeg encoding for nobody, so raise it only as far as the encoder has headroom. |
 | `prewarm` | no — default `false` | when `true`, ETV-next starts every channel's worker within about 20s of startup and respawns any that exit (a channel in failure backoff waits for it to clear), and the worker never idles out — `idle_grace_seconds` is overridden, so the first tune of an unwatched channel returns at once instead of after the ~15s cold start (Plex's Live TV transcoder gives up at ~12.8s). Written as `server.prewarm` in the rendered `lineup.json`. Costs one continuous transcode per channel regardless of viewers, so leave it off unless the encoder has headroom for every channel at once. |
 | `ffmpeg_profiles` | no | map of name → encoding picture — see [FFmpeg profiles](#ffmpeg-profiles) |
@@ -1790,7 +1790,7 @@ the weight math (ADR 0002).
 
 | Key | Resolves to |
 |---|---|
-| `keyword` | the value lowercased, trimmed, whitespace collapsed, then looked up in the pool's first granted datastore's `keyword_forms` — its stored, stemmed form (`Heists` resolves because the store recorded that spelling, not because the station stems it) |
+| `keyword` | the value lowercased, trimmed, whitespace collapsed, then looked up through plex-db-ex's `GET /keywords?surface=` — its stored, stemmed form (`Heists` resolves because plex-db-ex recorded that spelling, not because the station stems it) |
 | `genre`, `label`, `cast`, `director`, `writer`, `producer`, `country`, `studio`, `content_rating` | the value lowercased, under the item-map key it is read from (`genres`, `labels`, `cast`, `directors`, `writers`, `producers`, `countries`, `studio`, `content_rating`) |
 | `item` | one catalog entry, by external id (`imdb:…`, `tmdb:…`, `tvdb:…`, or an `entry_id` of that shape) or by exact `Title (Year)` among non-episodes |
 | `set` | every entry a CEL expression matches, resolved like `sources` |
@@ -1801,9 +1801,8 @@ the weight math (ADR 0002).
 matches from the pool's candidates. It takes a catalog tag (matched against the
 catalog's own value, ignoring case for ASCII letters only — `horror` matches
 `Horror`, `élodie` does not match `Élodie`), an `item`, or a `keyword` — never a
-`set`. A keyword resolves its spelling through `keyword_forms`, then matches
-every title whose movie or show carries that keyword in the pool's first
-granted datastore; an episode matches by its show's keywords, since it has none
+`set`. A keyword resolves its spelling through plex-db-ex's `GET /keywords?surface=`,
+then matches every title whose movie or show carries that keyword there; an episode matches by its show's keywords, since it has none
 of its own, so `{ keyword: christmas, exclude: true }` removes Christmas films
 and every episode of a show tagged `christmas`. The station drops the matched entry ids from each of the
 pool's resolved `sources` sets before the script runs, so an excluded title is
@@ -1858,8 +1857,8 @@ an unreadable profile file; an empty `ignore_keywords` value. Failing the
 generation, naming the entry and the spelling: an `item` matching no entry or
 several (listed); a `set` that fails to resolve or matches nothing; an
 excluded tag value no catalog entry carries; a
-`keyword` or `ignore_keywords` spelling `keyword_forms` has never seen, or a
-`keyword`/`ignore_keywords` entry on a pool that grants no datastore.
+`keyword` or `ignore_keywords` spelling plex-db-ex has never seen, or a
+`keyword`/`ignore_keywords` entry while `PLEXDB_EX_URL` is unset (the error names `PLEXDB_EX_URL`).
 
 #### How `taste-cosine.rhai` scores a taste profile
 
@@ -1890,7 +1889,7 @@ candidates. `disfavor` is the same against the disfavor map. Disfavor sits
 under the fraction, so a profile of nothing but negative weights can pull a
 score toward zero and never below it.
 
-A candidate's keywords are its `keywords` in the granted datastore; its
+A candidate's keywords are its `keywords` in plex-db-ex; its
 tag values come from its catalog item map, lowercased. On a `unit: show` pool
 a show's tag values are the union over its episodes — every episode carries
 its show's genres.
@@ -1934,8 +1933,8 @@ two that can resolve the same `entry_id` may both air it in one day and
 neither one's `no_repeat_within` will notice. `only` and `exclude` cannot
 overlap, so the two are disjoint by construction.
 
-Watch state comes from the granted datastore's whole `plays` table
-(`watched_units_for`, plex-db-ex#60), not from a Tautulli fetch, which is
+Watch state comes from plex-db-ex's whole play history
+(`GET /accounts/{id}/watched`, or `GET /watched` for the household), not from a Tautulli fetch, which is
 bounded to the newest 1000 rows and would call a film watched two years ago unseen.
 A pool with no `ctx.account_id` — a pooled channel — partitions on what the
 *house* has played, which is the closest true answer available to it; the
@@ -2034,7 +2033,7 @@ network of the plex-db-ex store (`ds.tag_neighbours`), on the movie network for
   continues with the remaining seeds. `seeds` must be non-empty; `neighbours`
   and `min_tags` must be 1 or more.
 
-The pool must grant the `taste` datastore, as `taste-cosine` already requires.
+The pool must grant `http`, as `taste-cosine` already requires, and the station needs `PLEXDB_EX_URL`.
 Audit detail carries `walk: { seeds, seeds_matched, tags: [{ tag, weight }],
 closeness }` (null on a pool with no `walk:`), and the guide line ends
 "walking out from kung fu, wuxia" unless the theme is long enough to push the
@@ -2249,7 +2248,7 @@ A plugin declares its hooks and the station wires only the declared ones
 |---|---|
 | `pool_provider` | supplies a pool's items. This is what a `plugin:` pool has always meant, so a script named there must declare it. |
 | `sequencer` | takes a block's resolved pools plus the generation window and emits the block's final timeline in place of the pattern walk (#169). A block names one under `sequencer:`; see [Block `sequencer`](#block-sequencer-—-a-plugin-arranges-the-block-itself). |
-| `bumper` | `build(ctx)` returns a `timeline()` of segments for one gap. `ctx` holds `gap_ms`, `next` and `prev` (item maps, each with the catalog columns such as `content_rating`, `source_ids`, a map from source (`plex`, `local_fs`) to that source's id for the entry, and `path` when the item plays a local file; `next` also carries `start`, the unix seconds the programme begins, and is `()` at the generation frontier), `upcoming` (item maps of the programmes after `next` in the schedule being laid, nearest first, at most 12; `[]` at the frontier), `config` (the fill entry's `config:`, or `#{}`), `channel` (`name`, `number`, `logo`, `vocabulary`) and `rng`, seeded from the channel, `next.entry_id` and the air date so one airing always resolves the same way. The builder (`segment()`, `clip(path, in_ms, out_ms)`) takes seconds, `_ms` variants take milliseconds, and `looped()` stands in for `loop`, a Rhai keyword. An empty timeline is an error and the host substitutes black. `ctx.rng` offers `int(lo, hi)`, `float()`, `chance(p)`, `pick(array)` and `array.random(rng)`. Segments take `black()`, `color("#rrggbb")`, `clip(c)`, `still(path)`, `render(path)`, `pending(path, stand_in)` or `pending(path, stand_in, plan)` (the plan is the render plan file the render sidecar queues for `path` once the segment airs within `renderer.lead_minutes`; a render that has not landed: the file at `stand_in` airs, repeated across the slot when the segment is `looped()` and otherwise followed by black, and the daemon, every 30 seconds, replaces the segment in the unaired playout with `path` once ffprobe reads it and the segment is more than 30 seconds from airtime; a real file shorter than the slot repeats when the segment is `looped()` and otherwise is followed by black, and the swap is logged as `bumper.pending_swapped`; a segment already airing or within 30 seconds keeps its stand-in), `http(url, in_ms, out_ms)` (a remote file ETV-next fetches; `{{VAR}}` in the url is expanded by ETV-next at play time, so a token stays out of the playout file), `fixed`, `flex`, `looped`, `optional`, `priority`, `overlay(script, vars)`, `own_audio`, `bed_audio`, `mute`, `ducked_bed(gain_db)` (the clip or render segment's own audio at `gain_db` dB mixed with the timeline's `audio_bed`; a timeline with no bed, or a segment that is not a clip or render, is a script error naming the segment); a timeline takes `push(segment)` and `audio_bed(source, opts)` (`source` is a file path, `#{ path: ... }`, or `#{ lavfi: "anoisesrc=color=brown,lowpass=f=180" }`, an ffmpeg audio filter graph that makes its own sound with no input file). No channel config names a bumper script yet; `bumper::hook` in `crates/etv-station/src/bumper/hook.rs` runs one. A bumper plugin may declare `probe` (`ctx.probe(path)`; when the plex-db-ex snapshot (`PLEXDB_SNAPSHOT_PATH`) holds audio facts for the file's entry the result also carries `audio` — `bpm`, `beat_grid` {`slope`, `intercept`, `start_s`, `end_s`, `mean_residual_s`, `beats`}, `downbeat_phase`, `landing_bar`, `landing_bar_s`, `key`, `scale`, `camelot`, `key_strength`, `beat_confidence`, `bar_energy`, `rms_mean` — stored as measured, so the plugin applies its own steady-run and confidence floor, and `audio` is absent for a file the plex-db-ex snapshot holds no facts for), `read` (`ctx.read(path)`, a file in its own folder), `catalog_read` (`ctx.catalog(expr)`: the live catalog entries a CEL expression matches, in a pool's `expr` language, as the item maps `ctx.sets` carries plus `source_ids`, `path` (the file the entry plays from) and `audio` (its audio facts from the plex-db-ex snapshot, `()` when it holds none for the entry or cannot be read), at most 5000 of them), `http` (`ctx.http(url, method, body)` or `ctx.http(url, method, body, #{ Accept: "application/json" })`, the same call and 10-second limit a pool's `http` has; `{{PLEX_URL}}` and `{{PLEX_TOKEN}}` in the url are filled from the station's environment, so a script reaches Plex without holding the token) and `exec` (`ctx.exec(program, args)` -> `#{ code, stdout, stderr }`, no stdin, killed and an error after 10 seconds; a nonzero `code` is the script's to read); `ctx.http` and `ctx.exec` together may spend 30 seconds per `build()` call, after which each further call errors at once, naming the budget; each must be both declared and granted. `parse_json(text)` and `to_json(value)` need no grant. `local_time(unix_secs)` -> `#{ weekday, hour, minute }` in the station's time zone needs no grant either, and with `ctx.next.start` words "Tonight" or "Tomorrow". `examples/plugins/bumpers/up_next.rhai` is an up-next promo: it plays a hand-picked window of the next film (`picks`), else the top Shot a plex-db-ex explorer's `POST /api/search/run` finds for `phrase` in that film (`plexdb_url`, needs `http`), else a `broll_generic` clip, skipping a picked or searched window whose `content_rating` exceeds `slot_rating`. `examples/plugins/bumpers/generated_ident.rhai` is a generated station ident: it derives render params (`prompts`, `models`, `negative`, `cfg`, a seed from the channel name, `epoch` and a variant index), airs a finished render found at its derived path whose `lg_params` tag equals those params, and otherwise writes `<path>.pending`, submits through `exec` to the `broker` program and airs `stand_in` as a `pending(path, stand_in)` segment; a `.pending` older than `abandon_min` (60) is abandoned and resubmitted, and with `exec` ungranted or failing the stand-in airs plainly. Render audio is muted unless `audio` is `bed`, or `own` on a file with an audio stream. `examples/plugins/bumpers/test/stub_broker.sh` is the broker the acceptance tests grant. |
+| `bumper` | `build(ctx)` returns a `timeline()` of segments for one gap. `ctx` holds `gap_ms`, `next` and `prev` (item maps, each with the catalog columns such as `content_rating`, `source_ids`, a map from source (`plex`, `local_fs`) to that source's id for the entry, and `path` when the item plays a local file; `next` also carries `start`, the unix seconds the programme begins, and is `()` at the generation frontier), `upcoming` (item maps of the programmes after `next` in the schedule being laid, nearest first, at most 12; `[]` at the frontier), `config` (the fill entry's `config:`, or `#{}`), `channel` (`name`, `number`, `logo`, `vocabulary`) and `rng`, seeded from the channel, `next.entry_id` and the air date so one airing always resolves the same way. The builder (`segment()`, `clip(path, in_ms, out_ms)`) takes seconds, `_ms` variants take milliseconds, and `looped()` stands in for `loop`, a Rhai keyword. An empty timeline is an error and the host substitutes black. `ctx.rng` offers `int(lo, hi)`, `float()`, `chance(p)`, `pick(array)` and `array.random(rng)`. Segments take `black()`, `color("#rrggbb")`, `clip(c)`, `still(path)`, `render(path)`, `pending(path, stand_in)` or `pending(path, stand_in, plan)` (the plan is the render plan file the render sidecar queues for `path` once the segment airs within `renderer.lead_minutes`; a render that has not landed: the file at `stand_in` airs, repeated across the slot when the segment is `looped()` and otherwise followed by black, and the daemon, every 30 seconds, replaces the segment in the unaired playout with `path` once ffprobe reads it and the segment is more than 30 seconds from airtime; a real file shorter than the slot repeats when the segment is `looped()` and otherwise is followed by black, and the swap is logged as `bumper.pending_swapped`; a segment already airing or within 30 seconds keeps its stand-in), `http(url, in_ms, out_ms)` (a remote file ETV-next fetches; `{{VAR}}` in the url is expanded by ETV-next at play time, so a token stays out of the playout file), `fixed`, `flex`, `looped`, `optional`, `priority`, `overlay(script, vars)`, `own_audio`, `bed_audio`, `mute`, `ducked_bed(gain_db)` (the clip or render segment's own audio at `gain_db` dB mixed with the timeline's `audio_bed`; a timeline with no bed, or a segment that is not a clip or render, is a script error naming the segment); a timeline takes `push(segment)` and `audio_bed(source, opts)` (`source` is a file path, `#{ path: ... }`, or `#{ lavfi: "anoisesrc=color=brown,lowpass=f=180" }`, an ffmpeg audio filter graph that makes its own sound with no input file). No channel config names a bumper script yet; `bumper::hook` in `crates/etv-station/src/bumper/hook.rs` runs one. A bumper plugin may declare `probe` (`ctx.probe(path)`; when plex-db-ex's explorer (`PLEXDB_EX_URL`) holds audio facts for the file's entry the result also carries `audio` — `bpm`, `beat_grid` {`slope`, `intercept`, `start_s`, `end_s`, `mean_residual_s`, `beats`}, `downbeat_phase`, `landing_bar`, `landing_bar_s`, `key`, `scale`, `camelot`, `key_strength`, `beat_confidence`, `bar_energy`, `rms_mean` — stored as measured, so the plugin applies its own steady-run and confidence floor, and `audio` is absent for a file plex-db-ex's explorer holds no facts for), `read` (`ctx.read(path)`, a file in its own folder), `catalog_read` (`ctx.catalog(expr)`: the live catalog entries a CEL expression matches, in a pool's `expr` language, as the item maps `ctx.sets` carries plus `source_ids`, `path` (the file the entry plays from) and `audio` (its audio facts from plex-db-ex's explorer, `()` when it has none for the entry or cannot be reached), at most 5000 of them), `http` (`ctx.http(url, method, body)` or `ctx.http(url, method, body, #{ Accept: "application/json" })`, the same call and 10-second limit a pool's `http` has; `{{PLEX_URL}}` and `{{PLEX_TOKEN}}` in the url are filled from the station's environment, so a script reaches Plex without holding the token) and `exec` (`ctx.exec(program, args)` -> `#{ code, stdout, stderr }`, no stdin, killed and an error after 10 seconds; a nonzero `code` is the script's to read); `ctx.http` and `ctx.exec` together may spend 30 seconds per `build()` call, after which each further call errors at once, naming the budget; each must be both declared and granted. `parse_json(text)` and `to_json(value)` need no grant. `local_time(unix_secs)` -> `#{ weekday, hour, minute }` in the station's time zone needs no grant either, and with `ctx.next.start` words "Tonight" or "Tomorrow". `examples/plugins/bumpers/up_next.rhai` is an up-next promo: it plays a hand-picked window of the next film (`picks`), else the top Shot a plex-db-ex explorer's `POST /api/search/run` finds for `phrase` in that film (`plexdb_url`, needs `http`), else a `broll_generic` clip, skipping a picked or searched window whose `content_rating` exceeds `slot_rating`. `examples/plugins/bumpers/generated_ident.rhai` is a generated station ident: it derives render params (`prompts`, `models`, `negative`, `cfg`, a seed from the channel name, `epoch` and a variant index), airs a finished render found at its derived path whose `lg_params` tag equals those params, and otherwise writes `<path>.pending`, submits through `exec` to the `broker` program and airs `stand_in` as a `pending(path, stand_in)` segment; a `.pending` older than `abandon_min` (60) is abandoned and resubmitted, and with `exec` ungranted or failing the stand-in airs plainly. Render audio is muted unless `audio` is `bed`, or `own` on a file with an audio stream. `examples/plugins/bumpers/test/stub_broker.sh` is the broker the acceptance tests grant. |
 
 A script may declare any of them. The declaration lives in the script, not in
 the channel config, so swapping one scorer for another needs no YAML edit.
@@ -2326,7 +2325,8 @@ opened only by name:
 |---|---|---|
 | `catalog_read` | `ctx.sets` — the items each `sources()` query matched; `ctx.entry_id_for(source, id)` — the `entry_id` the catalog filed under that `(source, source_id)` provenance row (`source` is `"plex"` or `"local_fs"`), or `()` when none matches, so a script joining its own external history (a Tautulli `rating_key`) resolves it without the daemon owning the join (ADR 0014) | `"catalog_read"` |
 | `http` | `ctx.http(url, method, body)` — one HTTP call returning the response body as text; a 4xx/5xx, a transport failure or 10 seconds without a response is an error; one `pick()` call's `ctx.http` calls together may spend 30 seconds, after which each further call errors at once, naming the budget (ADR 0014) | `"http"` |
-| a named external datastore | `ctx.datastore("name")` — a handle onto the vendored plex-db-ex reader's `enrichment_for`, `enrichment_for_many`, `edges_from`, `edges_to`, `tag_neighbours`, `taste_vector_for`, `pooled_taste_vector`, `watched_units_for`, and `watched_units` accessors (#181, #271, #411; `tag_neighbours(kind, tag)` returns `[#{ tag, shared, df }]` — the tags co-occurring with `tag` on the plex-db-ex tag network, ordered by `shared` descending; read `shared` as `n["shared"]`, since `shared` is a reserved word in Rhai; etv-station-xm8p.2); the grant also proves at load time that the store's location opens, at the schema version the reader crate understands | `#{ datastore: "name" }` |
+
+`ctx.http` fills a `{{PLEXDB_EX_URL}}` token in the URL from the station's environment, so a plugin reads plex-db-ex's explorer (enrichment, keywords, tag neighbours, taste vectors, watched units) with `http` alone: `ctx.http("{{PLEXDB_EX_URL}}/taste", "GET", "")`. An unset variable fails the call, naming it.
 
 Unlike `hooks()`, `capabilities()` is optional — a script with no such function
 declares nothing, which is the right answer for a plugin that only reads the
@@ -2335,11 +2335,11 @@ the script and calling that one function alone, so `sources()` and `pick()`
 never run during this check either.
 
 The channel config grants capabilities on the pool, next to `plugin:` — see
-[Pool `capabilities` / `datastores`](#pool-capabilities-datastores-—-granting-a-plugin-what-it-needs)
+[Pool `capabilities`](#pool-capabilities-—-granting-a-plugin-what-it-needs)
 below. The two sides must agree exactly:
 
 - A pool naming a script that declares a capability the pool's
-  `capabilities:`/`datastores:` does not grant is refused at load, naming the
+  `capabilities:` does not grant is refused at load, naming the
   plugin and the capability.
 - A pool granting a capability the script never declares is refused at load,
   the other way round — a grant nobody asked for is a typo or a stale config,
@@ -2349,15 +2349,13 @@ below. The two sides must agree exactly:
   the field, naming the capability. This is the one check that can only happen
   at run time, because the reach is a script call — `capabilities()` and
   `pick()`'s actual body can disagree, and only running `pick()` catches it.
-- A datastore grant naming a location that cannot be opened is refused at
-  load, naming the datastore and the underlying error.
 
-`examples/plugins/taste-cosine.rhai` reads `ctx.sets` and reaches for a named
-datastore, so it declares
-`["catalog_read", "http", #{ datastore: "taste" }]` (#254's interface
+`examples/plugins/taste-cosine.rhai` reads `ctx.sets` and calls plex-db-ex's
+explorer, so it declares
+`["catalog_read", "http"]` (#254's interface
 list — `pick()` reaches Tautulli through `ctx.http` only to name a watched
 title as a pick's reason, see `why` above); `examples/samples/foryou.yaml` grants
-all three on the one pool that points at it.
+both on the one pool that points at it.
 
 `ctx` carries `ctx.sets.<name>` (the items each source matched — every column on
 `entries` plus genres / cast / labels / … as arrays; requires `catalog_read`),
@@ -2747,8 +2745,8 @@ the pooled taste and rank a personal channel against everyone's viewing while
 looking perfectly healthy.
 
 `single_user` also requires `PLEX_URL` and `PLEX_TOKEN` in the daemon's
-environment, whatever the catalog ingests from and whatever datastores a scorer
-plugin is granted: `user` is looked up in Plex's own `/accounts` listing. A
+environment, whatever the catalog ingests from and wherever a scorer
+plugin reads plex-db-ex: `user` is looked up in Plex's own `/accounts` listing. A
 missing variable fails at load.
 
 What is *not* checked at load is whether the named account exists — that needs
@@ -2801,7 +2799,7 @@ each for two people makes three calls per window however many channels are
 pointed at those three audiences. Each scope ages on its own clock, so a personal
 channel refreshing does not drag the pooled one along with it.
 
-### Pool `capabilities` / `datastores` — granting a plugin what it needs
+### Pool `capabilities` — granting a plugin what it needs
 
 A plugin declares the host inputs it needs with `capabilities()`; the channel
 config grants exactly that set on the pool that names the script (#167).
@@ -2818,28 +2816,12 @@ pools:
 | Field | Type | Meaning |
 |---|---|---|
 | `capabilities` | list of strings | the simple capabilities granted — `catalog_read`, `http` |
-| `datastores` | list of `{ name, path }` | named external stores granted, one entry per `#{ datastore: "name" }` the script declares |
 
 The check is **symmetric, and both directions fail the load**: a capability the
 script declares that the pool does not grant, and a capability the pool grants
 that the script never declares. The second one matters as much as the first —
 an unasked-for grant is either a typo or a stale config, and quietly ignoring
 it hides both.
-
-A `datastores` entry's `path` is written as an env-var reference and expanded
-at load, per the project rule that a location never appears literally in a
-committed config:
-
-```yaml
-    datastores:
-      - name: taste
-        path: "${PLEXDB_SNAPSHOT_PATH}"
-```
-
-The file is opened at load to prove it is reachable; a path that cannot be
-opened fails the load naming the datastore and the underlying error, rather
-than producing an empty pool that looks like a scheduling result. A station
-whose channels grant no datastore never opens one at all.
 
 Reaching for `ctx.sets` or `ctx.http` without the grant fails the `pick()`
 call the moment the script reads the field, naming the capability — that one

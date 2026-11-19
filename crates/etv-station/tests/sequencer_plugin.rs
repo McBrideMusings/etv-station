@@ -97,7 +97,6 @@ fn discovery_pool() -> Pool {
         // Both pools are `expr`, so no plugin is reached and no capability
         // grant is needed (#167).
         capabilities: Vec::new(),
-        datastores: Vec::new(),
         guide: None,
     }
 }
@@ -131,7 +130,6 @@ fn spotlight_pool() -> Pool {
         // Both pools are `expr`, so no plugin is reached and no capability
         // grant is needed (#167).
         capabilities: Vec::new(),
-        datastores: Vec::new(),
         guide: None,
     }
 }
@@ -314,7 +312,6 @@ fn foryou_pool(plugin: &Path) -> Pool {
         // The fixture scripts below never read `ctx.sets`, so no
         // capability grant is needed (#167).
         capabilities: Vec::new(),
-        datastores: Vec::new(),
         guide: None,
     }
 }

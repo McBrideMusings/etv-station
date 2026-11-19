@@ -1,6 +1,6 @@
 //! Acceptance test for the keyword-cosine taste scorer (#254): a plugin that
 //! ranks by how close a candidate's TMDB keywords sit to the house's pooled
-//! taste vector, read from a granted plex-db-ex datastore, with a seeded
+//! taste vector, read from plex-db-ex's explorer API, with a seeded
 //! exploration slot layered on top of the ranking and a recency damping
 //! under it.
 //!
@@ -11,9 +11,8 @@
 //!
 //! Runs `score::pick` directly against `examples/plugins/taste-cosine.rhai`
 //! (the committed script, proving it still compiles and runs) and a
-//! hand-built `plexdb.db` fixture — the same style `datastore_capability.rs`
-//! uses for the generic datastore-grant mechanism this file exercises for
-//! one specific script.
+//! hand-built plex-db-ex fixture, written as SQLite in plex-db-ex's table
+//! shape and served by the fake explorer in `support/plexdb_ex_fake.rs`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -22,11 +21,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use etv_station::catalog::{Catalog, Entry, EntrySource, Source, TagNs};
-use etv_station::config::DatastoreGrant;
 use etv_station::score::{
     Capability, GrantedCapabilities, PickedItem, PoolSources, ScoreCache, ScoreInputs,
     declared_capabilities, declared_hooks, pick,
 };
+
+#[path = "support/plexdb_ex_fake.rs"]
+mod fake;
 
 fn plugin_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -35,25 +36,24 @@ fn plugin_path() -> PathBuf {
         .expect("examples/plugins/taste-cosine.rhai must exist")
 }
 
-fn grant(db: &Path) -> GrantedCapabilities {
+fn grant() -> GrantedCapabilities {
     GrantedCapabilities::from_names(&["catalog_read".into(), "http".into()])
-        .with_datastores(&[DatastoreGrant {
-            name: "taste".into(),
-            path: db.to_str().unwrap().into(),
-        }])
-        .expect("a fixture store that just validated must still open")
 }
 
-/// The tables `plexdb-reader` opens, at the schema version it understands —
-/// the empty store each fixture below then fills its own way.
+/// The pool `config:` a test passes, with `plexdb_url` naming `server` — the
+/// fake explorer stands in for `{{PLEXDB_EX_URL}}`.
+fn with_explorer(config: Option<&serde_json::Value>, server: &fake::Server) -> serde_json::Value {
+    let mut c = config.cloned().unwrap_or_else(|| serde_json::json!({}));
+    c["plexdb_url"] = server.url.clone().into();
+    c
+}
+
+/// The tables `fake::Store::from_sqlite` reads, in plex-db-ex's shape — the
+/// empty store each fixture below then fills its own way.
 fn empty_store(path: &Path) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute_batch(&format!(
-        "CREATE TABLE schema_version (version INTEGER NOT NULL);
-         INSERT INTO schema_version (version) VALUES ({version});
-         CREATE TABLE reader_shape (version INTEGER NOT NULL);
-         INSERT INTO reader_shape (version) VALUES ({version});
-         CREATE TABLE items (
+    conn.execute_batch(
+        "CREATE TABLE items (
              item_id TEXT PRIMARY KEY, type TEXT NOT NULL,
              show_item_id TEXT, season INTEGER, episode INTEGER
          );
@@ -66,8 +66,7 @@ fn empty_store(path: &Path) -> rusqlite::Connection {
              plex_account_id INTEGER NOT NULL, viewed_at INTEGER NOT NULL
          );
          CREATE TABLE keyword_forms (surface TEXT PRIMARY KEY, keyword TEXT NOT NULL);",
-        version = plexdb_reader::SUPPORTED_READER_SHAPE,
-    ))
+    )
     .unwrap();
     conn
 }
@@ -178,12 +177,11 @@ fn tunables(exploration_fraction: Option<f64>) -> Option<serde_json::Value> {
     exploration_fraction.map(|f| serde_json::json!({ "exploration_fraction": f }))
 }
 
-/// The committed script prepared against a catalog, plus the fixture store its
-/// `taste` grant opens — every test here needs all three together, and the
-/// `TempDir` has to outlive the store's path.
+/// The committed script prepared against a catalog, plus the fake explorer
+/// serving the fixture store — every test here needs all three together.
 struct Scorer {
     _dir: tempfile::TempDir,
-    db: PathBuf,
+    server: fake::Server,
     script: PathBuf,
     cache: ScoreCache,
     /// The pool's own `sources:` table (#210), or `None` to let the script's
@@ -212,15 +210,17 @@ impl Scorer {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("taste.db");
         write_store(&db);
+        let server = fake::serve(fake::Store::from_sqlite(&db));
         // The two halves, in the order the daemon runs them: `prepare` reads
         // the catalog, `pick` below ranks what it found.
         let mut cache = ScoreCache::default();
+        cache.explorer = Some(etv_station::plexdb_ex::Explorer::new(&server.url));
         cache
             .prepare_unprofiled(cat, &script, sources.as_ref())
             .unwrap();
         Self {
             _dir: dir,
-            db,
+            server,
             script,
             cache,
             sources,
@@ -327,6 +327,7 @@ impl Scorer {
             }
             c
         });
+        let config = with_explorer(config.as_ref(), &self.server);
         pick(
             &self.cache,
             &self.script,
@@ -334,8 +335,8 @@ impl Scorer {
             &inputs,
             etv_station::variety::Dice::fixed(seed),
             pool,
-            config.as_ref(),
-            grant(&self.db),
+            Some(&config),
+            grant(),
         )
     }
 }
@@ -598,24 +599,16 @@ fn a_pool_worded_why_reaches_each_picks_metadata() {
     );
 }
 
-/// `capabilities()` declares exactly the three things the sample channel
-/// grants (#167, #181) — a channel pool that grants fewer fails to load
-/// naming whichever is missing; that generic mechanism is covered by
-/// `config::validate::tests` and `datastore_capability.rs`. This is the half
-/// specific to this script: what it actually asks for.
+/// `capabilities()` declares exactly the two things the sample channel grants
+/// (#167) — a channel pool that grants fewer fails to load naming whichever is
+/// missing; that generic mechanism is covered by `config::validate::tests`.
+/// This is the half specific to this script: what it actually asks for.
 #[test]
-fn the_script_declares_pool_provider_and_all_three_capabilities() {
+fn the_script_declares_pool_provider_and_both_capabilities() {
     let path = plugin_path();
     assert_eq!(declared_hooks(&path).unwrap(), vec!["pool_provider"]);
     let caps = declared_capabilities(&path, "pool_provider").unwrap();
-    assert_eq!(
-        caps,
-        vec![
-            Capability::CatalogRead,
-            Capability::Http,
-            Capability::Datastore("taste".into()),
-        ]
-    );
+    assert_eq!(caps, vec![Capability::CatalogRead, Capability::Http,]);
 }
 
 /// `unit:` decides what gets ranked — never the pool's name, and never what
@@ -967,8 +960,8 @@ fn near_miss_limit_is_overridable_via_pool_config() {
         &inputs,
         etv_station::variety::Dice::fixed(42),
         "movies",
-        Some(&config),
-        grant(&scorer.db),
+        Some(&with_explorer(Some(&config), &scorer.server)),
+        grant(),
     )
     .unwrap();
 
@@ -1345,8 +1338,8 @@ impl Scorer {
             &inputs,
             etv_station::variety::Dice::fixed(0),
             "shows",
-            Some(&config),
-            grant(&self.db),
+            Some(&with_explorer(Some(&config), &self.server)),
+            grant(),
         )
         .unwrap()
     }
@@ -1479,8 +1472,8 @@ impl Scorer {
             &inputs,
             etv_station::variety::Dice::fixed(0),
             "shows",
-            Some(&config),
-            grant(&self.db),
+            Some(&with_explorer(Some(&config), &self.server)),
+            grant(),
         )
         .unwrap()
     }
@@ -2203,9 +2196,7 @@ impl Scorer {
     /// way the daemon resolves it, before `pick`.
     fn with_profile(mut self, cat: &Catalog, pool: &str, profile_yaml: &str) -> Self {
         let mut pool: etv_station::config::Pool = serde_norway::from_str(&format!(
-            "name: {pool}\nplugin: plugin.rhai\ndatastores:\n  - name: taste\n    path: \"{db}\"\n\
-             profile:\n{profile_yaml}",
-            db = self.db.display(),
+            "name: {pool}\nplugin: plugin.rhai\nprofile:\n{profile_yaml}",
         ))
         .unwrap();
         pool.sources = self.sources.clone();
@@ -2612,8 +2603,8 @@ fn pick_at(scorer: &Scorer, seed: u64, temperature: f64) -> Vec<PickedItem> {
             ..etv_station::variety::Dice::fixed(seed)
         },
         "movies",
-        tunables(Some(0.0)).as_ref(),
-        grant(&scorer.db),
+        Some(&with_explorer(tunables(Some(0.0)).as_ref(), &scorer.server)),
+        grant(),
     )
     .unwrap()
 }
@@ -2750,7 +2741,8 @@ fn pick_against_tautulli(
         account_id,
         ..Default::default()
     };
-    let mut granted = grant(&scorer.db);
+    let config = with_explorer(Some(&config), &scorer.server);
+    let mut granted = grant();
     granted.entry_ids = Some(plex_rows());
     pick(
         &scorer.cache,
@@ -3225,8 +3217,8 @@ fn a_walk_on_a_shows_pool_reads_the_show_network_and_the_shows_keywords() {
         &inputs,
         etv_station::variety::Dice::fixed(0),
         "shows",
-        Some(&config),
-        grant(&scorer.db),
+        Some(&with_explorer(Some(&config), &scorer.server)),
+        grant(),
     )
     .unwrap();
     let mut shows: Vec<&str> = picked.iter().map(|p| &p.id[..4]).collect();

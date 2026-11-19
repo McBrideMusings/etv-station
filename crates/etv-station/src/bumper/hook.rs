@@ -35,7 +35,7 @@
 //!   probed. `tags` is the container's metadata (ComfyUI writes `prompt` and
 //!   `workflow` there), keys lower-cased; each stream map has `index`, `kind`,
 //!   `codec`, `lang`, `width`, `height`, `channels` and its own lower-cased
-//!   `tags`. When the plex-db-ex snapshot holds audio facts for the file, the
+//!   `tags`. When the plex-db-ex explorer holds audio facts for the file, the
 //!   map also has `audio` (`bpm`, `beat_grid`, `downbeat_phase`, `landing_bar`,
 //!   `key`, `scale`, `camelot`, `key_strength`, `beat_confidence`,
 //!   `bar_energy`, `rms_mean`; plex-db-ex's `harvest-audio` writes them); it is
@@ -46,7 +46,7 @@
 //! - `catalog_read` — `ctx.catalog(expr)` returns the live catalog entries a CEL
 //!   expression matches (the language a pool's `expr` uses) as item maps, the
 //!   ones `ctx.sets` carries, each with `path` (the file it plays from) and
-//!   `audio` (its audio facts from the plex-db-ex snapshot, `()` when it has
+//!   `audio` (its audio facts from the plex-db-ex explorer, `()` when it has
 //!   none), up to [`CATALOG_LIMIT`] of them. It reads the catalog and nothing
 //!   else.
 //! - `http` — `ctx.http(url, method, body)` makes one HTTP call through
@@ -168,9 +168,9 @@ pub struct BumperInput {
     /// The catalog `ctx.catalog` reads and `ctx.probe` maps a file's path to an
     /// entry through; `None` leaves `audio` out of every probe result.
     pub catalog_path: Option<PathBuf>,
-    /// The plex-db-ex snapshot `ctx.catalog` and `ctx.probe` read audio facts
+    /// The plex-db-ex explorer `ctx.catalog` and `ctx.probe` read audio facts
     /// from; `None` leaves `audio` empty everywhere.
-    pub plexdb_path: Option<PathBuf>,
+    pub plexdb: Option<crate::plexdb_ex::Explorer>,
 }
 
 /// A script's timeline plus how it built it.
@@ -244,10 +244,7 @@ pub fn build(script: &Path, input: &BumperInput) -> Result<BuiltTimeline, Bumper
         history: input.history.clone(),
         pass: input.pass.clone(),
         catalog_path: input.catalog_path.clone(),
-        snapshot: input
-            .plexdb_path
-            .clone()
-            .map(|p| Arc::new(crate::audio_facts::SnapshotReader::new(p))),
+        explorer: input.plexdb.clone(),
         channel: input.channel.name.clone(),
         budget: crate::plugin_http::Budget::new(crate::plugin_http::GENERATION_BUDGET),
         tz: input.channel.tz.unwrap_or(time_tz::timezones::db::UTC),
@@ -701,8 +698,7 @@ struct Host {
     history: Option<Arc<HistoryDb>>,
     pass: Vec<PlayRecord>,
     catalog_path: Option<PathBuf>,
-    /// Opened on first use and kept for this build's calls.
-    snapshot: Option<Arc<crate::audio_facts::SnapshotReader>>,
+    explorer: Option<crate::plexdb_ex::Explorer>,
     /// The channel `ctx.airings` queries unless the filter names another.
     channel: String,
     /// What this `build()` call has left for `ctx.http` and `ctx.exec`.
@@ -722,9 +718,9 @@ impl Host {
     fn probe(&self, path: &str) -> RhaiResult<Dynamic> {
         self.require("probe")?;
         let mut probed = probe_media(Path::new(path)).map_err(|e| format!("ctx.probe(): {e}"))?;
-        let audio = match (&probed, &self.catalog_path, &self.snapshot) {
-            (Some(_), Some(catalog), Some(snapshot)) => {
-                crate::audio_facts::facts_for_path(catalog, snapshot, path)
+        let audio = match (&probed, &self.catalog_path, &self.explorer) {
+            (Some(_), Some(catalog), Some(explorer)) => {
+                crate::audio_facts::facts_for_path(catalog, explorer, path)
             }
             _ => None,
         };
@@ -748,7 +744,7 @@ impl Host {
     /// Each map is the one `ctx.sets` carries, plus `source_ids` (each live
     /// source's own id for the entry), `path` (the file the entry plays from,
     /// `()` when it has no source) and `audio` (the audio facts from the
-    /// plex-db-ex snapshot, `()` when it has none for the entry). At most
+    /// plex-db-ex explorer, `()` when it has none for the entry). At most
     /// [`CATALOG_LIMIT`] entries come back.
     fn catalog(&self, expr: &str) -> RhaiResult<Dynamic> {
         self.require("catalog_read")?;
@@ -815,26 +811,26 @@ impl Host {
         Ok(found.into())
     }
 
-    /// The audio facts the snapshot holds for `ids`. An unset or unreadable
-    /// snapshot gives none and logs one warning, so a missing snapshot leaves
-    /// `audio` empty rather than failing the hook.
+    /// The audio facts the explorer holds for `ids`. An unset or unreachable
+    /// explorer gives none and logs one warning, so it leaves `audio` empty
+    /// rather than failing the hook.
     fn audio_facts(&self, ids: &[String]) -> std::collections::HashMap<String, serde_json::Value> {
-        let Some(snapshot) = &self.snapshot else {
+        let Some(explorer) = &self.explorer else {
             tracing::warn!(
-                event = "audio.snapshot_unset",
+                event = "audio.explorer_unset",
                 channel = %self.channel,
-                env = crate::audio_facts::SNAPSHOT_ENV,
-                "ctx.catalog has no plex-db-ex snapshot; `audio` is empty"
+                env = crate::plexdb_ex::URL_ENV,
+                "ctx.catalog has no plex-db-ex explorer; `audio` is empty"
             );
             return Default::default();
         };
-        snapshot.facts_for_entries(ids).unwrap_or_else(|e| {
+        explorer.audio_facts_for(ids).unwrap_or_else(|e| {
             tracing::warn!(
-                event = "audio.snapshot_unreadable",
+                event = "audio.explorer_unreadable",
                 channel = %self.channel,
-                snapshot = %snapshot.path().display(),
+                explorer = explorer.base(),
                 error = %e,
-                "ctx.catalog could not read the plex-db-ex snapshot; `audio` is empty"
+                "ctx.catalog could not read the plex-db-ex explorer; `audio` is empty"
             );
             Default::default()
         })
@@ -1525,7 +1521,7 @@ mod tests {
             history: None,
             pass: Vec::new(),
             catalog_path: None,
-            plexdb_path: None,
+            plexdb: None,
         }
     }
 
@@ -1934,10 +1930,13 @@ fn build(ctx) {{
         assert!((1500..1520).contains(&ms), "{ms}");
     }
 
-    /// A catalog of `song` (plays from `media`, analyzed in the snapshot),
-    /// `plain` (plays from `plain`, in the snapshot with no facts) and `ghost`
-    /// (plays from `ghost`, not in the snapshot at all), and the snapshot.
-    fn audio_fixture(dir: &tempfile::TempDir, paths: [&Path; 3]) -> (PathBuf, PathBuf) {
+    /// A catalog of `song` (plays from `media`, analyzed in the store),
+    /// `plain` (plays from `plain`, in the store with no facts) and `ghost`
+    /// (plays from `ghost`, not in the store at all), and a fake explorer.
+    fn audio_fixture(
+        dir: &tempfile::TempDir,
+        paths: [&Path; 3],
+    ) -> (PathBuf, crate::plexdb_ex::fake::Server) {
         use crate::catalog::{Catalog, Entry, EntrySource, Source};
         let catalog_path = dir.path().join("catalog.db");
         let cat = Catalog::open(&catalog_path).unwrap();
@@ -1955,22 +1954,20 @@ fn build(ctx) {{
             })
             .unwrap();
         }
-        let snapshot = dir.path().join("plexdb.snapshot.db");
-        crate::audio_facts::fixture::write(
-            &snapshot,
-            &[
-                ("song", Some(r#"{"bpm":128.5,"beat_grid":{"beats":64}}"#)),
-                ("plain", None),
-            ],
+        let mut store = crate::plexdb_ex::fake::Store::default();
+        store.audio(
+            "song",
+            serde_json::json!({"bpm": 128.5, "beat_grid": {"beats": 64}}),
         );
-        (catalog_path, snapshot)
+        store.audio_null("plain");
+        (catalog_path, crate::plexdb_ex::fake::serve(store))
     }
 
-    /// `ctx.probe(path).audio` reads the facts the plex-db-ex snapshot holds for
+    /// `ctx.probe(path).audio` reads the facts the plex-db-ex explorer holds for
     /// the entry that plays from `path`; a probed file with no facts has no
     /// `audio`.
     #[test]
-    fn probe_carries_the_snapshots_audio_facts_when_the_file_was_analyzed() {
+    fn probe_carries_the_explorers_audio_facts_when_the_file_was_analyzed() {
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("song.mkv");
         let made = std::process::Command::new("ffmpeg")
@@ -1985,7 +1982,7 @@ fn build(ctx) {{
         std::fs::copy(&media, &plain).unwrap();
         let ghost = dir.path().join("ghost.mkv");
         std::fs::copy(&media, &ghost).unwrap();
-        let (catalog_path, snapshot) = audio_fixture(&dir, [&media, &plain, &ghost]);
+        let (catalog_path, server) = audio_fixture(&dir, [&media, &plain, &ghost]);
 
         let path = script(
             &dir,
@@ -1997,7 +1994,7 @@ fn build(ctx) {{
     let b = ctx.probe("{p}");
     let g = ctx.probe("{g}");
     if "audio" in b {{ throw "an unanalyzed file must have no audio"; }}
-    if "audio" in g {{ throw "a file the snapshot does not know must have no audio"; }}
+    if "audio" in g {{ throw "a file the store does not know must have no audio"; }}
     let t = timeline();
     t.push(segment().black().fixed_ms(1000).name(`${{a.audio.bpm}}|${{a.audio.beat_grid.beats}}`));
     t
@@ -2009,11 +2006,11 @@ fn build(ctx) {{
         );
         let mut input = granted(&["probe"]);
         input.catalog_path = Some(catalog_path.clone());
-        input.plexdb_path = Some(snapshot);
+        input.plexdb = Some(crate::plexdb_ex::Explorer::new(&server.url));
         let built = build(&path, &input).unwrap();
         assert_eq!(built.timeline.segments[0].name, "128.5|64");
 
-        // No snapshot: the probe still answers, without `audio`.
+        // No explorer: the probe still answers, without `audio`.
         let mut input = granted(&["probe"]);
         input.catalog_path = Some(catalog_path);
         let path = script(
@@ -2023,7 +2020,7 @@ fn build(ctx) {{
 fn capabilities() {{ ["probe"] }}
 fn build(ctx) {{
     let a = ctx.probe("{m}");
-    if "audio" in a {{ throw "no snapshot, so no audio"; }}
+    if "audio" in a {{ throw "no explorer, so no audio"; }}
     let t = timeline();
     t.push(segment().black().fixed_ms(1000).name(`${{a.format}}`));
     t
@@ -2034,13 +2031,13 @@ fn build(ctx) {{
         assert!(build(&path, &input).is_ok());
     }
 
-    /// `ctx.catalog(expr)[i].audio` is the snapshot's facts for an analyzed
-    /// entry and `()` for one without, and an unreadable snapshot leaves every
+    /// `ctx.catalog(expr)[i].audio` is the store's facts for an analyzed
+    /// entry and `()` for one without, and an unreachable explorer leaves every
     /// `audio` `()` instead of failing the hook.
     #[test]
-    fn catalog_items_carry_the_snapshots_audio_facts() {
+    fn catalog_items_carry_the_explorers_audio_facts() {
         let dir = tempfile::tempdir().unwrap();
-        let (catalog_path, snapshot) = audio_fixture(
+        let (catalog_path, server) = audio_fixture(
             &dir,
             [
                 Path::new("/m/song.mkv"),
@@ -2062,14 +2059,14 @@ fn build(ctx) {
         let path = script(&dir, body);
         let mut input = granted(&["catalog_read"]);
         input.catalog_path = Some(catalog_path.clone());
-        input.plexdb_path = Some(snapshot);
+        input.plexdb = Some(crate::plexdb_ex::Explorer::new(&server.url));
         let built = build(&path, &input).unwrap();
         assert_eq!(
             built.timeline.segments[0].name,
             "ghost=none;plain=none;song=128.5;"
         );
 
-        input.plexdb_path = Some(dir.path().join("missing.db"));
+        input.plexdb = Some(crate::plexdb_ex::Explorer::new("http://127.0.0.1:9"));
         let built = build(&path, &input).unwrap();
         assert_eq!(
             built.timeline.segments[0].name,

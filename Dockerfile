@@ -122,7 +122,7 @@ RUN jobs=$(cargo-jobs) && CARGO_BUILD_JOBS=$jobs cargo build --release --locked 
 # Cargo.toml, since crates/etv-overlay is a member of that workspace, not of
 # vendor/etv-next's. So the root manifest has to be present too. Cargo does not
 # require the root workspace's other members (crates/etv-station,
-# crates/etv-query-test, vendor/plexdb-reader) to exist for this — only the
+# crates/etv-query-test) to exist for this — only the
 # path actually walked, crates/etv-overlay.
 #
 # This layer is keyed on vendor/etv-next AND crates/etv-overlay: either one is

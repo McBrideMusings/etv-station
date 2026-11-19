@@ -204,10 +204,13 @@ mod tests {
             review: ReviewState::new(
                 station_path.clone(),
                 PathBuf::from("/nonexistent/catalog.db"),
+                None,
             ),
             mcp: None,
             arr: super::arr::ArrEnv::default(),
             plexdb: None,
+            keywords: Default::default(),
+            coverage: Default::default(),
             options: Options {
                 station: station_path,
                 catalog: PathBuf::from("/nonexistent/catalog.db"),

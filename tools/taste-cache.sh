@@ -3,7 +3,7 @@
 # tmp/claude/scratchpad/station-cache/ in step with the Unraid host's
 # /mnt/user/appdata/etv-station/data/.
 #
-#   tools/taste-cache.sh catalog.db plexdb.snapshot.db
+#   tools/taste-cache.sh catalog.db
 #
 # One SSH call reads each named database's schema_version and its newest write
 # time (the later of the file and its -wal) on the host. A local copy that is
@@ -33,7 +33,7 @@ CACHE_DIR="tmp/claude/scratchpad/station-cache"
 REMOTE_DIR="/mnt/user/appdata/etv-station/data"
 
 if [ "$#" -eq 0 ]; then
-  echo "usage: tools/taste-cache.sh <catalog.db|plexdb.snapshot.db>..." >&2
+  echo "usage: tools/taste-cache.sh <database>..." >&2
   exit 2
 fi
 

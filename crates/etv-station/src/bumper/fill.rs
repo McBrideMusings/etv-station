@@ -145,8 +145,8 @@ pub struct FillEnv<'a> {
     pub history: Option<Arc<HistoryDb>>,
     /// The catalog `ctx.catalog` reads and `ctx.probe` maps a path through.
     pub catalog_path: Option<PathBuf>,
-    /// The plex-db-ex snapshot audio facts are read from.
-    pub plexdb_path: Option<PathBuf>,
+    /// The plex-db-ex explorer audio facts are read from.
+    pub plexdb: Option<crate::plexdb_ex::Explorer>,
     /// One plan per block index (`ResolvedItem::block`); `None` for a block
     /// that does not align.
     pub plans: Vec<Option<FillPlan>>,
@@ -644,7 +644,7 @@ fn draw_one(
         history: env.history.clone(),
         pass: pass.to_vec(),
         catalog_path: env.catalog_path.clone(),
-        plexdb_path: env.plexdb_path.clone(),
+        plexdb: env.plexdb.clone(),
     };
     let (built, error) = build_or_black(script, &input);
     let resolved = match fit(&built.timeline, gap_ms, FILL_FPS) {
@@ -1045,7 +1045,7 @@ fn build(ctx) {
             overlay_root: root,
             history: None,
             catalog_path: None,
-            plexdb_path: None,
+            plexdb: None,
             plans: vec![Some(plan)],
             pools,
             item_map: kind,
@@ -1388,7 +1388,7 @@ fn build(ctx) {
             overlay_root: Path::new("."),
             history: None,
             catalog_path: None,
-            plexdb_path: None,
+            plexdb: None,
             plans: vec![None],
             pools: HashMap::new(),
             item_map: &plain,

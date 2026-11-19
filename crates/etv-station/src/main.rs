@@ -75,13 +75,14 @@ struct Cli {
     check_determinism: Option<String>,
 
     /// Compare this station's catalog (`--config`'s `catalog_path`)
-    /// `entry_id` against a `plex-db-ex` snapshot's `item_id`, joined on
-    /// Plex rating key, then exit — a report, never a fix (#269). Both
-    /// databases are opened read-only; every mismatch prints in full, and
-    /// "present in only one store" titles are counted and sampled. Exit
-    /// code is non-zero when anything mismatches.
-    #[arg(long, value_name = "PLEXDB_PATH")]
-    reconcile_plexdb: Option<PathBuf>,
+    /// `entry_id` against `plex-db-ex`'s `item_id`, read from its explorer at
+    /// `PLEXDB_EX_URL` (ADR 0024), joined on Plex rating key, then exit — a
+    /// report, never a fix (#269). The catalog opens read-only and the
+    /// explorer is only read; every mismatch prints in full, and "present in
+    /// only one store" titles are counted and sampled. Exit code is non-zero
+    /// when anything mismatches.
+    #[arg(long)]
+    reconcile_plexdb: bool,
 
     /// Print the named channel's fully-resolved overlay spec as YAML on stdout
     /// and exit, with every path absolute — what the channel's overlay process
@@ -475,8 +476,8 @@ fn main() -> ExitCode {
         return check_determinism(config, channel);
     }
 
-    if let Some(plexdb_path) = cli.reconcile_plexdb.as_deref() {
-        return reconcile_plexdb_cmd(config, plexdb_path);
+    if cli.reconcile_plexdb {
+        return reconcile_plexdb_cmd(config);
     }
 
     if cli.backfill_history {
@@ -675,10 +676,10 @@ fn dump_overlay(config_path: &Path, channel_name: &str) -> ExitCode {
 /// where its channels live.
 ///
 /// A narrow read rather than `config::load`, on purpose. A full load resolves
-/// pools, which opens every datastore a channel names — so asking "what does
-/// this channel draw" would fail on a deploy host's `${PLEXDB_SNAPSHOT_PATH}`
-/// being absent from the machine running the preview. Nothing about the
-/// cascade needs any of that. The cascade itself is NOT reimplemented here:
+/// pools and expands every `${VAR}` a channel names — so asking "what does
+/// this channel draw" would fail on a deploy host's variable being absent from
+/// the machine running the preview. Nothing about the cascade needs any of
+/// that. The cascade itself is NOT reimplemented here:
 /// `OverlayDecl` is the real type and `resolve_decl`/`load_chain` are the real
 /// functions the daemon uses.
 #[derive(serde::Deserialize)]
@@ -1457,13 +1458,13 @@ fn check_determinism(config_path: &Path, channel_name: &str) -> ExitCode {
     }
 }
 
-/// Load the station config, open its catalog and the named `plex-db-ex`
-/// snapshot both read-only, compare `entry_id` against `item_id`, and print
+/// Load the station config, open its catalog read-only, read `plex-db-ex`'s
+/// titles from its explorer, compare `entry_id` against `item_id`, and print
 /// the report. See `catalog::reconcile_plexdb` (#269) for what the
 /// comparison does and why it lives here rather than in `plex-db-ex`. Exit
 /// code is non-zero when anything mismatches, so this can run as a check
 /// rather than be read by eye.
-fn reconcile_plexdb_cmd(config_path: &Path, plexdb_path: &Path) -> ExitCode {
+fn reconcile_plexdb_cmd(config_path: &Path) -> ExitCode {
     let station = match load_for("reconcile-plexdb", config_path) {
         Ok(s) => s,
         Err(code) => return code,
@@ -1482,14 +1483,21 @@ fn reconcile_plexdb_cmd(config_path: &Path, plexdb_path: &Path) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let plexdb_conn = match reconcile_plexdb::open_plexdb_readonly(plexdb_path) {
-        Ok(c) => c,
+    let Some(explorer) = etv_station::plexdb_ex::Explorer::from_env() else {
+        eprintln!(
+            "reconcile-plexdb: {} is not set — it names the plex-db-ex explorer to compare against",
+            etv_station::plexdb_ex::URL_ENV
+        );
+        return ExitCode::from(1);
+    };
+    let plexdb = match reconcile_plexdb::PlexdbRows::from_explorer(&explorer) {
+        Ok(r) => r,
         Err(err) => {
             eprintln!("reconcile-plexdb: {err}");
             return ExitCode::from(1);
         }
     };
-    let report = match reconcile_plexdb::reconcile(&catalog, &plexdb_conn) {
+    let report = match reconcile_plexdb::reconcile(&catalog, &plexdb) {
         Ok(r) => r,
         Err(err) => {
             eprintln!("reconcile-plexdb: {err}");

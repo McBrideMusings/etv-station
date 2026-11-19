@@ -243,10 +243,16 @@ mod tests {
         let state = AppState {
             catalog: Catalog::open_in_memory().expect("in-memory catalog"),
             pools: PoolState::default(),
-            review: channel::ReviewState::new(station.clone(), PathBuf::from("/nonexistent/c.db")),
+            review: channel::ReviewState::new(
+                station.clone(),
+                PathBuf::from("/nonexistent/c.db"),
+                None,
+            ),
             mcp: None,
             arr: super::arr::ArrEnv::default(),
             plexdb: None,
+            keywords: Default::default(),
+            coverage: Default::default(),
             options: Options {
                 station,
                 catalog: PathBuf::from("/nonexistent/c.db"),

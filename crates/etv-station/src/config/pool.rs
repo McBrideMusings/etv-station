@@ -698,31 +698,11 @@ pub struct Pool {
     /// be one the script declares (else the load fails the other way,
     /// naming both). See [`crate::score::declared_capabilities`].
     ///
-    /// A named external datastore is not listed here — see
-    /// [`Pool::datastores`]. Meaningless on an `expr` or `groups` pool, on
+    /// Meaningless on an `expr` or `groups` pool, on
     /// the same terms as [`Pool::config`]: there is no script to grant
     /// anything to, so it is ignored rather than rejected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
-
-    /// Named external datastore handles (#167) granted to this pool's
-    /// `plugin` — one entry per datastore name the plugin's `capabilities()`
-    /// declares via `#{ datastore: "name" }`. Cross-checked against the
-    /// declaration the same way [`Pool::capabilities`] is: a name declared
-    /// but not granted, or granted but not declared, fails the load naming
-    /// both.
-    ///
-    /// The location is proven openable — and at the schema version the
-    /// vendored `plexdb-reader` crate understands — before any plugin ever
-    /// runs ([`crate::config::validate`]), so a station whose channels grant
-    /// none opens no connection at all. A granted plugin reaches the six
-    /// accessors the crate publishes (`enrichment_for`, `enrichment_for_many`,
-    /// `edges_from`, `edges_to`, `taste_vector_for`, `pooled_taste_vector`) as
-    /// `ctx.datastore("name")` (#181, [`crate::score::pick`]); what those
-    /// accessors actually read from is `plex-db-ex`'s concern, not this
-    /// station's.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub datastores: Vec<DatastoreGrant>,
 
     /// This pool's own `guide:` defaults (#289) — the rung between the block
     /// and the item in the cascade [`GuideConfig::cascade`] defines, for the
@@ -764,21 +744,6 @@ pub const POOL_LABEL_KEY: &str = "pool_label";
 
 /// The metadata key a drawn item carries its pool's [`Pool::advisory`] under.
 pub const POOL_ADVISORY_KEY: &str = "pool_advisory";
-
-/// One named external datastore grant (#167) — see [`Pool::datastores`].
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DatastoreGrant {
-    /// Matches the name the plugin's `capabilities()` declares for this
-    /// datastore.
-    pub name: String,
-
-    /// Filesystem path to the datastore. Written as an env var reference
-    /// (`${VAR}`) and expanded at load exactly like an item's local
-    /// `source.path` (see `config::load::resolve_blocks`) — per the project
-    /// rule, a store location never appears as a literal in a committed
-    /// config.
-    pub path: String,
-}
 
 impl Pool {
     /// Write this pool's `label` and `advisory` into an item's metadata blob.
@@ -1065,20 +1030,16 @@ sources:
     }
 
     #[test]
-    fn parses_capabilities_and_datastores() {
-        let yaml = "name: taste\nplugin: taste.rhai\ncapabilities: [catalog_read, http]\ndatastores:\n  - name: taste_db\n    path: \"${TASTE_DB_PATH}\"\n";
+    fn parses_capabilities() {
+        let yaml = "name: taste\nplugin: taste.rhai\ncapabilities: [catalog_read, http]\n";
         let pool: Pool = serde_norway::from_str(yaml).unwrap();
         assert_eq!(pool.capabilities, vec!["catalog_read", "http"]);
-        assert_eq!(pool.datastores.len(), 1);
-        assert_eq!(pool.datastores[0].name, "taste_db");
-        assert_eq!(pool.datastores[0].path, "${TASTE_DB_PATH}");
     }
 
     #[test]
-    fn capabilities_and_datastores_default_empty() {
+    fn capabilities_default_empty() {
         let bare = bare("movies");
         assert!(bare.capabilities.is_empty());
-        assert!(bare.datastores.is_empty());
     }
 
     #[test]

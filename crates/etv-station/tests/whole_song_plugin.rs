@@ -65,23 +65,20 @@ fn flat(id: &'static str, bpm: f64) -> Song {
     }
 }
 
-#[path = "support/audio_snapshot.rs"]
-mod audio_snapshot;
+#[path = "support/plexdb_ex_fake.rs"]
+mod fake;
 
-/// The plex-db-ex snapshot holding `songs`' audio facts.
-fn snapshot_file(dir: &Path, songs: &[Song]) -> PathBuf {
-    let path = dir.join("plexdb.snapshot.db");
-    let rows: Vec<(&str, Option<String>)> = songs
-        .iter()
-        .map(|s| {
-            let (intro, body) = (s.intro, s.body);
-            let f = facts(s.bpm, s.confidence, |i| if i < 16 { intro } else { body });
-            (s.id, Some(f.to_string()))
-        })
-        .collect();
-    let refs: Vec<(&str, Option<&str>)> = rows.iter().map(|(i, f)| (*i, f.as_deref())).collect();
-    audio_snapshot::write(&path, &refs);
-    path
+/// The fake plex-db-ex explorer's store, holding `songs`' audio facts.
+fn audio_store(songs: &[Song]) -> fake::Store {
+    let mut store = fake::Store::default();
+    for s in songs {
+        let (intro, body) = (s.intro, s.body);
+        store.audio(
+            s.id,
+            facts(s.bpm, s.confidence, |i| if i < 16 { intro } else { body }),
+        );
+    }
+    store
 }
 
 fn catalog_file(dir: &Path, songs: &[Song]) -> PathBuf {
@@ -123,6 +120,7 @@ static STUBS: Mutex<()> = Mutex::new(());
 struct Fixture {
     dir: tempfile::TempDir,
     work: PathBuf,
+    explorer: fake::Server,
     _turn: MutexGuard<'static, ()>,
 }
 
@@ -135,11 +133,13 @@ impl Fixture {
         Fixture {
             dir,
             work,
+            explorer: fake::serve(fake::Store::default()),
             _turn: turn,
         }
     }
 
     fn input(&self, songs: &[Song], entry: &str, gap_ms: u64) -> BumperInput {
+        *self.explorer.store.lock().unwrap() = audio_store(songs);
         let ffmpeg = stub(
             self.dir.path(),
             "ffmpeg",
@@ -172,7 +172,7 @@ impl Fixture {
             granted: vec!["probe".into(), "catalog_read".into(), "exec".into()],
             history: None,
             catalog_path: Some(catalog_file(self.dir.path(), songs)),
-            plexdb_path: Some(snapshot_file(self.dir.path(), songs)),
+            plexdb: Some(etv_station::plexdb_ex::Explorer::new(&self.explorer.url)),
         }
     }
 

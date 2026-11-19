@@ -4128,7 +4128,6 @@ mod tests {
                 constraints: None,
                 config: None,
                 capabilities: Vec::new(),
-                datastores: Vec::new(),
                 guide: None,
             },
             Pool {
@@ -4157,7 +4156,6 @@ mod tests {
                 constraints: None,
                 config: None,
                 capabilities: Vec::new(),
-                datastores: Vec::new(),
                 guide: None,
             },
         ];
@@ -5139,7 +5137,6 @@ fn annotate(ctx, item) { #{ seen: item.entry_id, title: item.title } }"#,
             constraints: None,
             config: None,
             capabilities: Vec::new(),
-            datastores: Vec::new(),
             guide: None,
         }];
         inc.pattern = vec![PatternStep {

@@ -17,15 +17,15 @@
 //
 // Five functions make up the contract (see docs/schema.md "Pool `plugin`"):
 //   hooks()               -> ["pool_provider"]
-//   capabilities()        -> ["catalog_read", #{ datastore: "taste_db" }]
+//   capabilities()        -> ["catalog_read", "http"]
 //   sources()             -> #{ movies: cel_expression }
 //   pick(ctx)             -> #{ picks: [#{ entry_id, metadata }, …], workspace }
 //   audit(ctx, picks, ws) -> #{ entry_id: stage_record }
 //
 // ctx carries (docs/schema.md § capabilities()):
 //   ctx.sets.movies   every movie the sources() query matched
-//   ctx.datastore("taste_db")
-//                     the plex-db-ex reader handle this pool was granted
+//   ctx.http(url, …)  the one way out; px_open() below reads plex-db-ex
+//                     through it
 //   ctx.recent        entry_ids this channel aired most recently, oldest first
 //   ctx.target_count  how many items this generation needs
 //   ctx.config        this pool's `config:` block
@@ -69,20 +69,123 @@ fn drift(ctx) { tunable(ctx, "drift", 0.02) }
 // candidate dump is Channels > Pools in the web dashboard.
 fn near_miss_limit(ctx) { tunable(ctx, "near_miss_limit", 3).to_int() }
 
-// Which datastore grant this script reaches for — see
-// docs/schema.md "Pool `capabilities` / `datastores`". A fixed name, not a
-// tunable: the channel author names the *location* under `datastores:`, not
-// which handle the script asks for.
-fn datastore_name() { "taste_db" }
+// plex-db-ex, read over its explorer's HTTP API (ADR 0024) with ctx.http.
+// `ctx.http` fills `{{PLEXDB_EX_URL}}` from the station's environment;
+// `config.plexdb_url` replaces it when a pool must name another explorer.
+// px_open() returns the handle the rest of pick() calls `ds`; each accessor
+// below is a method on it, so a fetched title's facts and a keyword's
+// spellings are read once per pick() however many times they are asked for.
+fn px_open(ctx) {
+    #{ ctx: ctx, base: tunable(ctx, "plexdb_url", "{{PLEXDB_EX_URL}}"), facts: #{}, surfaces: #{} }
+}
+
+// `s` percent-encoded as one URL path segment or query value.
+fn px_encode(s) {
+    let out = "";
+    for ch in s {
+        if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+            || ch == '-' || ch == '_' || ch == '.' || ch == '~' || ch == ':' {
+            out += ch;
+        } else {
+            for b in ch.to_string().to_blob() {
+                let h = b.to_hex().to_upper();
+                out += if h.len == 1 { "%0" + h } else { "%" + h };
+            }
+        }
+    }
+    out
+}
+
+// GET `path` as JSON; unit when the explorer answers 404 (a title, account,
+// keyword or tag it does not hold).
+fn px_get(path) {
+    let text = "";
+    try {
+        text = this.ctx.http(this.base + path, "GET", "");
+    } catch (e) {
+        if e.to_string().contains("status 404") { return (); }
+        throw e;
+    }
+    parse_json(text)
+}
+
+// Every row of the cursor-paged list at `path` (`limit` 1000 per page).
+fn px_list(path) {
+    let sep = if path.contains("?") { "&" } else { "?" };
+    let rows = [];
+    let after = ();
+    loop {
+        let page_path = path + sep + "limit=1000";
+        if after != () { page_path += "&after=" + px_encode(after); }
+        let page = this.px_get(page_path);
+        if page == () { return rows; }
+        rows += page.data;
+        if !page.has_more || page.next == () { return rows; }
+        after = page.next;
+    }
+}
+
+// Fetch every enrichment fact, in every namespace, of each of `ids` not
+// already held. Up to 50 titles are one `GET /items/{id}/enrichment` each;
+// more walk `GET /items?type=show|movie&include=enrichment` (the API has no
+// read by a set of ids), keeping only the titles asked for and stopping once
+// all are found. One walk serves every namespace a pick() reads.
+fn px_load_facts(ids) {
+    let want = #{};
+    for id in ids {
+        if this.facts[id] == () { want[id] = true; }
+    }
+    if want.len() == 0 { return; }
+    if want.len() <= 50 {
+        for id in want.keys() {
+            let facts = this.px_get("/items/" + px_encode(id) + "/enrichment");
+            this.facts[id] = if facts == () { [] } else { facts };
+        }
+        return;
+    }
+    for kind in ["show", "movie"] {
+        let after = ();
+        while want.len() > 0 {
+            let path = "/items?type=" + kind + "&include=enrichment&limit=1000";
+            if after != () { path += "&after=" + px_encode(after); }
+            let page = this.px_get(path);
+            if page == () { throw "plex-db-ex explorer: GET " + path + " answered 404"; }
+            for item in page.data {
+                if want[item.item_id] != () {
+                    this.facts[item.item_id] = item.enrichment;
+                    want.remove(item.item_id);
+                }
+            }
+            if !page.has_more || page.next == () { break; }
+            after = page.next;
+        }
+    }
+    for id in want.keys() { this.facts[id] = []; }
+}
+
+// Each of `ids` with its facts in namespace `ns`, as `#{ id: [#{ namespace,
+// key, value, fetched_at }] }`; a title with none in `ns` is absent.
+fn enrichment_for_many(ids, ns) {
+    this.px_load_facts(ids);
+    let out = #{};
+    for id in ids {
+        let kept = [];
+        for f in this.facts[id] {
+            if f.namespace == ns { kept.push(f); }
+        }
+        if kept.len > 0 { out[id] = kept; }
+    }
+    out
+}
 
 fn hooks() { ["pool_provider"] }
 
-fn capabilities() { ["catalog_read", #{ datastore: datastore_name() }] }
+fn capabilities() { ["catalog_read", "http"] }
 
 fn sources() { #{ movies: `item.type == "movie"` } }
 
 fn pick(ctx) {
-    let ds = ctx.datastore(datastore_name());
+    let ds = px_open(ctx);
 
     // Every movie this pool offers, in the order ctx.sets handed them over —
     // that order is what makes the seeded picks below reproducible run to

@@ -163,13 +163,15 @@ pub fn simulate(
         tz,
         Ledger::default(),
         ResumeMap::new(),
+        crate::plexdb_ex::Explorer::from_env(),
     )
 }
 
 /// [`simulate`] continuing a real channel: `start` is the instant its
 /// published schedule ends, `ledger` holds the airings before it and `resume`
 /// is the daemon's `.resume` state there, so the first generation is the one
-/// the daemon would lay down next.
+/// the daemon would lay down next. `explorer` is where a profile's `keyword:`
+/// entries resolve ([`crate::score::ScoreCache::explorer`]).
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_from(
     config: &ChannelConfig,
@@ -181,6 +183,7 @@ pub fn simulate_from(
     tz: Option<&'static time_tz::Tz>,
     mut ledger: Ledger,
     mut resume: ResumeMap,
+    explorer: Option<crate::plexdb_ex::Explorer>,
 ) -> Result<Simulation, String> {
     let nominal = std::time::Duration::from_secs(u64::from(
         config
@@ -203,6 +206,7 @@ pub fn simulate_from(
     // One cache for the whole replay: the catalog and the plugin files do not
     // change under it, so each plugin compiles and resolves its sources once.
     let mut score_cache = crate::score::ScoreCache::default();
+    score_cache.explorer = explorer;
 
     while now < end {
         let target = now + window;

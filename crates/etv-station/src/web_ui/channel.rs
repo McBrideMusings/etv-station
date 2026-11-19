@@ -103,7 +103,13 @@ pub(super) struct ReviewState {
 const CANDIDATE_DIGEST_LIFE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl ReviewState {
-    pub(super) fn new(station_path: PathBuf, catalog_path: PathBuf) -> Self {
+    /// `explorer` is the plex-db-ex explorer projections resolve a profile's
+    /// `keyword:` entries against, the one [`super::AppState::plexdb`] holds.
+    pub(super) fn new(
+        station_path: PathBuf,
+        catalog_path: PathBuf,
+        explorer: Option<crate::plexdb_ex::Explorer>,
+    ) -> Self {
         // One directory per build of this binary, so a rebuilt renderer or
         // simulator never serves what the previous one produced.
         let build = std::env::current_exe()
@@ -123,6 +129,7 @@ impl ReviewState {
                     .parent()
                     .map(|p| p.join("ui-projections"))
                     .unwrap_or_else(|| std::env::temp_dir().join("etv-station-ui-projections")),
+                explorer,
             ),
             renders: super::graphics::RenderQueue::new(
                 catalog_path

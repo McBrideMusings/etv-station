@@ -153,7 +153,6 @@ fn pool(name: &str, expr: &str, guide: Option<GuideConfig>) -> Pool {
         constraints: None,
         config: None,
         capabilities: Vec::new(),
-        datastores: Vec::new(),
         guide,
     }
 }

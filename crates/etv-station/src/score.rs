@@ -30,14 +30,7 @@
 //! // a script that only reads ctx.recent/ctx.config/ctx.target_count/ctx.now
 //! // needs nothing here. `ctx.sets` below is a gated input: reaching for
 //! // it without declaring (and being granted) the matching capability
-//! // fails the pick() call that reaches for it, naming the capability. A named external datastore is declared
-//! // as `#{ datastore: "name" }` instead of a bare string; see
-//! // `config::Pool::datastores`. A granted datastore is reached as
-//! // `ctx.datastore("name")` (#181), which returns a handle exposing the
-//! // plex-db-ex reader crate's nine accessors — `enrichment_for`,
-//! // `enrichment_for_many`, `edges_from`, `edges_to`, `tag_neighbours`, `taste_vector_for`,
-//! // `pooled_taste_vector`, `watched_units_for`, `watched_units` — or fails
-//! // the pick() call naming the datastore if it was never granted.
+//! // fails the pick() call that reaches for it, naming the capability.
 //! // `"http"` gates `ctx.http(url, method, body)`, the one way a script
 //! // reaches an outside service (ADR 0014): it returns the response body as
 //! // text, errors on a 4xx/5xx, and gives up after
@@ -136,7 +129,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use etv_overlay::config_carrier;
 use rhai::serde::DynamicDeserializer;
@@ -236,7 +229,7 @@ type CacheKey = (PathBuf, Option<PoolSources>, crate::profile::Narrowing);
 /// simulator holds one across a whole replay, which is only sound because the
 /// catalog and the plugin files are fixed for that replay: a cache outlives
 /// neither a catalog change nor an edit to a script on disk.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ScoreCache {
     entries: HashMap<CacheKey, CachedScript>,
     /// The metadata/take-override half of what a plugin pool's `pick()` just
@@ -272,6 +265,20 @@ pub struct ScoreCache {
     /// by pool rather than by script and sources, since two pools sharing a
     /// script and a candidate set still author their own profiles.
     profiles: HashMap<String, crate::profile::ResolvedProfile>,
+    /// Where a profile's `keyword:` entries resolve (ADR 0024):
+    /// [`crate::plexdb_ex::Explorer::from_env`] by default.
+    pub explorer: Option<crate::plexdb_ex::Explorer>,
+}
+
+impl Default for ScoreCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            picked_extras: HashMap::new(),
+            profiles: HashMap::new(),
+            explorer: crate::plexdb_ex::Explorer::from_env(),
+        }
+    }
 }
 
 /// The metadata blob and/or take override one `entry_id` carried in a plugin
@@ -590,10 +597,6 @@ pub fn check_plugin_dir(dir: &Path) -> Result<Vec<PluginCheck>, String> {
 
 /// A host capability a plugin script can declare via `capabilities()` (#167).
 /// `CatalogRead` gates `ctx.sets`.
-/// `Datastore` names an external handle the channel config must separately
-/// grant (see [`crate::config::Pool::datastores`]) — reached at runtime as
-/// `ctx.datastore("name")` (#181), which returns the plex-db-ex reader
-/// crate's accessors for that store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Capability {
     CatalogRead,
@@ -613,16 +616,14 @@ pub enum Capability {
     /// [`crate::plugin_http::GENERATION_TIMEOUT`]. Offered by
     /// [`crate::bumper::hook`] only.
     Exec,
-    Datastore(String),
 }
 
 impl Capability {
     /// The one name this capability answers to — the string a script's
     /// `capabilities()` returns and the string a pool grants under
-    /// `capabilities:` or as a `datastores:` entry name. Simple capabilities
-    /// and datastore names share a single namespace, which is what lets the
-    /// load-time cross-check ([`crate::config::validate`]) compare the two
-    /// sides as plain sets of names.
+    /// `capabilities:`, which is what lets the load-time cross-check
+    /// ([`crate::config::validate`]) compare the two sides as plain sets of
+    /// names.
     pub fn name(&self) -> &str {
         match self {
             Capability::CatalogRead => "catalog_read",
@@ -630,14 +631,11 @@ impl Capability {
             Capability::Read => "read",
             Capability::Http => "http",
             Capability::Exec => "exec",
-            Capability::Datastore(name) => name,
         }
     }
 }
 
-/// The simple (non-parameterized) capability names a `pool_provider` script's
-/// `capabilities()` may return as bare strings. A named datastore is declared
-/// separately, as `#{ datastore: "name" }` — see [`declared_capabilities`].
+/// The capability names a `pool_provider` script's `capabilities()` may return.
 pub const POOL_CAPABILITIES: &[&str] = &["catalog_read", "http"];
 
 /// The simple capability names `hook` offers a script — the one table both
@@ -676,9 +674,8 @@ pub fn join_offered(offered: &[&str]) -> String {
 /// not [offer](offered_capabilities) fails naming what it does offer.
 ///
 /// Every failure names the script: an unreadable or uncompilable file, a
-/// throwing `capabilities()`, an entry that is neither a string nor a
-/// `#{ datastore: "name" }` map, an unknown string capability, a capability
-/// another hook offers, or a datastore entry with an empty or non-string name.
+/// throwing `capabilities()`, an entry that is not a string, an unknown
+/// capability, or a capability another hook offers.
 ///
 /// A convenience wrapper over [`compile_plugin`] +
 /// [`declared_capabilities_from_ast`]; a caller that already compiled the
@@ -708,35 +705,9 @@ pub fn declared_capabilities_from_ast(
 
     let mut out = Vec::with_capacity(declared.len());
     for value in declared {
-        if value.is_map() {
-            let map = value.cast::<Map>();
-            let ds_value = map.get("datastore").ok_or_else(|| {
-                format!(
-                    "plugin {}: capabilities() entry {map:?} is not a recognized capability — \
-                     expected a string or `#{{ datastore: \"name\" }}`",
-                    script_path.display()
-                )
-            })?;
-            let ds_name = ds_value.clone().into_string().map_err(|actual| {
-                format!(
-                    "plugin {}: capabilities() datastore name must be a string, got {actual}",
-                    script_path.display()
-                )
-            })?;
-            if ds_name.trim().is_empty() {
-                return Err(format!(
-                    "plugin {}: capabilities() declares a datastore with an empty name",
-                    script_path.display()
-                ));
-            }
-            out.push(Capability::Datastore(ds_name));
-            continue;
-        }
-
         let name = value.into_string().map_err(|actual| {
             format!(
-                "plugin {}: capabilities() must return an array of strings or \
-                 `#{{ datastore: \"name\" }}` maps, got {actual}",
+                "plugin {}: capabilities() must return an array of strings, got {actual}",
                 script_path.display()
             )
         })?;
@@ -746,8 +717,7 @@ pub fn declared_capabilities_from_ast(
             .any(|h| offered_capabilities(h).contains(&name.as_str()));
         if !offered_by_any_hook {
             return Err(format!(
-                "plugin {} declares unknown capability {name:?} — the {hook} hook offers: {}, \
-                 or `#{{ datastore: \"name\" }}`",
+                "plugin {} declares unknown capability {name:?} — the {hook} hook offers: {}",
                 script_path.display(),
                 join_offered(offered)
             ));
@@ -785,33 +755,17 @@ pub struct GrantedCapabilities {
     /// connection, which is not `Sync` and so cannot live inside a Rhai
     /// [`Dynamic`], and `pick` takes no catalog.
     pub entry_ids: Option<Arc<HashMap<(String, String), String>>>,
-    /// Opened handles for every datastore this pool was granted (#181), keyed
-    /// by the grant's name — the same name a script's `capabilities()`
-    /// declares via `#{ datastore: "name" }`. Empty for a pool that grants
-    /// none, which is every pool before this field existed.
-    ///
-    /// `plexdb_reader::Reader` wraps a `rusqlite` connection, which is
-    /// [`Send`] but not [`Sync`]; the [`Mutex`] is what lets one [`Arc`] live
-    /// inside a Rhai [`Dynamic`] under this engine's `sync` feature, which
-    /// requires every registered type to be `Send + Sync`. Contention is not
-    /// a concern — [`pick`] runs one script call at a time on one thread, so
-    /// the lock is never held by more than one caller.
-    pub datastores: HashMap<String, Arc<Mutex<plexdb_reader::Reader>>>,
 }
 
 impl GrantedCapabilities {
     /// Read a pool's granted capability names back into the two flags [`pick`]
     /// acts on, so a caller never has to know how a capability is spelled.
-    /// Names that are not simple capabilities — a datastore grant — are
-    /// ignored here; [`Self::with_datastores`] handles those separately,
-    /// since opening one can fail and this constructor cannot.
     pub fn from_names(names: &[String]) -> Self {
         let has = |want: &str| names.iter().any(|n| n == want);
         Self {
             catalog_read: has("catalog_read"),
             http: has("http"),
             entry_ids: None,
-            datastores: HashMap::new(),
         }
     }
 
@@ -833,31 +787,6 @@ impl GrantedCapabilities {
         }
         Ok(self)
     }
-
-    /// Open every grant in `grants` and fold the handles into this capability
-    /// set, keyed by grant name. Called once per plugin pool per generation
-    /// (`pattern::resolve_pool_sources`), right before [`pick`] runs —
-    /// load-time validation ([`crate::config::validate`]) already proved each
-    /// path opens and is at the schema version this build understands; this
-    /// reopens it fresh each generation rather than caching a handle across
-    /// them, since a `Reader::open` is one file open plus one `SELECT`, not a
-    /// network round trip.
-    ///
-    /// Fails naming the datastore, its path, and the underlying error if a
-    /// store that validated at load can no longer be opened — e.g. deleted or
-    /// moved mid-run.
-    pub fn with_datastores(
-        mut self,
-        grants: &[crate::config::DatastoreGrant],
-    ) -> Result<Self, String> {
-        for grant in grants {
-            let reader = plexdb_reader::Reader::open(&grant.path, None, None)
-                .map_err(|e| format!("datastore {:?} at {:?}: {e}", grant.name, grant.path))?;
-            self.datastores
-                .insert(grant.name.clone(), Arc::new(Mutex::new(reader)));
-        }
-        Ok(self)
-    }
 }
 
 /// The `ctx` argument handed to a plugin's `pick()`.
@@ -868,9 +797,7 @@ impl GrantedCapabilities {
 /// with a message that names the capability.
 /// Every other field is an ordinary infallible getter; nothing about their
 /// values or names changes from before this existed, so a script that never
-/// touches a gated field is unaffected. `ctx.datastore("name")` (#181) is
-/// gated the same way, except by name rather than by a single flag — see
-/// [`ScoreCtx::get_datastore`].
+/// touches a gated field is unaffected.
 #[derive(Debug, Clone)]
 struct ScoreCtx {
     /// Filled only when `catalog_read` was granted; `None` is what turns a
@@ -881,13 +808,6 @@ struct ScoreCtx {
     target_count: i64,
     now: i64,
     recent: Dynamic,
-    /// Every datastore this pool was granted (#181), keyed by name — the same
-    /// map [`GrantedCapabilities::datastores`] carries, moved across whole and
-    /// wrapped in the registered [`Datastore`] type only when a script asks
-    /// for one. A name absent here is indistinguishable to the script from one
-    /// that was never declared: both fail [`ScoreCtx::get_datastore`] the same
-    /// way.
-    datastores: HashMap<String, Arc<Mutex<plexdb_reader::Reader>>>,
     /// The channel's resolved generation seed, mixed with this pool's name
     /// (#255, ADR 0005) — the one source of reproducible entropy inside the
     /// sandbox. Not gated: a `pool_provider` script always receives it, the
@@ -957,18 +877,6 @@ impl ScoreCtx {
         self.recent.clone()
     }
 
-    /// `ctx.datastore("name")` (#181). A name this pool was not granted —
-    /// whether never declared, never granted, or misspelled — fails here
-    /// naming the datastore, the same load-bearing error shape
-    /// [`ungranted`] gives the two boolean-gated fields.
-    fn get_datastore(&mut self, name: &str) -> Result<Dynamic, Box<EvalAltResult>> {
-        self.datastores
-            .get(name)
-            .cloned()
-            .map(|reader| Dynamic::from(Datastore(reader)))
-            .ok_or_else(|| format!("datastore {name:?} not declared or granted").into())
-    }
-
     fn get_seed(&mut self) -> i64 {
         self.seed
     }
@@ -1007,218 +915,6 @@ impl ScoreCtx {
             None => Dynamic::UNIT,
         }
     }
-}
-
-/// A live handle to one granted datastore (#181), registered as its own Rhai
-/// type so a script calls `ctx.datastore("name").enrichment_for(...)` and the
-/// crate's other five accessors directly. Wraps the same
-/// `Arc<Mutex<plexdb_reader::Reader>>` [`GrantedCapabilities::datastores`]
-/// carries — see that field's doc for why the mutex exists.
-#[derive(Debug, Clone)]
-struct Datastore(Arc<Mutex<plexdb_reader::Reader>>);
-
-impl Datastore {
-    fn lock(&self) -> std::sync::MutexGuard<'_, plexdb_reader::Reader> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn enrichment_for(
-        &mut self,
-        item_id: &str,
-        namespace: &str,
-    ) -> Result<Array, Box<EvalAltResult>> {
-        let facts = self
-            .lock()
-            .enrichment_for(item_id, namespace)
-            .map_err(|e| format!("datastore: enrichment_for({item_id:?}, {namespace:?}): {e}"))?;
-        Ok(facts.into_iter().map(enrichment_fact_to_dynamic).collect())
-    }
-
-    /// One host call for a whole candidate set, rather than
-    /// [`Self::enrichment_for`] once per id — see
-    /// [`plexdb_reader::Reader::enrichment_for_many`] for why that call shape
-    /// exists at all (plex-db-ex#40).
-    fn enrichment_for_many(
-        &mut self,
-        item_ids: Array,
-        namespace: &str,
-    ) -> Result<Map, Box<EvalAltResult>> {
-        let ids: Vec<String> = item_ids
-            .into_iter()
-            .map(|id| {
-                id.into_string().map_err(|actual| {
-                    format!(
-                        "datastore: enrichment_for_many: item id must be a string, got {actual}"
-                    )
-                })
-            })
-            .collect::<Result<_, String>>()?;
-        let by_item = self
-            .lock()
-            .enrichment_for_many(ids.iter().map(String::as_str), namespace)
-            .map_err(|e| format!("datastore: enrichment_for_many({namespace:?}): {e}"))?;
-        Ok(by_item
-            .into_iter()
-            .map(|(item_id, facts)| {
-                let facts: Array = facts.into_iter().map(enrichment_fact_to_dynamic).collect();
-                (item_id.into(), Dynamic::from_array(facts))
-            })
-            .collect())
-    }
-
-    /// The stored keyword a raw spelling maps to, or `()` for a spelling the
-    /// store has never seen — the same lookup [`crate::profile::resolve`]
-    /// runs for a `keyword:` profile entry, exposed here so a script can
-    /// explain a candidate's own keywords the same way.
-    fn keyword_for_surface(&mut self, surface: &str) -> Result<Dynamic, Box<EvalAltResult>> {
-        let keyword = self
-            .lock()
-            .keyword_for_surface(surface)
-            .map_err(|e| format!("datastore: keyword_for_surface({surface:?}): {e}"))?;
-        Ok(keyword.map(Dynamic::from).unwrap_or(Dynamic::UNIT))
-    }
-
-    /// Every raw spelling the store recorded for a stored `keyword` — the
-    /// audit's way of showing which spelling(s) actually earned a candidate
-    /// its match, rather than only the stemmed form the score math uses.
-    fn surfaces_for_keyword(&mut self, keyword: &str) -> Result<Array, Box<EvalAltResult>> {
-        let surfaces = self
-            .lock()
-            .surfaces_for_keyword(keyword)
-            .map_err(|e| format!("datastore: surfaces_for_keyword({keyword:?}): {e}"))?;
-        Ok(surfaces.into_iter().map(Dynamic::from).collect())
-    }
-
-    fn edges_from(&mut self, item_id: &str, edge_type: &str) -> Result<Array, Box<EvalAltResult>> {
-        let edges = self
-            .lock()
-            .edges_from(item_id, edge_type)
-            .map_err(|e| format!("datastore: edges_from({item_id:?}, {edge_type:?}): {e}"))?;
-        Ok(edges.into_iter().map(edge_to_dynamic).collect())
-    }
-
-    fn edges_to(&mut self, item_id: &str, edge_type: &str) -> Result<Array, Box<EvalAltResult>> {
-        let edges = self
-            .lock()
-            .edges_to(item_id, edge_type)
-            .map_err(|e| format!("datastore: edges_to({item_id:?}, {edge_type:?}): {e}"))?;
-        Ok(edges.into_iter().map(edge_to_dynamic).collect())
-    }
-
-    /// The tags sharing titles with `tag` on the precomputed tag network of
-    /// `kind`, strongest first, as `[#{ tag, shared, df }]`.
-    fn tag_neighbours(&mut self, kind: &str, tag: &str) -> Result<Array, Box<EvalAltResult>> {
-        let neighbours = self
-            .lock()
-            .tag_neighbours(kind, tag)
-            .map_err(|e| format!("datastore: tag_neighbours({kind:?}, {tag:?}): {e}"))?;
-        Ok(neighbours
-            .into_iter()
-            .map(|n| {
-                let mut m = Map::new();
-                m.insert("tag".into(), n.tag.into());
-                m.insert("shared".into(), n.shared.into());
-                m.insert("df".into(), n.df.into());
-                Dynamic::from_map(m)
-            })
-            .collect())
-    }
-
-    fn taste_vector_for(&mut self, plex_account_id: i64) -> Result<Dynamic, Box<EvalAltResult>> {
-        let vector = self
-            .lock()
-            .taste_vector_for(plex_account_id)
-            .map_err(|e| format!("datastore: taste_vector_for({plex_account_id}): {e}"))?;
-        Ok(taste_vector_to_dynamic(vector))
-    }
-
-    /// Every unit one account has ever played, as an array of id strings
-    /// (plex-db-ex#60). The lifetime answer, unlike a bounded fetch of recent
-    /// rows, which reports a film watched three years ago as unseen.
-    fn watched_units_for(&mut self, plex_account_id: i64) -> Result<Array, Box<EvalAltResult>> {
-        let units = self
-            .lock()
-            .watched_units_for(plex_account_id)
-            .map_err(|e| format!("datastore: watched_units_for({plex_account_id}): {e}"))?;
-        Ok(units.into_iter().map(Dynamic::from).collect())
-    }
-
-    /// The same, pooled across every account — what the house has seen.
-    fn watched_units(&mut self) -> Result<Array, Box<EvalAltResult>> {
-        let units = self
-            .lock()
-            .watched_units()
-            .map_err(|e| format!("datastore: watched_units(): {e}"))?;
-        Ok(units.into_iter().map(Dynamic::from).collect())
-    }
-
-    /// The server-wide taste vector — see
-    /// [`plexdb_reader::Reader::pooled_taste_vector`] for what "pooled" means
-    /// (plex-db-ex#39).
-    fn pooled_taste_vector(&mut self) -> Result<Dynamic, Box<EvalAltResult>> {
-        let vector = self
-            .lock()
-            .pooled_taste_vector()
-            .map_err(|e| format!("datastore: pooled_taste_vector(): {e}"))?;
-        Ok(taste_vector_to_dynamic(vector))
-    }
-}
-
-/// One `enrichment` row (#181), as a Rhai map: `namespace`, `key`, `value`,
-/// `fetched_at` — the same four fields [`plexdb_reader::EnrichmentFact`]
-/// carries, untouched.
-fn enrichment_fact_to_dynamic(fact: plexdb_reader::EnrichmentFact) -> Dynamic {
-    let mut m = Map::new();
-    m.insert("namespace".into(), fact.namespace.into());
-    m.insert("key".into(), fact.key.into());
-    m.insert("value".into(), fact.value.into());
-    m.insert("fetched_at".into(), fact.fetched_at.into());
-    Dynamic::from_map(m)
-}
-
-/// One `edges` row (#181), as a Rhai map — mirrors [`plexdb_reader::Edge`]
-/// field for field.
-fn edge_to_dynamic(edge: plexdb_reader::Edge) -> Dynamic {
-    let mut m = Map::new();
-    m.insert("from_id".into(), edge.from_id.into());
-    m.insert("to_id".into(), edge.to_id.into());
-    m.insert("edge_type".into(), edge.edge_type.into());
-    m.insert("rank".into(), edge.rank.into());
-    m.insert("fetched_at".into(), edge.fetched_at.into());
-    Dynamic::from_map(m)
-}
-
-/// One [`plexdb_reader::TasteVector`] (#181), as a Rhai map: `attributes` (an
-/// array of `{namespace, key, value, weight}` maps) and
-/// `shows_without_seasons` (an array of strings) — mirrors the Rust struct
-/// field for field, nothing renamed or dropped.
-fn taste_vector_to_dynamic(vector: plexdb_reader::TasteVector) -> Dynamic {
-    let attributes: Array = vector
-        .attributes
-        .into_iter()
-        .map(|a| {
-            let mut m = Map::new();
-            m.insert("namespace".into(), a.namespace.into());
-            m.insert("key".into(), a.key.into());
-            m.insert("value".into(), a.value.into());
-            m.insert("weight".into(), a.weight.into());
-            Dynamic::from_map(m)
-        })
-        .collect();
-    let shows_without_seasons: Array = vector
-        .shows_without_seasons
-        .into_iter()
-        .map(Dynamic::from)
-        .collect();
-    let mut m = Map::new();
-    m.insert("attributes".into(), Dynamic::from_array(attributes));
-    m.insert(
-        "shows_without_seasons".into(),
-        Dynamic::from_array(shows_without_seasons),
-    );
-    Dynamic::from_map(m)
 }
 
 /// The step (in seconds) [`crate::resolve::resolve_channel_with_resume`] seeds
@@ -1322,10 +1018,6 @@ pub(crate) fn set_plugin_clock(start: f64, step: f64) -> ClockGuard {
 /// `pub(crate)` so [`crate::sequence`] (#169) shares it rather than a second
 /// engine configuration that could drift from this one.
 ///
-/// [`Datastore`] (#181) is registered here unconditionally too, for the same
-/// reason `ScoreCtx` is — harmless when nothing constructs one, and it keeps
-/// every plugin call sharing one engine configuration.
-///
 /// `timestamp()`/`elapsed()` are registered here unconditionally too, for the
 /// same "one shared configuration" reason: they shadow rhai's own built-ins
 /// (which read the real, unfixed wall clock) with a pair backed by
@@ -1352,7 +1044,6 @@ pub(crate) fn engine() -> Engine {
         .register_get("account_id", ScoreCtx::get_account_id)
         .register_get("profile", ScoreCtx::get_profile)
         .register_get("ignore_keywords", ScoreCtx::get_ignore_keywords)
-        .register_fn("datastore", ScoreCtx::get_datastore)
         .register_fn("entry_id_for", ScoreCtx::entry_id_for)
         .register_fn("http", ScoreCtx::http);
     engine.register_fn("parse_json", crate::plugin_http::parse_json);
@@ -1369,19 +1060,6 @@ pub(crate) fn engine() -> Engine {
     engine.register_fn("log", |text: &str| {
         tracing::info!(event = "score.log", "{text}");
     });
-    engine
-        .register_type_with_name::<Datastore>("Datastore")
-        .register_fn("enrichment_for", Datastore::enrichment_for)
-        .register_fn("enrichment_for_many", Datastore::enrichment_for_many)
-        .register_fn("edges_from", Datastore::edges_from)
-        .register_fn("edges_to", Datastore::edges_to)
-        .register_fn("tag_neighbours", Datastore::tag_neighbours)
-        .register_fn("taste_vector_for", Datastore::taste_vector_for)
-        .register_fn("pooled_taste_vector", Datastore::pooled_taste_vector)
-        .register_fn("watched_units_for", Datastore::watched_units_for)
-        .register_fn("watched_units", Datastore::watched_units)
-        .register_fn("keyword_for_surface", Datastore::keyword_for_surface)
-        .register_fn("surfaces_for_keyword", Datastore::surfaces_for_keyword);
     engine
         .register_fn("timestamp", clock_read)
         .register_fn("elapsed", |t0: f64| clock_read() - t0);
@@ -1469,12 +1147,7 @@ impl ScoreCache {
     /// half as [`Self::prepare`]. A pool that authored neither stores nothing,
     /// and its script reads empty arrays.
     ///
-    /// A `keyword` reference resolves against the pool's first granted
-    /// datastore (`pool.datastores`) — the same store a keyword-reading
-    /// scorer script names via its own `datastore_name()`/`capabilities()` —
-    /// opened fresh here exactly as [`GrantedCapabilities::with_datastores`]
-    /// does for [`pick`], for the same reason: a `Reader::open` is one file
-    /// open plus one `SELECT`, cheap enough to redo rather than cache.
+    /// A `keyword` reference resolves against [`Self::explorer`].
     fn prepare_profile(
         &mut self,
         catalog: &Catalog,
@@ -1502,18 +1175,11 @@ impl ScoreCache {
             return Ok(());
         }
         let entries = crate::profile::load(pool, base_dir)?;
-        let keyword_store = match pool.datastores.first() {
-            Some(grant) => Some(
-                plexdb_reader::Reader::open(&grant.path, None, None)
-                    .map_err(|e| format!("datastore {:?} at {:?}: {e}", grant.name, grant.path))?,
-            ),
-            None => None,
-        };
         let resolved = crate::profile::resolve(
             catalog,
             &entries,
             &pool.ignore_keywords,
-            keyword_store.as_ref(),
+            self.explorer.as_ref(),
         )?;
         for x in &resolved.exclusions {
             tracing::info!(
@@ -1638,8 +1304,8 @@ fn mixed_seed(seed: u64, pool_name: &str) -> i64 {
 ///
 /// `granted` (#167) is trusted as already reconciled against what the script
 /// declares — [`crate::config::validate`] rejects a mismatch at config load —
-/// so this only decides what `ctx.sets` / `ctx.datastore(name)`
-/// (#181) resolve to for *this* call; it never re-reads `capabilities()`.
+/// so this only decides what `ctx.sets` resolves to for *this* call; it
+/// never re-reads `capabilities()`.
 ///
 /// `dice` is this pool's seed and temperature for the period being ranked
 /// ([`crate::variety`]) — the seed is the same value
@@ -1705,10 +1371,6 @@ pub fn pick(
                 .map(|id| Dynamic::from(id.clone()))
                 .collect(),
         ),
-        // Datastore grants (#181) are keyed by name, not gated behind one flag
-        // — `ScoreCtx::get_datastore` fails a lookup of any name absent here,
-        // whether the pool never declared it or `validate` never granted it.
-        datastores: granted.datastores,
         seed: mixed_seed(dice.seed, pool_name),
         temperature: dice.temperature,
         account_id: inputs.account_id,
@@ -2575,37 +2237,40 @@ fn audit(ctx, picks, workspace) { #{} }
         serde_norway::from_str(yaml_src).unwrap()
     }
 
-    /// A minimal real plexdb store, schema v10, holding only `keyword_forms`
-    /// — the one table a pool's `keyword`/`ignore_keywords` resolution reads
-    /// (`crate::profile::resolve_keyword_surface`). `forms` is
-    /// `(surface, stored keyword)` pairs.
-    fn write_keyword_store_fixture(path: &std::path::Path, forms: &[(&str, &str)]) {
-        let conn = rusqlite::Connection::open(path).unwrap();
-        conn.execute_batch(&format!(
-            "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version (version) VALUES ({version});
-             CREATE TABLE reader_shape (version INTEGER NOT NULL);
-             INSERT INTO reader_shape (version) VALUES ({version});
-             CREATE TABLE keyword_forms (surface TEXT PRIMARY KEY, keyword TEXT NOT NULL);",
-            version = plexdb_reader::SUPPORTED_READER_SHAPE,
-        ))
-        .unwrap();
+    /// A fake plex-db-ex explorer that knows each `(surface, stored keyword)`
+    /// pair and files each `(item_id, keyword)` under the `keywords`
+    /// namespace — what a pool's `keyword`/`ignore_keywords` resolution reads
+    /// (`crate::profile::resolve_keyword_surface`, `KeywordIndex`).
+    fn keyword_explorer(
+        forms: &[(&str, &str)],
+        tagged: &[(&str, &str, &str)],
+    ) -> crate::plexdb_ex::fake::Server {
+        let mut store = crate::plexdb_ex::fake::Store::default();
+        let mut by_keyword: HashMap<&str, Vec<&str>> = HashMap::new();
         for (surface, keyword) in forms {
-            conn.execute(
-                "INSERT INTO keyword_forms (surface, keyword) VALUES (?1, ?2)",
-                (surface, keyword),
-            )
-            .unwrap();
+            by_keyword.entry(keyword).or_default().push(surface);
         }
+        for (keyword, surfaces) in by_keyword {
+            store.keyword(keyword, &surfaces);
+        }
+        for (id, kind, keyword) in tagged {
+            store.item(id, kind);
+            store.fact(id, "keywords", "keyword", keyword);
+        }
+        crate::plexdb_ex::fake::serve(store)
     }
 
-    fn run_profile(
+    fn run_profile_with(
         catalog: &Catalog,
         dir: &tempfile::TempDir,
         pool: &crate::config::Pool,
+        explorer: Option<&crate::plexdb_ex::fake::Server>,
     ) -> Result<Vec<String>, String> {
         let p = write(dir, PROFILE_ECHO);
-        let mut cache = ScoreCache::default();
+        let mut cache = ScoreCache {
+            explorer: explorer.map(|s| crate::plexdb_ex::Explorer::new(&s.url)),
+            ..Default::default()
+        };
         cache.prepare_profile(catalog, pool, dir.path())?;
         run(
             catalog,
@@ -2615,6 +2280,14 @@ fn audit(ctx, picks, workspace) { #{} }
             None,
             &mut cache,
         )
+    }
+
+    fn run_profile(
+        catalog: &Catalog,
+        dir: &tempfile::TempDir,
+        pool: &crate::config::Pool,
+    ) -> Result<Vec<String>, String> {
+        run_profile_with(catalog, dir, pool, None)
     }
 
     /// An `exclude: true` entry weights nothing, so it is not in
@@ -2658,30 +2331,25 @@ fn audit(ctx, picks, workspace) { #{} }
             "- { genre: Horror, weight: -1.0 }\n",
         )
         .unwrap();
-        let db = dir.path().join("taste.db");
-        write_keyword_store_fixture(
-            &db,
+        let explorer = keyword_explorer(
             &[
                 ("bank heist", "bank heist"),
                 ("duringcreditsstinger", "duringcreditsstinger"),
             ],
+            &[],
         );
-        let pool = profile_pool(&format!(
+        let pool = profile_pool(
             r#"
 name: movies
 plugin: plugin.rhai
-datastores:
-  - name: taste
-    path: "{db}"
 profile_files: [a.yaml, b.yaml]
 profile:
-  - {{ item: "Heat (1995)", weight: -1.5 }}
-  - {{ set: 'item.year == 2002', weight: 3.0 }}
+  - { item: "Heat (1995)", weight: -1.5 }
+  - { set: 'item.year == 2002', weight: 3.0 }
 ignore_keywords: ["DuringCreditsStinger "]
 "#,
-            db = db.display(),
-        ));
-        let got = run_profile(&profile_catalog(), &dir, &pool).unwrap();
+        );
+        let got = run_profile_with(&profile_catalog(), &dir, &pool, Some(&explorer)).unwrap();
         assert_eq!(
             got,
             vec![
@@ -2696,50 +2364,46 @@ ignore_keywords: ["DuringCreditsStinger "]
 
     /// The store's own stemmed spelling, not the surface as written, is what
     /// `ctx.profile` carries — proving `keyword: Heists` really goes through
-    /// `keyword_forms` rather than just lowercasing (etv-station-sctf.1).
+    /// the store's recorded spellings rather than just lowercasing
+    /// (etv-station-sctf.1).
     #[test]
-    fn a_keyword_resolves_through_keyword_forms_to_its_stored_stem() {
+    fn a_keyword_resolves_through_its_recorded_spelling_to_its_stored_stem() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("taste.db");
-        write_keyword_store_fixture(&db, &[("heists", "heist")]);
-        let pool = profile_pool(&format!(
-            "name: movies\nplugin: plugin.rhai\ndatastores:\n  - name: taste\n    path: \"{db}\"\n\
-             profile:\n  - {{ keyword: Heists, weight: 1.0 }}\n",
-            db = db.display(),
-        ));
-        let got = run_profile(&profile_catalog(), &dir, &pool).unwrap();
+        let explorer = keyword_explorer(&[("heists", "heist")], &[]);
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { keyword: Heists, weight: 1.0 }\n",
+        );
+        let got = run_profile_with(&profile_catalog(), &dir, &pool, Some(&explorer)).unwrap();
         assert_eq!(got, vec!["keyword:keywords=heist:1.0@inline"]);
     }
 
-    /// A spelling `keyword_forms` has never seen fails naming the entry and
+    /// A spelling the store has never recorded fails naming the entry and
     /// the spelling, rather than silently passing it through unmatched.
     #[test]
     fn an_unresolvable_keyword_spelling_fails_naming_it() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("taste.db");
-        write_keyword_store_fixture(&db, &[("heists", "heist")]);
-        let pool = profile_pool(&format!(
-            "name: movies\nplugin: plugin.rhai\ndatastores:\n  - name: taste\n    path: \"{db}\"\n\
-             profile:\n  - {{ keyword: nosuchword, weight: 1.0 }}\n",
-            db = db.display(),
-        ));
-        let msg = run_profile(&profile_catalog(), &dir, &pool).unwrap_err();
+        let explorer = keyword_explorer(&[("heists", "heist")], &[]);
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { keyword: nosuchword, weight: 1.0 }\n",
+        );
+        let msg = run_profile_with(&profile_catalog(), &dir, &pool, Some(&explorer)).unwrap_err();
         assert!(msg.contains("profile entry 1 in inline"), "msg = {msg}");
         assert!(msg.contains("\"nosuchword\""), "msg = {msg}");
         assert!(msg.contains("matches no stored keyword"), "msg = {msg}");
     }
 
-    /// A `keyword` entry on a pool that grants no datastore fails naming the
-    /// entry, rather than resolving against nothing.
+    /// A `keyword` entry with no explorer configured fails naming the entry
+    /// and the variable, rather than resolving against nothing.
     #[test]
-    fn a_keyword_entry_without_a_granted_datastore_fails_naming_it() {
+    fn a_keyword_entry_without_an_explorer_fails_naming_it() {
         let dir = tempfile::tempdir().unwrap();
         let pool = profile_pool(
             "name: movies\nplugin: plugin.rhai\nprofile:\n  - { keyword: heist, weight: 1.0 }\n",
         );
         let msg = run_profile(&profile_catalog(), &dir, &pool).unwrap_err();
         assert!(msg.contains("profile entry 1 in inline"), "msg = {msg}");
-        assert!(msg.contains("grants none"), "msg = {msg}");
+        assert!(msg.contains("PLEXDB_EX_URL"), "msg = {msg}");
+        assert!(msg.contains("it is not set"), "msg = {msg}");
     }
 
     #[test]
@@ -3280,22 +2944,6 @@ fn pick(ctx) { throw "pick must not run"; }
         );
     }
 
-    #[test]
-    fn declared_capabilities_reads_a_named_datastore() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = write(
-            &dir,
-            r#"fn capabilities() { ["catalog_read", #{ datastore: "taste_db" }] }"#,
-        );
-        assert_eq!(
-            declared_capabilities(&p, "pool_provider").unwrap(),
-            vec![
-                Capability::CatalogRead,
-                Capability::Datastore("taste_db".into())
-            ]
-        );
-    }
-
     /// A script with no `capabilities()` at all declares nothing — the field
     /// is optional, unlike `hooks()`. A plugin that only reads the ambient
     /// inputs (`ctx.recent`, `ctx.config`, …) needs no declaration.
@@ -3332,19 +2980,11 @@ fn pick(ctx) { throw "pick must not run"; }
     }
 
     #[test]
-    fn declared_capabilities_rejects_a_datastore_entry_with_an_empty_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = write(&dir, r#"fn capabilities() { [#{ datastore: "" }] }"#);
-        let e = declared_capabilities(&p, "pool_provider").unwrap_err();
-        assert!(e.contains("empty"), "got {e}");
-    }
-
-    #[test]
     fn declared_capabilities_rejects_an_unrecognized_map_shape() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, r#"fn capabilities() { [#{ wat: "taste_db" }] }"#);
         let e = declared_capabilities(&p, "pool_provider").unwrap_err();
-        assert!(e.contains("not a recognized capability"), "got {e}");
+        assert!(e.contains("must return an array of strings"), "got {e}");
     }
 
     /// `declared_capabilities` never runs `sources()` or `pick()`, exactly
@@ -4608,7 +4248,7 @@ fn audit(ctx, picks, workspace) { #{} }
     }
 
     /// A `keyword` exclusion removes every title whose movie or show carries
-    /// the keyword in the datastore — a film by its own keywords, an episode
+    /// the keyword in plex-db-ex — a film by its own keywords, an episode
     /// by its show's — while titles without it stay candidates.
     #[test]
     fn a_keyword_exclusion_removes_films_and_episodes_carrying_it() {
@@ -4618,24 +4258,21 @@ fn audit(ctx, picks, workspace) { #{} }
         let mut ep = Entry::new("ep-1", "episode", "A Very Special Episode", Source::Plex);
         ep.show_id = Some("tvdb:77".into());
         cat.upsert_entry(&ep).unwrap();
-        let db = dir.path().join("taste.db");
-        write_keyword_store_fixture(&db, &[("Christmas", "christmas")]);
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE enrichment (item_id TEXT, namespace TEXT, source TEXT, key TEXT,
-                                      value TEXT, fetched_at TEXT, rank INTEGER);
-             INSERT INTO enrichment VALUES
-               ('imdb:tt0113277', 'keywords', 'tmdb', 'keyword', 'christmas', '2026-01-01', NULL),
-               ('tvdb:77',        'keywords', 'tmdb', 'keyword', 'christmas', '2026-01-01', NULL),
-               ('m2',             'keywords', 'tmdb', 'keyword', 'heist',     '2026-01-01', NULL);",
-        )
-        .unwrap();
-        let pool = profile_pool(&format!(
-            "name: movies\nplugin: plugin.rhai\ndatastores:\n  - name: taste\n    path: \"{db}\"\n\
-             profile:\n  - {{ keyword: Christmas, exclude: true }}\n",
-            db = db.display(),
-        ));
-        let mut cache = ScoreCache::default();
+        let explorer = keyword_explorer(
+            &[("christmas", "christmas")],
+            &[
+                ("imdb:tt0113277", "movie", "christmas"),
+                ("tvdb:77", "show", "christmas"),
+                ("m2", "movie", "heist"),
+            ],
+        );
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { keyword: Christmas, exclude: true }\n",
+        );
+        let mut cache = ScoreCache {
+            explorer: Some(crate::plexdb_ex::Explorer::new(&explorer.url)),
+            ..Default::default()
+        };
         cache.prepare_profile(&cat, &pool, dir.path()).unwrap();
         let excluded = cache.narrowing("movies");
         assert_eq!(
@@ -4658,22 +4295,17 @@ fn audit(ctx, picks, workspace) { #{} }
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, ECHO_SET);
         let cat = profile_catalog();
-        let db = dir.path().join("taste.db");
-        write_keyword_store_fixture(&db, &[("christmas", "christmas")]);
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE enrichment (item_id TEXT, namespace TEXT, source TEXT, key TEXT,
-                                      value TEXT, fetched_at TEXT, rank INTEGER);
-             INSERT INTO enrichment VALUES
-               ('imdb:tt0113277', 'keywords', 'tmdb', 'keyword', 'christmas', '2026-01-01', NULL);",
-        )
-        .unwrap();
-        let pool = profile_pool(&format!(
-            "name: movies\nplugin: plugin.rhai\ndatastores:\n  - name: taste\n    path: \"{db}\"\n\
-             profile:\n  - {{ keyword: christmas, require: true }}\n  - {{ genre: Horror, require: true }}\n",
-            db = db.display(),
-        ));
-        let mut cache = ScoreCache::default();
+        let explorer = keyword_explorer(
+            &[("christmas", "christmas")],
+            &[("imdb:tt0113277", "movie", "christmas")],
+        );
+        let pool = profile_pool(
+            "name: movies\nplugin: plugin.rhai\nprofile:\n  - { keyword: christmas, require: true }\n  - { genre: Horror, require: true }\n",
+        );
+        let mut cache = ScoreCache {
+            explorer: Some(crate::plexdb_ex::Explorer::new(&explorer.url)),
+            ..Default::default()
+        };
         cache.prepare_profile(&cat, &pool, dir.path()).unwrap();
         let narrowing = cache.narrowing("movies");
         cache.prepare(&cat, &p, None, &narrowing).unwrap();

@@ -17,33 +17,31 @@
 //! `plexdb.db` opening a consumer's private database — and only worked when
 //! both stores happened to sit on one host, reached through an
 //! `ETV_CATALOG_PATH` environment variable pointing across a repository
-//! boundary. This repository already reads `plex-db-ex`'s published
-//! snapshot (its ADR-0007), so it already holds both halves; doing the
-//! comparison here needs no new coupling.
+//! boundary. This repository already reads `plex-db-ex` through its explorer
+//! API (ADR 0024), so it already holds both halves; doing the comparison here
+//! needs no new coupling.
 //!
 //! **The join key is the Plex `ratingKey`.** Both stores record every
 //! physical Plex item's rating key as raw provenance, independent of
 //! whatever identity each side derived for it: `entry_sources.source_id`
-//! where `source = 'plex'` here, `plex_items.rating_key` in `plex-db-ex`.
+//! where `source = 'plex'` here, each title's `plex[].rating_key` on the
+//! explorer's `GET /items?include=plex`.
 //! Matching on it is what lets this module tell "the two stores derived
 //! different ids for the same title" apart from "the two stores don't know
 //! about the same titles" — and it only makes sense when both stores were
 //! built by walking the *same* Plex server, which nothing in either schema
 //! records, so this module cannot check it.
 //!
-//! **Read-only on both sides, always.** `plexdb_conn` is opened via
-//! [`open_plexdb_readonly`], which uses SQLite's own read-only flag; the
-//! `Catalog` this compares against is whatever the caller already opened
-//! (normally [`super::Catalog::open_readonly`]). Nothing here executes a
-//! write statement, so a write attempted through either connection fails at
-//! the database rather than being prevented by this module's own
-//! discipline.
+//! **Read-only on both sides, always.** The `plex-db-ex` half is
+//! [`PlexdbRows`], read from the explorer's GET routes
+//! ([`PlexdbRows::from_explorer`]); the `Catalog` this compares against is
+//! whatever the caller already opened (normally
+//! [`super::Catalog::open_readonly`]). Nothing here executes a write
+//! statement.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags};
-use thiserror::Error;
+use rusqlite::Connection;
 
 use super::model::ExternalNs;
 use super::{Catalog, CatalogError};
@@ -96,62 +94,80 @@ impl ReconcileReport {
     }
 }
 
-/// Opening a `plex-db-ex` snapshot for [`reconcile`].
-#[derive(Debug, Error)]
-pub enum ReconcileOpenError {
-    #[error("failed to open plex-db-ex snapshot at {path}: {source}")]
-    Open {
-        path: PathBuf,
-        #[source]
-        source: rusqlite::Error,
-    },
-
-    #[error(transparent)]
-    Store(#[from] plexdb_reader::ReaderError),
+/// The `plex-db-ex` half of [`reconcile`]: what its explorer reports for every
+/// title, keyed the way the comparison joins.
+#[derive(Debug, Clone, Default)]
+pub struct PlexdbRows {
+    /// Plex rating key → `item_id`.
+    pub by_rk: HashMap<String, String>,
+    /// `item_id` → title.
+    pub titles: HashMap<String, String>,
+    /// `item_id` → its external ids in the four recognised namespaces.
+    pub external: HashMap<String, Vec<(ExternalNs, String)>>,
 }
 
-/// Open a `plex-db-ex` snapshot read-only, refusing anything the vendored
-/// `plexdb-reader` crate would refuse — a store whose read shape this
-/// comparison is not written against — rather than let a renamed or missing
-/// column surface as a confusing query failure deep inside [`reconcile`].
-pub fn open_plexdb_readonly(path: impl AsRef<Path>) -> Result<Connection, ReconcileOpenError> {
-    let path = path.as_ref();
-    let conn =
-        Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|source| {
-            ReconcileOpenError::Open {
-                path: path.to_path_buf(),
-                source,
+impl PlexdbRows {
+    /// One walk of `GET /items?include=external_ids,plex`.
+    pub fn from_explorer(explorer: &crate::plexdb_ex::Explorer) -> Result<Self, String> {
+        let mut rows = Self::default();
+        explorer.items("external_ids,plex", |item| {
+            let Some(id) = item.get("item_id").and_then(|v| v.as_str()) else {
+                return;
+            };
+            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+            rows.titles.insert(id.to_string(), title.to_string());
+            for p in item
+                .get("plex")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(rk) = p.get("rating_key").and_then(|v| v.as_str()) {
+                    rows.by_rk.insert(rk.to_string(), id.to_string());
+                }
+            }
+            for x in item
+                .get("external_ids")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let (Some(ns), Some(value)) = (
+                    x.get("ns").and_then(|v| v.as_str()),
+                    x.get("value").and_then(|v| v.as_str()),
+                ) else {
+                    continue;
+                };
+                if let Some(ns) = RECOGNISED_NAMESPACES.iter().find(|r| r.as_str() == ns) {
+                    rows.external
+                        .entry(id.to_string())
+                        .or_default()
+                        .push((*ns, value.to_string()));
+                }
             }
         })?;
-    plexdb_reader::check_store(&conn, path)?;
-    Ok(conn)
+        Ok(rows)
+    }
 }
 
 /// Compare every title both stores know about, joined by Plex rating key.
-/// `catalog` is this repository's already-open catalog; `plexdb_conn` is a
-/// read-only connection onto a `plex-db-ex` snapshot, normally opened via
-/// [`open_plexdb_readonly`].
-pub fn reconcile(
-    catalog: &Catalog,
-    plexdb_conn: &Connection,
-) -> Result<ReconcileReport, CatalogError> {
+/// `catalog` is this repository's already-open catalog; `plexdb` is what the
+/// explorer reported ([`PlexdbRows::from_explorer`]).
+pub fn reconcile(catalog: &Catalog, plexdb: &PlexdbRows) -> Result<ReconcileReport, CatalogError> {
     let etv_conn = &catalog.conn;
 
     let etv_by_rk = fetch_pairs(
         etv_conn,
         "SELECT source_id, entry_id FROM entry_sources WHERE source = 'plex'",
     )?;
-    let plexdb_by_rk = fetch_pairs(plexdb_conn, "SELECT rating_key, item_id FROM plex_items")?;
+    let plexdb_by_rk = &plexdb.by_rk;
     let etv_titles = fetch_pairs(etv_conn, "SELECT entry_id, title FROM entries")?;
-    let plexdb_titles = fetch_pairs(plexdb_conn, "SELECT item_id, title FROM items")?;
+    let plexdb_titles = &plexdb.titles;
     let etv_guids = fetch_guids(
         etv_conn,
         "SELECT entry_id, namespace, value FROM entry_external_ids WHERE namespace IN (?1, ?2, ?3, ?4)",
     )?;
-    let plexdb_guids = fetch_guids(
-        plexdb_conn,
-        "SELECT item_id, ns, value FROM external_ids WHERE ns IN (?1, ?2, ?3, ?4)",
-    )?;
+    let plexdb_guids = &plexdb.external;
 
     // How many rating keys each of plex-db-ex's identities covers. An
     // identity covering more than one did not derive its id for every one
@@ -234,8 +250,8 @@ pub fn reconcile(
     })
 }
 
-/// `SELECT <key>, <value> FROM ...` into a map, for the four `(rating_key →
-/// id)` / `(id → title)` lookups [`reconcile`] needs on each side.
+/// `SELECT <key>, <value> FROM ...` into a map, for the `(rating_key → id)` /
+/// `(id → title)` lookups [`reconcile`] needs on the catalog side.
 fn fetch_pairs(conn: &Connection, sql: &str) -> Result<HashMap<String, String>, CatalogError> {
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |row| {
@@ -356,53 +372,24 @@ mod tests {
     use super::*;
     use crate::catalog::model::{Entry, EntrySource, Source};
 
-    /// A minimal plex-db-ex store: `items`, `plex_items`, `external_ids` —
-    /// the exact subset this module reads.
-    fn plexdb_store() -> Connection {
-        let conn = Connection::open_in_memory().expect("open in-memory plexdb");
-        conn.execute_batch(
-            "CREATE TABLE items (item_id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT NOT NULL);
-             CREATE TABLE plex_items (
-                 rating_key TEXT PRIMARY KEY,
-                 item_id TEXT NOT NULL,
-                 section_id TEXT NOT NULL,
-                 last_seen TEXT
-             );
-             CREATE TABLE external_ids (
-                 item_id TEXT NOT NULL,
-                 ns TEXT NOT NULL,
-                 value TEXT NOT NULL,
-                 kind TEXT NOT NULL
-             );",
-        )
-        .expect("build a minimal plexdb schema");
-        conn
+    fn plexdb_store() -> PlexdbRows {
+        PlexdbRows::default()
     }
 
     fn add_item(
-        conn: &Connection,
+        rows: &mut PlexdbRows,
         item_id: &str,
         title: &str,
         rating_key: &str,
         guids: &[(ExternalNs, &str)],
     ) {
-        conn.execute(
-            "INSERT INTO items (item_id, type, title) VALUES (?1, 'movie', ?2)",
-            rusqlite::params![item_id, title],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO plex_items (rating_key, item_id, section_id, last_seen) \
-             VALUES (?1, ?2, '1', '2024-01-01T00:00:00+00:00')",
-            rusqlite::params![rating_key, item_id],
-        )
-        .unwrap();
+        rows.titles.insert(item_id.into(), title.into());
+        rows.by_rk.insert(rating_key.into(), item_id.into());
         for (ns, value) in guids {
-            conn.execute(
-                "INSERT INTO external_ids (item_id, ns, value, kind) VALUES (?1, ?2, ?3, 'movie')",
-                rusqlite::params![item_id, ns.as_str(), value],
-            )
-            .unwrap();
+            rows.external
+                .entry(item_id.into())
+                .or_default()
+                .push((*ns, value.to_string()));
         }
     }
 
@@ -437,7 +424,7 @@ mod tests {
     #[test]
     fn matching_titles_agree() {
         let catalog = Catalog::open_in_memory().unwrap();
-        let plexdb = plexdb_store();
+        let mut plexdb = plexdb_store();
         add_entry(
             &catalog,
             "imdb:tt1",
@@ -446,7 +433,7 @@ mod tests {
             &[(ExternalNs::Imdb, "tt1")],
         );
         add_item(
-            &plexdb,
+            &mut plexdb,
             "imdb:tt1",
             "Die Hard",
             "100",
@@ -465,7 +452,7 @@ mod tests {
     #[test]
     fn a_guid_present_in_only_one_store_is_reported_with_that_reason() {
         let catalog = Catalog::open_in_memory().unwrap();
-        let plexdb = plexdb_store();
+        let mut plexdb = plexdb_store();
         // etv-station only ever recorded the tmdb guid for this rating key.
         add_entry(
             &catalog,
@@ -475,7 +462,7 @@ mod tests {
             &[(ExternalNs::Tmdb, "562")],
         );
         add_item(
-            &plexdb,
+            &mut plexdb,
             "imdb:tt1",
             "Die Hard",
             "100",
@@ -506,9 +493,9 @@ mod tests {
     #[test]
     fn an_identity_covering_two_rating_keys_is_reported_as_inherited_not_drifted() {
         let catalog = Catalog::open_in_memory().unwrap();
-        let plexdb = plexdb_store();
+        let mut plexdb = plexdb_store();
         add_item(
-            &plexdb,
+            &mut plexdb,
             "imdb:tt0047034",
             "Godzilla",
             "5550",
@@ -517,12 +504,8 @@ mod tests {
         // A second rating key that inherited Godzilla's identity — the show
         // Plex reports as The Golden Girls.
         plexdb
-            .execute(
-                "INSERT INTO plex_items (rating_key, item_id, section_id, last_seen) \
-                 VALUES ('141718', 'imdb:tt0047034', '2', '2024-01-01T00:00:00+00:00')",
-                [],
-            )
-            .unwrap();
+            .by_rk
+            .insert("141718".into(), "imdb:tt0047034".into());
         add_entry(
             &catalog,
             "imdb:tt0047034",
@@ -555,8 +538,8 @@ mod tests {
     #[test]
     fn both_falling_back_to_a_path_hash_is_reported_as_a_canonical_path_disagreement() {
         let catalog = Catalog::open_in_memory().unwrap();
-        let plexdb = plexdb_store();
-        add_item(&plexdb, "fs:aaaaaaaaaaaaaaaa", "Home Video", "200", &[]);
+        let mut plexdb = plexdb_store();
+        add_item(&mut plexdb, "fs:aaaaaaaaaaaaaaaa", "Home Video", "200", &[]);
         add_entry(&catalog, "fs:bbbbbbbbbbbbbbbb", "Home Video", "200", &[]);
 
         let report = reconcile(&catalog, &plexdb).unwrap();
@@ -572,9 +555,9 @@ mod tests {
     #[test]
     fn a_guid_win_against_a_path_hash_is_reported_as_a_missing_guid() {
         let catalog = Catalog::open_in_memory().unwrap();
-        let plexdb = plexdb_store();
+        let mut plexdb = plexdb_store();
         add_item(
-            &plexdb,
+            &mut plexdb,
             "imdb:tt9",
             "Unmatched Elsewhere",
             "300",
@@ -599,9 +582,9 @@ mod tests {
     #[test]
     fn titles_present_in_only_one_store_are_counted_and_listed() {
         let catalog = Catalog::open_in_memory().unwrap();
-        let plexdb = plexdb_store();
+        let mut plexdb = plexdb_store();
         add_item(
-            &plexdb,
+            &mut plexdb,
             "imdb:tt1",
             "Only In Plexdb",
             "100",
@@ -632,15 +615,21 @@ mod tests {
     #[test]
     fn running_it_twice_produces_the_same_report() {
         let catalog = Catalog::open_in_memory().unwrap();
-        let plexdb = plexdb_store();
+        let mut plexdb = plexdb_store();
         add_item(
-            &plexdb,
+            &mut plexdb,
             "imdb:tt1",
             "A",
             "100",
             &[(ExternalNs::Imdb, "tt1")],
         );
-        add_item(&plexdb, "tmdb:2", "B", "101", &[(ExternalNs::Tmdb, "2")]);
+        add_item(
+            &mut plexdb,
+            "tmdb:2",
+            "B",
+            "101",
+            &[(ExternalNs::Tmdb, "2")],
+        );
         add_entry(&catalog, "tvdb:9", "A", "100", &[(ExternalNs::Tvdb, "9")]);
         add_entry(&catalog, "tmdb:2", "B", "101", &[(ExternalNs::Tmdb, "2")]);
 
@@ -653,56 +642,27 @@ mod tests {
         assert_eq!(first.mismatches.len(), 1);
     }
 
-    /// The acceptance criterion that matters: a write attempted through a
-    /// `plex-db-ex` connection opened via [`open_plexdb_readonly`] must
-    /// fail at SQLite's own gate.
+    /// The explorer's rows land keyed the way the join reads them, and an
+    /// external id outside the four recognised namespaces is dropped.
     #[test]
-    fn open_plexdb_readonly_rejects_a_write() {
-        let file = tempfile::NamedTempFile::new().expect("create a temp file");
-        {
-            let setup = Connection::open(file.path()).expect("open for setup");
-            setup
-                .execute_batch(&format!(
-                    "CREATE TABLE schema_version (version INTEGER NOT NULL);
-                     INSERT INTO schema_version (version) VALUES (15);
-                     CREATE TABLE reader_shape (version INTEGER NOT NULL);
-                     INSERT INTO reader_shape (version) VALUES ({shape});
-                     CREATE TABLE t (id INTEGER PRIMARY KEY);",
-                    shape = plexdb_reader::SUPPORTED_READER_SHAPE
-                ))
-                .expect("build a minimal plexdb store");
-        }
-
-        let conn = open_plexdb_readonly(file.path()).expect("open read-only");
-        let result = conn.execute("INSERT INTO t (id) VALUES (1)", []);
-
-        assert!(
-            result.is_err(),
-            "a read-only plexdb connection must not accept a write"
+    fn rows_from_the_explorer_key_by_rating_key_and_keep_recognised_ids() {
+        let mut store = crate::plexdb_ex::fake::Store::default();
+        let item = store.item("imdb:tt1", "movie");
+        item.title = Some("Die Hard".into());
+        item.plex = vec![("100".into(), "1".into()), ("101".into(), "2".into())];
+        item.external_ids = vec![
+            ("imdb".into(), "tt1".into()),
+            ("letterboxd".into(), "die-hard".into()),
+        ];
+        let server = crate::plexdb_ex::fake::serve(store);
+        let rows =
+            PlexdbRows::from_explorer(&crate::plexdb_ex::Explorer::new(&server.url)).unwrap();
+        assert_eq!(rows.by_rk.get("100").map(String::as_str), Some("imdb:tt1"));
+        assert_eq!(rows.by_rk.get("101").map(String::as_str), Some("imdb:tt1"));
+        assert_eq!(rows.titles["imdb:tt1"], "Die Hard");
+        assert_eq!(
+            rows.external["imdb:tt1"],
+            vec![(ExternalNs::Imdb, "tt1".to_string())]
         );
-    }
-
-    #[test]
-    fn open_plexdb_readonly_refuses_an_unsupported_reader_shape() {
-        let file = tempfile::NamedTempFile::new().expect("create a temp file");
-        {
-            let setup = Connection::open(file.path()).expect("open for setup");
-            let wrong_shape = plexdb_reader::SUPPORTED_READER_SHAPE + 1;
-            setup
-                .execute_batch(&format!(
-                    "CREATE TABLE schema_version (version INTEGER NOT NULL);
-                     INSERT INTO schema_version (version) VALUES (15);
-                     CREATE TABLE reader_shape (version INTEGER NOT NULL);
-                     INSERT INTO reader_shape (version) VALUES ({wrong_shape});"
-                ))
-                .expect("build a store at the wrong reader shape");
-        }
-
-        let err =
-            open_plexdb_readonly(file.path()).expect_err("wrong reader shape must refuse to open");
-        assert!(matches!(
-            err,
-            ReconcileOpenError::Store(plexdb_reader::ReaderError::UnsupportedReaderShape { .. })
-        ));
     }
 }

@@ -44,7 +44,7 @@ The declaration lives in the script, so swapping one scorer for another needs no
 fn hooks() { ["pool_provider"] }
 
 // Optional. Omit it and the script declares nothing.
-fn capabilities() { ["catalog_read", "http", #{ datastore: "taste" }] }
+fn capabilities() { ["catalog_read", "http"] }
 ```
 
 Both functions are read at config load: the station compiles the script and calls just that
@@ -58,7 +58,6 @@ one function, before the catalog exists. `sources()`, `pick()` and `arrange()` d
 |---|---|---|---|
 | `catalog_read` | `ctx.sets` (the items each `sources()` query matched) and `ctx.entry_id_for(source, id)` | `"catalog_read"` | `capabilities: [catalog_read]` |
 | `http` | `ctx.http(url, method, body)`: 10 seconds per call, 30 seconds per `pick()` together | `"http"` | `capabilities: [http]` |
-| a named datastore | `ctx.datastore("name")`, a read-only handle on the plex-db-ex reader | `#{ datastore: "name" }` | `datastores: [{ name: name, path: "${VAR}" }]` |
 
 The channel grants them on the same pool that names the script:
 
@@ -67,10 +66,9 @@ pools:
   - name: movies
     plugin: "../plugins/taste-cosine.rhai"
     capabilities: [catalog_read, http]
-    datastores:
-      - name: taste
-        path: "${PLEXDB_SNAPSHOT_PATH}"
 ```
+
+A plugin reads plex-db-ex with `http` alone. `ctx.http` fills the `{{PLEXDB_EX_URL}}` token in a URL from the station's environment, so `ctx.http("{{PLEXDB_EX_URL}}/taste", "GET", "")` reaches the explorer without the script holding its address.
 
 The declaration and the grant must match exactly, in both directions. These are the
 failures you will hit, all at config load unless noted:
@@ -82,11 +80,10 @@ failures you will hit, all at config load unless noted:
 | `hooks()` returns `[]` | refused: a plugin must declare at least one hook |
 | the script declares a capability the pool does not grant | refused, naming the plugin and the capability |
 | the pool grants a capability the script never declares | refused the same way: a grant nobody asked for is a typo or a stale config |
-| a datastore path that cannot be opened | refused, naming the datastore and the underlying error |
 | the script reads `ctx.sets` or `ctx.http` without the capability | the `pick()` call fails when it reads the field, naming the capability. This one only shows at run time, because the reach is a script call |
 | a `pool_provider` with no `audit()` function | refused, naming the missing function |
 
-`examples/plugins/taste-cosine.rhai` declares all three kinds and is the worked example.
+`examples/plugins/taste-cosine.rhai` declares both and is the worked example.
 
 ## The return shape
 

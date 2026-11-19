@@ -1,22 +1,23 @@
 //! Acceptance tests for the Endless pool provider (#176):
 //! `examples/plugins/endless-distance.rhai` picks each item by keyword-cosine
 //! distance from the item picked before it, inside a declared band that
-//! drifts over the run, reading `keywords` from a granted plex-db-ex
-//! snapshot.
+//! drifts over the run, reading `keywords` from plex-db-ex's explorer API.
 //!
-//! Every fixture here is written fresh by this file (mirroring
-//! `datastore_capability.rs`) rather than reading the real store — this
-//! project's own convention (`vendor_plexdb_reader_pin.rs`'s doc comment) is
-//! that a committed test never depends on a path outside the repository, so
-//! these prove the algorithm's shape rather than the real library's numbers.
+//! Every fixture here is written fresh by this file and served by the fake
+//! explorer in `support/plexdb_ex_fake.rs`, rather than reading the real
+//! store — a committed test never depends on a service outside the
+//! repository, so these prove the algorithm's shape rather than the real
+//! library's numbers.
 //! The band defaults baked into the script were tuned separately, by hand,
 //! against a read-only copy of the real store.
 
 use std::path::{Path, PathBuf};
 
 use etv_station::catalog::{Catalog, Entry, Source};
-use etv_station::config::DatastoreGrant;
 use etv_station::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs, pick};
+
+#[path = "support/plexdb_ex_fake.rs"]
+mod fake;
 
 const PLUGIN: &str = "../../examples/plugins/endless-distance.rhai";
 
@@ -24,18 +25,14 @@ fn plugin_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(PLUGIN)
 }
 
-/// Writes a minimal plexdb-schema store: one `movie` row per `(item_id,
+/// Writes a minimal plex-db-ex-shaped store: one `movie` row per `(item_id,
 /// keywords)` pair, each keyword landing as one `keywords` enrichment
 /// row with `key = "keyword"`. An entry with an empty keyword slice gets no
 /// enrichment rows at all — a title the real store never tagged.
 fn write_fixture(path: &Path, movies: &[(&str, &[&str])]) {
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute_batch(&format!(
-        "CREATE TABLE schema_version (version INTEGER NOT NULL);
-         INSERT INTO schema_version (version) VALUES ({version});
-         CREATE TABLE reader_shape (version INTEGER NOT NULL);
-         INSERT INTO reader_shape (version) VALUES ({version});
-         CREATE TABLE items (
+    conn.execute_batch(
+        "CREATE TABLE items (
              item_id TEXT PRIMARY KEY, type TEXT NOT NULL,
              show_item_id TEXT, season INTEGER, episode INTEGER
          );
@@ -51,8 +48,7 @@ fn write_fixture(path: &Path, movies: &[(&str, &[&str])]) {
              history_key TEXT PRIMARY KEY, item_id TEXT NOT NULL,
              plex_account_id INTEGER NOT NULL, viewed_at INTEGER NOT NULL
          );",
-        version = plexdb_reader::SUPPORTED_READER_SHAPE,
-    ))
+    )
     .unwrap();
     for (id, keywords) in movies {
         conn.execute(
@@ -107,12 +103,10 @@ fn run_full(
     let mut cache = ScoreCache::default();
     cache.prepare_unprofiled(cat, &script, None).unwrap();
 
-    let granted = GrantedCapabilities::from_names(&["catalog_read".to_string()])
-        .with_datastores(&[DatastoreGrant {
-            name: "taste_db".into(),
-            path: db.to_str().unwrap().into(),
-        }])
-        .unwrap();
+    let granted = GrantedCapabilities::from_names(&["catalog_read".into(), "http".into()]);
+    let server = fake::serve(fake::Store::from_sqlite(db));
+    let mut config = config.unwrap_or_else(|| serde_json::json!({}));
+    config["plexdb_url"] = server.url.clone().into();
 
     let inputs = ScoreInputs {
         target_count,
@@ -127,7 +121,7 @@ fn run_full(
         &inputs,
         etv_station::variety::Dice::fixed(seed),
         "endless",
-        config.as_ref(),
+        Some(&config),
         granted,
     )
     .expect("pick() must succeed against a fixture with at least one keyworded candidate")

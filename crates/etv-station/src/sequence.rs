@@ -594,7 +594,6 @@ mod tests {
             config: None,
             // An `expr` pool reaches no plugin, so it needs no grant (#167).
             capabilities: Vec::new(),
-            datastores: Vec::new(),
             guide: None,
         }
     }

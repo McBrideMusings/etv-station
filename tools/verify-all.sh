@@ -2,7 +2,7 @@
 # Run a quality check across BOTH cargo workspaces in this repo.
 #
 # etv-station is two workspaces, not one:
-#   * the parent at the repo root (crates/*, vendor/plexdb-reader)
+#   * the parent at the repo root (crates/*)
 #   * vendor/etv-next, which has its own [workspace] and is EXCLUDED from the
 #     parent — a `cargo <anything> --workspace` at the root never touches it.
 #

@@ -1,5 +1,5 @@
 # station-align.yaml's twin for the megamix bumper. Run it from the repo root
-# with a catalog and a plex-db-ex snapshot (PLEXDB_SNAPSHOT_PATH) whose music
+# with a catalog and a plex-db-ex explorer (PLEXDB_EX_URL) whose music
 # videos carry audio facts:
 #   ./target/debug/etv-station --config examples/station-megamix.yaml
 # or `STATION_CONFIG=examples/station-megamix.yaml ./tools/dev-run.sh`.

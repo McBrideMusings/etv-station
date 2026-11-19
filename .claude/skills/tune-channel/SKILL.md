@@ -58,7 +58,7 @@ Audit the comment rule before calling an edit done:
 
 - **Taste profile keywords** must be `keyword_forms` surface spellings or the
   projection fails with "matches no stored keyword". Check one with
-  `sqlite3 tmp/claude/scratchpad/station-cache/plexdb.snapshot.db "select keyword from keyword_forms where surface='<x>'"`.
+  `curl -s "$PLEXDB_EX_URL/keywords?surface=<x>" | jq '.data[].keyword'`.
 - **`require: true`** entries on a pool's theme keywords stop a zero-match title
   from being drawn. Count what a require list keeps before adding one.
 - **Animated films** often carry no Animation genre tag; the `anime` and

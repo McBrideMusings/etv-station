@@ -58,13 +58,12 @@
 // competes on taste alone. See the score assembly in pick().
 //
 // capabilities() declares catalog_read (for ctx.sets, built from sources()
-// below, and ctx.entry_id_for), http (to read Tautulli's watch history itself,
-// see recent_watches() below), and a named datastore grant (#181). The channel
-// pool that names this script must grant all three under that pool's
-// `capabilities:` / `datastores:`, or the load fails naming whichever is
-// missing.
+// below, and ctx.entry_id_for) and http (to read plex-db-ex's explorer,
+// px_open() below, and Tautulli's watch history). The channel pool that names
+// this script must grant both under that pool's `capabilities:`, or the load
+// fails naming whichever is missing.
 //
-// ctx carries (see docs/schema.md § Pool `capabilities` / `datastores`):
+// ctx carries (see docs/schema.md § Pool `capabilities`):
 //   ctx.sets.movies      the movie candidates sources() matched
 //   ctx.profile          the pool's resolved taste profile, one map per entry
 //                        (kind, namespace, value, items, weight, reference,
@@ -94,9 +93,8 @@
 //                        reads those only to name a watched title as a pick's
 //                        reason (#319). Ambient: no capability gates
 //                        ctx.recent.
-//   ctx.datastore(name)  a handle onto the plex-db-ex reader (#181),
-//                        exposing enrichment_for_many / pooled_taste_vector
-//                        among others
+//   ctx.http(url, …)     the one way out; px_open() below reads plex-db-ex
+//                        through it
 
 // Tunables. Written as functions, not `const`: a top-level constant is only
 // in scope once the script's body has run, and the station calls
@@ -170,7 +168,7 @@ fn taste_weight(ctx) {
 }
 
 // The namespace ctx.profile names keyword entries under. Candidate keywords
-// read from the datastore (enrichment_namespace() below) are filed under the
+// read from plex-db-ex (enrichment_namespace() below) are filed under the
 // same name, so a profile keyword and a candidate keyword meet in one bucket.
 fn keyword_bucket() { "keywords" }
 
@@ -195,7 +193,7 @@ fn genre_bucket() { "genres" }
 // no-repeat rule will notice. "only" and "exclude" cannot overlap, so a
 // comfort pool and a discovery pool are disjoint by construction.
 //
-// The source is the datastore's lifetime play set, not recent_watches() — that
+// The source is plex-db-ex's lifetime play set, not recent_watches() — that
 // is the newest 1000 Tautulli rows, so a film watched three years ago would
 // read as unseen and land in the discovery half.
 fn seen_mode(ctx) { tunable(ctx, "seen", "any") }
@@ -406,10 +404,150 @@ fn walk_config(ctx) {
     #{ seeds: seeds, neighbours: neighbours, min_tags: min_tags }
 }
 
-// The datastore grant name this script reaches for (#181). A channel names
-// its own grant under the pool's `datastores:`; this is this script's half
-// of that contract.
-fn datastore_name() { "taste" }
+// plex-db-ex, read over its explorer's HTTP API (ADR 0024) with ctx.http.
+// `ctx.http` fills `{{PLEXDB_EX_URL}}` from the station's environment;
+// `config.plexdb_url` replaces it when a pool must name another explorer.
+// px_open() returns the handle the rest of pick() calls `ds`; each accessor
+// below is a method on it, so a fetched title's facts and a keyword's
+// spellings are read once per pick() however many times they are asked for.
+fn px_open(ctx) {
+    #{ ctx: ctx, base: tunable(ctx, "plexdb_url", "{{PLEXDB_EX_URL}}"), facts: #{}, surfaces: #{} }
+}
+
+// `s` percent-encoded as one URL path segment or query value.
+fn px_encode(s) {
+    let out = "";
+    for ch in s {
+        if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')
+            || ch == '-' || ch == '_' || ch == '.' || ch == '~' || ch == ':' {
+            out += ch;
+        } else {
+            for b in ch.to_string().to_blob() {
+                let h = b.to_hex().to_upper();
+                out += if h.len == 1 { "%0" + h } else { "%" + h };
+            }
+        }
+    }
+    out
+}
+
+// GET `path` as JSON; unit when the explorer answers 404 (a title, account,
+// keyword or tag it does not hold).
+fn px_get(path) {
+    let text = "";
+    try {
+        text = this.ctx.http(this.base + path, "GET", "");
+    } catch (e) {
+        if e.to_string().contains("status 404") { return (); }
+        throw e;
+    }
+    parse_json(text)
+}
+
+// Every row of the cursor-paged list at `path` (`limit` 1000 per page).
+fn px_list(path) {
+    let sep = if path.contains("?") { "&" } else { "?" };
+    let rows = [];
+    let after = ();
+    loop {
+        let page_path = path + sep + "limit=1000";
+        if after != () { page_path += "&after=" + px_encode(after); }
+        let page = this.px_get(page_path);
+        if page == () { return rows; }
+        rows += page.data;
+        if !page.has_more || page.next == () { return rows; }
+        after = page.next;
+    }
+}
+
+// Fetch every enrichment fact, in every namespace, of each of `ids` not
+// already held. Up to 50 titles are one `GET /items/{id}/enrichment` each;
+// more walk `GET /items?type=show|movie&include=enrichment` (the API has no
+// read by a set of ids), keeping only the titles asked for and stopping once
+// all are found. One walk serves every namespace a pick() reads.
+fn px_load_facts(ids) {
+    let want = #{};
+    for id in ids {
+        if this.facts[id] == () { want[id] = true; }
+    }
+    if want.len() == 0 { return; }
+    if want.len() <= 50 {
+        for id in want.keys() {
+            let facts = this.px_get("/items/" + px_encode(id) + "/enrichment");
+            this.facts[id] = if facts == () { [] } else { facts };
+        }
+        return;
+    }
+    for kind in ["show", "movie"] {
+        let after = ();
+        while want.len() > 0 {
+            let path = "/items?type=" + kind + "&include=enrichment&limit=1000";
+            if after != () { path += "&after=" + px_encode(after); }
+            let page = this.px_get(path);
+            if page == () { throw "plex-db-ex explorer: GET " + path + " answered 404"; }
+            for item in page.data {
+                if want[item.item_id] != () {
+                    this.facts[item.item_id] = item.enrichment;
+                    want.remove(item.item_id);
+                }
+            }
+            if !page.has_more || page.next == () { break; }
+            after = page.next;
+        }
+    }
+    for id in want.keys() { this.facts[id] = []; }
+}
+
+// Each of `ids` with its facts in namespace `ns`, as `#{ id: [#{ namespace,
+// key, value, fetched_at }] }`; a title with none in `ns` is absent.
+fn enrichment_for_many(ids, ns) {
+    this.px_load_facts(ids);
+    let out = #{};
+    for id in ids {
+        let kept = [];
+        for f in this.facts[id] {
+            if f.namespace == ns { kept.push(f); }
+        }
+        if kept.len > 0 { out[id] = kept; }
+    }
+    out
+}
+
+// Every raw spelling the store recorded for a stored keyword (`GET
+// /keywords/{kw}`), read once per keyword per pick().
+fn surfaces_for_keyword(keyword) {
+    if this.surfaces[keyword] == () {
+        let k = this.px_get("/keywords/" + px_encode(keyword));
+        this.surfaces[keyword] = if k == () { [] } else { k.surfaces };
+    }
+    this.surfaces[keyword]
+}
+
+// The tags sharing titles with `tag` on the tag network of `kind`, strongest
+// first, as `[#{ tag, shared, df }]`; empty for a tag the network lacks.
+fn tag_neighbours(kind, tag) {
+    let near = this.px_get("/tags/" + px_encode(tag) + "/neighbours?kind=" + kind);
+    if near == () { [] } else { near }
+}
+
+// One account's taste vector, `#{ attributes: [#{ namespace, key, value,
+// weight }], shows_without_seasons }`; empty for an account with no plays.
+fn taste_vector_for(account_id) {
+    let v = this.px_get("/accounts/" + account_id + "/taste");
+    if v == () { #{ attributes: [], shows_without_seasons: [] } } else { v }
+}
+
+// The same over every account's plays.
+fn pooled_taste_vector() {
+    let v = this.px_get("/taste");
+    if v == () { #{ attributes: [], shows_without_seasons: [] } } else { v }
+}
+
+// Every title one account ever played (an episode as its show), by item id.
+fn watched_units_for(account_id) { this.px_list("/accounts/" + account_id + "/watched") }
+
+// The same across every account.
+fn watched_units() { this.px_list("/watched") }
 
 // The one enrichment namespace this scorer reads today. Named once so the
 // exploration eligibility rule below reads "has a fact in a namespace this
@@ -417,7 +555,7 @@ fn datastore_name() { "taste" }
 // scorer grows into later is one more line here, not a rewritten rule.
 fn enrichment_namespace() { "keywords" }
 
-// The datastore row a profile member's keywords live on: the title itself, or
+// The plex-db-ex title a profile member's keywords live on: the title itself, or
 // for an episode, its show — an episode carries no keywords of its own.
 fn member_key(item) {
     if item.type == "episode" && item.show_id != () { item.show_id } else { item.entry_id }
@@ -436,11 +574,12 @@ fn tag_values(field) {
 
 // Profile map keys (`bucket \x01 value`) as `bucket: value`, for the audit —
 // a `keywords` value's stored form gains the raw spelling(s) the store
-// actually recorded for it (`ds.surfaces_for_keyword`, #181), so the audit
+// actually recorded for it (`surfaces_for_keyword` below), so the audit
 // shows what a viewer would recognize alongside the stemmed form the score
 // math ran on. Every other bucket is already a value a channel author wrote
 // verbatim, so it needs no such lookup.
-fn display_keys(ds, keys) {
+// A method on the `ds` handle, so each keyword's spellings are fetched once.
+fn display_keys(keys) {
     let out = [];
     for k in keys {
         let parts = k.split("\x01");
@@ -448,7 +587,7 @@ fn display_keys(ds, keys) {
         let value = parts[1];
         let shown = value;
         if bucket == keyword_bucket() {
-            let surfaces = ds.surfaces_for_keyword(value);
+            let surfaces = this.surfaces_for_keyword(value);
             if surfaces.len > 0 {
                 shown += " (" + surfaces.reduce(|s, x| if s == () { x } else { s + ", " + x }) + ")";
             }
@@ -520,7 +659,7 @@ fn recent_watches(ctx, cutoff) {
 
 fn hooks() { ["pool_provider"] }
 
-fn capabilities() { ["catalog_read", "http", #{ datastore: datastore_name() }] }
+fn capabilities() { ["catalog_read", "http"] }
 
 // Both sets this script can rank. A pool picks one with `unit:` in its
 // `config:` and SHOULD narrow `sources:` to match — a pool that overrides
@@ -566,7 +705,7 @@ fn unit_at(seed, nonce) {
 }
 
 fn pick(ctx) {
-    let ds = ctx.datastore(datastore_name());
+    let ds = px_open(ctx);
     let ns = enrichment_namespace();
     let kw = keyword_bucket();
 
@@ -602,7 +741,7 @@ fn pick(ctx) {
     // `touched` remembers which entries fed each key, by position in
     // ctx.profile, so a pick's audit can name the entries behind its score.
     let entries = ctx.profile;
-    // A member's keywords live on the datastore row for the title — for an
+    // A member's keywords live on the plex-db-ex title — for an
     // episode, that is its show. One bulk fetch for every member of every
     // item and set entry, the #172 rule the candidate fetch below follows.
     let member_ids = [];
@@ -1546,8 +1685,8 @@ fn pick(ctx) {
             // The five pairs that weighed most on each side — a heavily
             // tagged title can match dozens, and the audit record has a byte
             // budget (ADR 0011).
-            favor_matches: top_keywords(display_keys(ds, row.on_favor), row.on_favor_w, 5),
-            disfavor_matches: top_keywords(display_keys(ds, row.on_disfavor), row.on_disfavor_w, 5),
+            favor_matches: ds.display_keys(top_keywords(row.on_favor, row.on_favor_w, 5)),
+            disfavor_matches: ds.display_keys(top_keywords(row.on_disfavor, row.on_disfavor_w, 5)),
             profile_entries: profile_entries,
             // The house term and the half of the library this pool drew from
             // (#411), so an audit line says which of the two movie pools a

@@ -8,7 +8,7 @@ about = "What airs when: pattern/sequence/resolve/resume/simulate in crates/etv-
 about = "catalog.db and what fills it: Plex and local-fs ingest, schema migrations, reconcile sweep, artwork."
 
 [labels.plugins]
-about = "The Rhai plugin engine, its host functions and ctx, plugin scripts (taste-cosine, endless, sequencers), the vendored plexdb-reader."
+about = "The Rhai plugin engine, its host functions and ctx, plugin scripts (taste-cosine, endless, sequencers), and their reads of plex-db-ex's explorer API."
 
 [labels.overlay]
 about = "crates/etv-overlay and overlay scripts: Vello rendering, the now/next snipe, logos, block cards, the fifo to ffmpeg."

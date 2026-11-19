@@ -143,6 +143,7 @@ fn a_projection_from_the_frontier_airs_what_the_daemon_airs_next() {
         None,
         seeded,
         resume.clone(),
+        None,
     )
     .unwrap();
     let from_frontier: Vec<&str> = projected.generations[0]

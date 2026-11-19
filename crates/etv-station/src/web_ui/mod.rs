@@ -56,11 +56,11 @@ mod real;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::account::AccountScope;
-use crate::catalog::{Catalog, Entry as CatalogEntry, TagNs, like_escape};
-use crate::config::{self, DatastoreGrant, Pool};
+use crate::catalog::{Catalog, Entry as CatalogEntry, TagNs};
+use crate::config::{self, Pool};
 use crate::profile::ProfileEntry;
 use crate::score::{GrantedCapabilities, PickedItem, ScoreCache, ScoreInputs};
 use crate::tune_in_still::{MediaRemap, Neighbours, StillJpeg, TuneInStill, Unavailable};
@@ -80,7 +80,6 @@ use pools::{
     scored_channel_count,
 };
 use preview::api_preview;
-use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use tiny_http::Method;
 
@@ -110,9 +109,18 @@ struct AppState {
     mcp: Option<mcp::Mcp>,
     /// Radarr and Sonarr, for the item inspector.
     arr: arr::ArrEnv,
-    /// The plex-db-ex snapshot audio facts are read from (`PLEXDB_SNAPSHOT_PATH`).
-    plexdb: Option<PathBuf>,
+    /// The plex-db-ex explorer audio facts and keywords are read from
+    /// (`PLEXDB_EX_URL`).
+    plexdb: Option<crate::plexdb_ex::Explorer>,
+    /// The explorer's keyword list, for the keyword search, and when it was read.
+    keywords: KeywordCache,
+    /// The Health tab's audio coverage count (`pools::api_health_audio`).
+    coverage: Arc<Mutex<pools::Coverage>>,
 }
+
+/// Every stored keyword with its spellings.
+pub(crate) type KeywordList = Arc<Vec<(String, Vec<String>)>>;
+type KeywordCache = Mutex<Option<(std::time::Instant, KeywordList)>>;
 
 /// Listen on `options.bind:options.port` and serve until the process ends.
 /// Fails only when the catalog cannot be opened or the port cannot be bound.
@@ -154,7 +162,12 @@ pub fn serve(options: Options) -> Result<(), String> {
         "MCP endpoint listening"
     );
 
-    let review = ReviewState::new(options.station.clone(), options.catalog.clone());
+    let plexdb = crate::plexdb_ex::Explorer::from_env();
+    let review = ReviewState::new(
+        options.station.clone(),
+        options.catalog.clone(),
+        plexdb.clone(),
+    );
     review.sims.spawn();
     let mut state = AppState {
         catalog,
@@ -163,7 +176,9 @@ pub fn serve(options: Options) -> Result<(), String> {
         options,
         mcp: Some(mcp),
         arr: arr::ArrEnv::from_env(),
-        plexdb: crate::audio_facts::snapshot_path_from_env(),
+        plexdb,
+        keywords: Default::default(),
+        coverage: Default::default(),
     };
     run(&server, &mut state);
     Ok(())
@@ -544,10 +559,16 @@ mod tests {
         AppState {
             catalog: Catalog::open_in_memory().expect("in-memory catalog"),
             pools: PoolState::default(),
-            review: ReviewState::new(station.clone(), PathBuf::from("/nonexistent/catalog.db")),
+            review: ReviewState::new(
+                station.clone(),
+                PathBuf::from("/nonexistent/catalog.db"),
+                None,
+            ),
             mcp: None,
             arr: arr::ArrEnv::default(),
             plexdb: None,
+            keywords: Default::default(),
+            coverage: Default::default(),
             options: Options {
                 station,
                 catalog: PathBuf::from("/nonexistent/catalog.db"),
@@ -597,11 +618,12 @@ mod tests {
     }
 
     /// `GET /api/audio/{id}` is what `admin facts` prints, and `/api/health/audio`
-    /// is the Health tab's coverage line: entries the snapshot knows, with and
-    /// without facts.
+    /// is the Health tab's coverage line: entries the store knows, with and
+    /// without facts, counted off the request thread.
     #[test]
     fn audio_facts_are_served_per_entry_and_counted_for_health() {
         use crate::catalog::{Entry, Source};
+        use crate::plexdb_ex::{Explorer, fake};
         let mut state = example_state();
         for id in ["a", "b", "c"] {
             state
@@ -610,13 +632,11 @@ mod tests {
                 .unwrap();
         }
         // `c` is in the catalog only.
-        let dir = tempfile::tempdir().unwrap();
-        let snapshot = dir.path().join("plexdb.snapshot.db");
-        crate::audio_facts::fixture::write(
-            &snapshot,
-            &[("a", Some(r#"{"bpm":120.0}"#)), ("b", None)],
-        );
-        state.plexdb = Some(snapshot.clone());
+        let mut store = fake::Store::default();
+        store.audio("a", json!({"bpm": 120.0}));
+        store.audio_null("b");
+        let server = fake::serve(store);
+        state.plexdb = Some(Explorer::new(&server.url));
 
         let (status, body) = get_json(&mut state, "/api/audio/a");
         assert_eq!((status, body["facts"]["bpm"].clone()), (200, json!(120.0)));
@@ -624,36 +644,40 @@ mod tests {
         assert_eq!(body["analyzed"], json!(false));
         assert_eq!(get_json(&mut state, "/api/audio/nope").0, 404);
 
-        let (_, body) = get_json(&mut state, "/api/health/audio");
+        let (_, first) = get_json(&mut state, "/api/health/audio");
+        assert_eq!(first["counting"], json!(true), "{first}");
+        let started = std::time::Instant::now();
+        let body = loop {
+            let (_, body) = get_json(&mut state, "/api/health/audio");
+            if body["counting"] == json!(false) {
+                break body;
+            }
+            assert!(
+                started.elapsed().as_secs() < 10,
+                "count never finished: {body}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert_eq!(
             (
                 body["entries"].clone(),
-                body["in_snapshot"].clone(),
+                body["in_store"].clone(),
                 body["with_facts"].clone(),
                 body["without_facts"].clone(),
-                body["snapshot"]["path"].clone(),
+                body["explorer"]["url"].clone(),
             ),
-            (
-                json!(3),
-                json!(2),
-                json!(1),
-                json!(1),
-                json!(snapshot.display().to_string())
-            )
+            (json!(3), json!(2), json!(1), json!(1), json!(server.url))
         );
 
+        // An explorer that is unset or unreachable is an error, never "not analyzed".
         state.plexdb = None;
-        let (_, body) = get_json(&mut state, "/api/health/audio");
-        assert!(body["problem"].as_str().is_some(), "{body}");
-
-        // A snapshot that cannot be read is an error, never "not analyzed".
         let (status, body) = get_json(&mut state, "/api/audio/a");
         assert_eq!(status, 503, "{body}");
         assert!(
             body["error"].as_str().unwrap().contains("not set"),
             "{body}"
         );
-        state.plexdb = Some(dir.path().join("missing.db"));
+        state.plexdb = Some(Explorer::new("http://127.0.0.1:9"));
         let (status, body) = get_json(&mut state, "/api/audio/a");
         assert_eq!(status, 503, "{body}");
         assert!(
@@ -808,7 +832,7 @@ mod tests {
         let (status, body) = get_json(&mut state, &format!("/api/channels/{encoded}/review"));
         assert_eq!(status, 200, "{body}");
         assert_eq!(body["channel"], key.as_str());
-        assert_eq!(body["span"]["label"], "real only");
+        assert_eq!(body["span"]["label"], "real only", "{body}");
     }
 
     #[test]
@@ -915,10 +939,12 @@ mod tests {
         let state = AppState {
             catalog: Catalog::open_readonly(&catalog_path).unwrap(),
             pools: PoolState::default(),
-            review: ReviewState::new(station.clone(), catalog_path.clone()),
+            review: ReviewState::new(station.clone(), catalog_path.clone(), None),
             mcp: None,
             arr: arr::ArrEnv::default(),
             plexdb: None,
+            keywords: Default::default(),
+            coverage: Default::default(),
             options: Options {
                 station,
                 catalog: catalog_path,
@@ -961,7 +987,7 @@ mod tests {
         let ids: Vec<&str> = airings.iter().map(|a| a["id"].as_str().unwrap()).collect();
         assert_eq!(ids, ["m00", "m01"]);
         assert!(airings.iter().all(|a| a["projected"] == false));
-        assert_eq!(body["span"]["label"], "real only");
+        assert_eq!(body["span"]["label"], "real only", "{body}");
         assert_eq!(body["projection"], Value::Null);
         let frontier = body["frontier"].as_i64().unwrap();
         assert_eq!(body["span"]["real_until"], frontier);

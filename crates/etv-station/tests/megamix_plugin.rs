@@ -67,24 +67,17 @@ const SONGS: &[(&str, f64, &str, &str, f64, i64)] = &[
     ("mv-weak", 120.0, "8A", "A", 1.2, 64),
 ];
 
-#[path = "support/audio_snapshot.rs"]
-mod audio_snapshot;
+#[path = "support/plexdb_ex_fake.rs"]
+mod fake;
 
-/// The plex-db-ex snapshot holding the songs' audio facts.
-fn snapshot_file(dir: &Path) -> PathBuf {
-    let path = dir.join("plexdb.snapshot.db");
-    let rows: Vec<(&str, Option<String>)> = SONGS
-        .iter()
-        .enumerate()
-        .map(|(i, (id, bpm, camelot, key, confidence, beats))| {
-            let landing = 8 * (1 + i % 3);
-            let f = facts(*bpm, camelot, key, *confidence, *beats, landing);
-            (*id, Some(f.to_string()))
-        })
-        .collect();
-    let refs: Vec<(&str, Option<&str>)> = rows.iter().map(|(i, f)| (*i, f.as_deref())).collect();
-    audio_snapshot::write(&path, &refs);
-    path
+/// A fake plex-db-ex explorer holding the songs' audio facts.
+fn audio_explorer() -> fake::Server {
+    let mut store = fake::Store::default();
+    for (i, (id, bpm, camelot, key, confidence, beats)) in SONGS.iter().enumerate() {
+        let landing = 8 * (1 + i % 3);
+        store.audio(id, facts(*bpm, camelot, key, *confidence, *beats, landing));
+    }
+    fake::serve(store)
 }
 
 fn catalog_file(dir: &Path) -> PathBuf {
@@ -136,6 +129,7 @@ static STUBS: Mutex<()> = Mutex::new(());
 struct Fixture {
     dir: tempfile::TempDir,
     work: PathBuf,
+    explorer: fake::Server,
     _turn: MutexGuard<'static, ()>,
 }
 
@@ -148,6 +142,7 @@ impl Fixture {
         Fixture {
             dir,
             work,
+            explorer: audio_explorer(),
             _turn: turn,
         }
     }
@@ -191,7 +186,7 @@ impl Fixture {
             history: None,
             pass: Vec::new(),
             catalog_path: Some(catalog_file(self.dir.path())),
-            plexdb_path: Some(snapshot_file(self.dir.path())),
+            plexdb: Some(etv_station::plexdb_ex::Explorer::new(&self.explorer.url)),
         }
     }
 

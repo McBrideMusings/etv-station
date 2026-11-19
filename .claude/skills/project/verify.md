@@ -381,7 +381,6 @@ cp examples/plugins/taste-cosine.rhai "$SIM/appdata/plugins/"
 # in $SIM/appdata/channels/034-syfy/channel.yaml: seed: { rotate: 2d },
 # temperature: 0.5, films pools advance: resume, shows pools temperature: 0
 set -a; . /Users/pierce/Projects/etv-station/.env; set +a
-export PLEXDB_SNAPSHOT_PATH=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/station-cache/plexdb.snapshot.db
 export ETV_STATION_CATALOG=/Users/pierce/Projects/etv-station/tmp/claude/scratchpad/station-cache/catalog.db
 cargo run --release --bin etv-station -- \
   --config "$SIM/appdata/station.yaml" --serve-ui --ui-port <PORT>
@@ -772,32 +771,18 @@ run the migration, and `etv-station --config <copy>/station.yaml --dump-overlay
 
 `cargo test -p etv-station --test arcs_sample` loads the committed `examples/arcs/black-clover.yaml` through a station, simulates 7 days of `examples/samples/black-clover-arcs.yaml` over a 160-episode catalog and asserts the air order is Dungeon 51, Royal Knights 51, Witch Queen 52, trailing 6, with no run past one arc. Against prod data: `ssh` read-only `select count(*), count(absolute_episode) from entries where show='Black Clover'` must show equal counts (173/173 on 2026-10-21); a local `tmp/catalog.db` ingested before #105 shows 0 and needs a re-ingest.
 
-## Three blockers you will hit, and how to get past them
+## Booting the daemon without a Plex ingest
 
-**1. `PLEXDB_SNAPSHOT_PATH` is not in `.env`.** `examples/samples/foryou.yaml` references
-it, and config validation resolves env vars eagerly, so the daemon exits before serving:
+**A configured Plex blocks the channel loop from ever starting.** In `daemon.rs`, the
+startup ingest (`catalog.ingest.fs` → `catalog.ingest.plex_start mode="full"`) runs to
+completion before any channel task rolls. With `PLEX_URL`/`PLEX_TOKEN` set, that means a
+real library read taking minutes, and the daemon never reaches the resume path most local
+verification actually wants to watch. Unset them with `env -u` as shown below rather than
+relying on `.env` not having them — `admin dev-station` sources `.env`, which may set them,
+so use the raw binary invocation for this, not the admin task.
 
-```
-ERROR failed to load configuration event="config.error" error=invalid config at examples/samples/foryou.yaml:
-  env var `PLEXDB_SNAPSHOT_PATH` referenced by "${PLEXDB_SNAPSHOT_PATH}" is not set
-```
-
-**2. The plexdb reader is a schema version behind.** Pointing it at a store built by the
-current sibling `plex-db-ex` gets you:
-
-```
-datastore "taste" … could not be opened: store at … is schema version 8,
-but plexdb-reader only understands version 7
-```
-
-In a `plex-db-ex` checkout, `PLEXDB_PATH=/tmp/x.db uv run plexdb init` creates a **v8**
-store today, so it cannot satisfy this reader. Until the reader is rebuilt against a
-matching plex-db-ex, the sample channels cannot load at all — this is a real
-incompatibility between the two projects, not a config mistake.
-
-**The workaround that gets the daemon up:** drop the sample channels. Use the committed
-`examples/station-test.yaml` — it already registers only `channels/lavfi-test.yaml`, no
-`samples/*.yaml` glob, so neither blocker above can fire:
+Use the committed `examples/station-test.yaml` — it registers only `channels/lavfi-test.yaml`,
+no `samples/*.yaml` glob:
 
 ```bash
 env -u PLEX_URL -u PLEX_TOKEN -u TAUTULLI_URL -u TAUTULLI_API_KEY \
@@ -806,14 +791,6 @@ env -u PLEX_URL -u PLEX_TOKEN -u TAUTULLI_URL -u TAUTULLI_API_KEY \
 
 That boots clean and rolls the one lavfi channel. Do not hand-author a throwaway sibling
 config for this — `examples/station-test.yaml` is tracked precisely so nobody has to.
-
-**3. A configured Plex blocks the channel loop from ever starting.** In `daemon.rs`, the
-startup ingest (`catalog.ingest.fs` → `catalog.ingest.plex_start mode="full"`) runs to
-completion before any channel task rolls. With `PLEX_URL`/`PLEX_TOKEN` set, that means a
-real library read taking minutes, and the daemon never reaches the resume path most local
-verification actually wants to watch. Unset them with `env -u` as shown above rather than
-relying on `.env` not having them — `admin dev-station` sources `.env`, which may set them,
-so use the raw binary invocation for this, not the admin task.
 
 `examples/station-test.yaml`'s `catalog_refresh_secs: 86400` only helps *subsequent* boots
 once a catalog already exists on disk (`plex_ingest_plan` takes `PlexIngestPlan::Skip` and
@@ -1235,7 +1212,7 @@ Run it through the swarm lock in a worker (`swarm heavy -- tools/verify-reburst.
 
 Run `cargo test -p etv-station --test megamix_plugin` (seven fixture songs; stub `ffmpeg`), `cargo test -p etv-station --lib chapters_list` and `cargo test -p etv-station --lib a_chapter_prints_the_seam_notes`. The first expects a plan of 3 to 5 hooks with every semitone shift within 3, every landing within Camelot distance 1 of the chapter key, every hook starting on an 8-bar boundary, `mv-unsteady` and `mv-weak` never chosen, and one pending segment named `chapter:<stem>|…` whose `plan` is the plan file written beside the render. `cargo test -p etv-render --test queue_sync` proves the sidecar queues a scheduled plan, supersedes a job the schedule replaced, leaves running and failed jobs, and skips an unreadable plan until it changes.
 
-Against a dev stack whose plex-db-ex snapshot (`PLEXDB_SNAPSHOT_PATH`) holds audio facts for the music videos (`STATION_CONFIG=examples/station-megamix.yaml`, inside `swarm heavy`): `curl -s localhost:$ETV_PORT/api/channels/megamix-test/chapters | jq '.chapters[] | {name, state, notes}'` lists each chapter with its seam lines, and `etv-station --config examples/station-megamix.yaml --audit megamix-test --audit-out -` prints a `render:` line per hook. Two rendered chapters back to back with no gap is a listen at the TV; it needs Demucs, PyTorch and librubberband (`/api/health/renders` shows `detected`) and has not been run in a worktree.
+Against a dev stack whose plex-db-ex explorer (`PLEXDB_EX_URL`) holds audio facts for the music videos (`STATION_CONFIG=examples/station-megamix.yaml`, inside `swarm heavy`): `curl -s localhost:$ETV_PORT/api/channels/megamix-test/chapters | jq '.chapters[] | {name, state, notes}'` lists each chapter with its seam lines, and `etv-station --config examples/station-megamix.yaml --audit megamix-test --audit-out -` prints a `render:` line per hook. Two rendered chapters back to back with no gap is a listen at the TV; it needs Demucs, PyTorch and librubberband (`/api/health/renders` shows `detected`) and has not been run in a worktree.
 
 ## Verifying the tempo ride (whole-song sets)
 

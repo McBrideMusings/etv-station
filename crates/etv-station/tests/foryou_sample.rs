@@ -2,20 +2,21 @@
 //! `examples/samples/foryou.yaml` channel weaves two movies and a
 //! three-episode run, where *which movies* play is chosen by
 //! `examples/plugins/taste-cosine.rhai` ranking TMDB keywords against a
-//! pooled taste vector read from a granted plex-db-ex datastore — not by any
+//! pooled taste vector read from plex-db-ex's explorer API — not by any
 //! query this config authors, and not by what this repo's own watch history
 //! says.
 //!
 //! The deepest sample in the set: it stacks plugin scoring (#74) with a
-//! granted external datastore (#181) on pools + pattern (#72) and the
+//! plex-db-ex's explorer, reached with `ctx.http`, on pools + pattern (#72) and the
 //! per-`show_id` resume map, and it is the one place the whole claim is
 //! checked end to end — the station supplies the catalog, the target count,
 //! and the seed; the script supplies the ranking and holds no replay rule of
 //! its own (ADR 0002).
 //!
-//! Every test here resolves against a hand-built plexdb fixture
-//! ([`write_taste_fixture`]), never the real plex-db-ex snapshot — the same
-//! posture `datastore_capability.rs` and `taste_cosine_scorer.rs` take.
+//! Every test here resolves against a hand-built plex-db-ex fixture
+//! ([`write_taste_fixture`]) served by the fake explorer in
+//! `support/plexdb_ex_fake.rs`, never the real plex-db-ex — the same posture
+//! `taste_cosine_scorer.rs` takes.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -27,6 +28,9 @@ use etv_station::resolve::{ResolvedItem, resolve_channel_with_resume};
 use etv_station::resume::{GenerationState, ResumeMap};
 use etv_station::score::ScoreInputs;
 use time::OffsetDateTime;
+
+#[path = "support/plexdb_ex_fake.rs"]
+mod fake;
 
 /// Ten movies and three shows of unequal length, all locally sourced so
 /// resolution reaches a playable item.
@@ -122,12 +126,8 @@ fn library() -> Catalog {
 /// comes from this store, which is what the test below actually checks.
 fn write_taste_fixture(path: &Path) {
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute_batch(&format!(
-        "CREATE TABLE schema_version (version INTEGER NOT NULL);
-         INSERT INTO schema_version (version) VALUES ({version});
-         CREATE TABLE reader_shape (version INTEGER NOT NULL);
-         INSERT INTO reader_shape (version) VALUES ({version});
-         CREATE TABLE items (
+    conn.execute_batch(
+        "CREATE TABLE items (
              item_id TEXT PRIMARY KEY, type TEXT NOT NULL,
              show_item_id TEXT, season INTEGER, episode INTEGER
          );
@@ -154,37 +154,39 @@ fn write_taste_fixture(path: &Path) {
              ('mov-arrival', 'keywords', 'keyword', 'linguistics', '2026-01-01T00:00:00+00:00');
          INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at) VALUES
              ('h1', 'mov-contact', 42, 1700000000);",
-        version = plexdb_reader::SUPPORTED_READER_SHAPE,
-    ))
+    )
     .unwrap();
 }
 
-/// The fixture store, built once and shared read-only across every test in
-/// this binary — `Reader::open` never writes, so concurrent tests reading it
-/// are safe, and rebuilding it per test would just be the same bytes again.
-fn taste_store_path() -> &'static Path {
-    static PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        // `keep()` hands back the directory and gives up deleting it: the
-        // fixture has to outlive every test function in this binary, and a
-        // `tempdir()` still owned here would clean itself up on drop.
-        let path = tempfile::tempdir().unwrap().keep().join("taste.db");
+/// The fake explorer serving the fixture store, started once and shared
+/// read-only across every test in this binary — it only answers reads, so
+/// concurrent tests are safe, and one per test would serve the same rows.
+fn explorer() -> &'static fake::Server {
+    static SERVER: OnceLock<fake::Server> = OnceLock::new();
+    SERVER.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("taste.db");
         write_taste_fixture(&path);
-        path
+        fake::serve(fake::Store::from_sqlite(&path))
     })
+}
+
+/// Points the movies pool's plugin at the fake explorer: `plexdb_url` in its
+/// `config:` stands in for `{{PLEXDB_EX_URL}}`.
+fn point_at_explorer(cfg: &mut ChannelConfig) {
+    let pool = movies_pool(cfg);
+    let mut c = pool.config.take().unwrap_or_else(|| serde_json::json!({}));
+    c["plexdb_url"] = explorer().url.clone().into();
+    pool.config = Some(c);
 }
 
 fn sample_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/samples/foryou.yaml")
 }
 
-/// The committed sample, with the movies pool's `datastores` grant path
-/// repointed at the local fixture store — `read_channel` is a raw parse
-/// (docs on `config::load::read_channel`) that does not expand `${VAR}`, so
-/// the committed `${PLEXDB_SNAPSHOT_PATH}` reference is overwritten here the
-/// same way `config_with_movies_config` overwrites `config:` below, rather
-/// than relying on a real snapshot or an environment variable no test
-/// machine can be expected to have set.
+/// The committed sample, with the movies pool's plugin pointed at the fake
+/// explorer ([`point_at_explorer`]) rather than at `PLEXDB_EX_URL`, which no
+/// test machine can be expected to have set.
 ///
 /// Also pins `seed`, which the committed sample leaves unset (a real station
 /// resolves one per generation). `resolve::resolve_channel_with_resume`
@@ -198,12 +200,12 @@ fn sample_path() -> std::path::PathBuf {
 fn config() -> ChannelConfig {
     let mut cfg = read_channel(&sample_path()).expect("load the For You sample");
     cfg.seed = Some(etv_station::config::SeedSpec::Fixed(20260812));
-    movies_pool(&mut cfg).datastores[0].path = taste_store_path().to_str().unwrap().to_string();
+    point_at_explorer(&mut cfg);
     cfg
 }
 
-/// The sample's movies pool — the one carrying the plugin and its datastore
-/// grant, which is what every test below repoints or reconfigures.
+/// The sample's movies pool — the one carrying the plugin, which is what every
+/// test below repoints or reconfigures.
 fn movies_pool(cfg: &mut ChannelConfig) -> &mut Pool {
     cfg.rule.blocks[0]
         .pools
@@ -388,8 +390,8 @@ fn a_block_level_constraint_is_inherited_without_reordering_the_pattern() {
     assert_two_movies_then_three_episodes(&got);
 }
 
-/// Acceptance criterion 2: the plugin's ranking comes from the plex-db-ex
-/// datastore. `mov-contact` leads (see `write_taste_fixture`'s hand-computed
+/// Acceptance criterion 2: the plugin's ranking comes from plex-db-ex.
+/// `mov-contact` leads (see `write_taste_fixture`'s hand-computed
 /// scores).
 ///
 /// Exploration is turned off here (`exploration_fraction: 0.0`, overriding
@@ -397,7 +399,7 @@ fn a_block_level_constraint_is_inherited_without_reordering_the_pattern() {
 /// seeded surprise slot has its own tests below and in
 /// `taste_cosine_scorer.rs`.
 #[test]
-fn the_datastore_taste_vector_decides_the_ranking() {
+fn the_explorers_taste_vector_decides_the_ranking() {
     let cat = library();
     let inputs = ScoreInputs {
         target_count: 20,
@@ -491,6 +493,7 @@ fn a_pool_config_value_changes_the_scripts_ranking() {
 fn config_with_movies_config(pool_config: Option<serde_json::Value>) -> ChannelConfig {
     let mut cfg = config();
     movies_pool(&mut cfg).config = pool_config;
+    point_at_explorer(&mut cfg);
     cfg
 }
 
@@ -613,16 +616,14 @@ fn an_in_progress_show_continues_across_generations() {
 
 /// Acceptance criterion 4: swapping the scorer keeps the channel working. The
 /// station holds no taste rule, so a script with entirely different judgment
-/// still produces a valid schedule from the same config shape — the movies
-/// pool's `datastores` grant still opens (the station proves that before any
-/// plugin runs, regardless of whether the plugin reaches for it), but the
-/// replacement script below never calls `ctx.datastore` at all.
+/// still produces a valid schedule from the same config shape — the
+/// replacement script below never reads plex-db-ex at all.
 #[test]
 fn swapping_the_scorer_keeps_the_channel_working() {
     let dir = tempfile::tempdir().unwrap();
     let plugins = dir.path().join("plugins");
     std::fs::create_dir(&plugins).unwrap();
-    // Oldest-first, and deliberately ignores the datastore entirely — about
+    // Oldest-first, and deliberately ignores plex-db-ex entirely — about
     // as far from taste-cosine's judgment as a scorer can get.
     std::fs::write(
         plugins.join("taste-cosine.rhai"),
@@ -648,8 +649,7 @@ fn audit(ctx, picks, workspace) { #{} }
     let channel = samples.join("foryou.yaml");
     std::fs::copy(sample_path(), &channel).unwrap();
 
-    let mut cfg = read_channel(&channel).expect("load the copied sample");
-    movies_pool(&mut cfg).datastores[0].path = taste_store_path().to_str().unwrap().to_string();
+    let cfg = read_channel(&channel).expect("load the copied sample");
 
     let cat = library();
     let (items, _) = resolve_cfg(

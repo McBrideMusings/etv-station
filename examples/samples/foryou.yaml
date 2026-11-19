@@ -10,8 +10,8 @@
 # the ranking, if its keywords are the house's keywords.
 #
 # What this exercises that no other sample does:
-#   - `plugin` on a pool granting a named `datastore` (#181) — the script
-#     reaches plex-db-ex through `ctx.datastore("taste")`, not through this
+#   - `plugin` on a pool granting `http` — the script
+#     reaches plex-db-ex through its explorer API with `ctx.http`, not through this
 #     repo's own catalog or Tautulli history
 #   - `ctx.seed` (#255, ADR 0005) driving a script's own seeded randomness —
 #     the only source of reproducible entropy inside the sandbox, and the
@@ -61,14 +61,12 @@
 #
 # Registered in examples/station.yaml via the `samples/*.yaml` glob, so a
 # dev-run serves it live. It resolves to nothing unless the station's
-# `catalog_path` points at a populated catalog and `PLEXDB_SNAPSHOT_PATH`
-# points at a reachable plex-db-ex snapshot at the schema version
-# `vendor/plexdb-reader` understands — without either, the channel fails to
-# load rather than airing an arbitrary ranking, because the datastore grant
-# is proven openable before any plugin ever runs. Its resolution is also
-# proven by the `foryou_sample` acceptance test, against a hand-built
-# fixture store.
-number: 2
+# `catalog_path` points at a populated catalog and `PLEXDB_EX_URL` names a
+# reachable plex-db-ex explorer — without it, the plugin's first `ctx.http`
+# call fails the generation rather than airing an arbitrary ranking. Its
+# resolution is also proven by the `foryou_sample` acceptance test, against a
+# fake explorer.
+number: 12
 name: foryou
 display_name: "For You"
 window_days: 1
@@ -98,15 +96,10 @@ rule:
         # ranking it exists to produce.
         - name: movies
           plugin: "../plugins/taste-cosine.rhai"
-          # taste-cosine.rhai declares all three (#167) — the pool must
-          # grant exactly what it declares, or the channel fails to load.
+          # taste-cosine.rhai declares both (#167) — the pool must grant
+          # exactly what it declares, or the channel fails to load. `http`
+          # is how it reads plex-db-ex's explorer (`{{PLEXDB_EX_URL}}`).
           capabilities: [catalog_read, http]
-          datastores:
-            - name: taste
-              # Never a literal path in a committed config — expanded from
-              # the container's environment at load. See .env.example
-              # § Taste snapshot (plex-db-ex).
-              path: "${PLEXDB_SNAPSHOT_PATH}"
           config:
             # The share of output slots filled by a seeded random pick
             # instead of by rank (#254, ADR 0005) — roughly 1 slot in 5 at

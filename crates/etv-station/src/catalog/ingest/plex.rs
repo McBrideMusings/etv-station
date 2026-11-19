@@ -257,7 +257,7 @@ pub struct PlexIngestStats {
 /// One real account Plex's own `/accounts` reports — the server owner and
 /// every home/shared user alike (#281).
 ///
-/// This is Plex's **own** id space — the one `plexdb_reader::Reader::taste_vector_for`
+/// This is Plex's **own** id space — the one plex-db-ex's `/accounts/{id}/taste`
 /// keys its store on. `crate::account::resolve` looks a `single_user` channel's
 /// `user` up in this list to find that id.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -683,7 +683,6 @@ fn audit(ctx, picks, workspace) {
             // own `capabilities()` here — the script declares it too, so the
             // pair matches what a real config would have to write.
             capabilities: vec!["catalog_read".into()],
-            datastores: Vec::new(),
             guide: None,
         }
     }

@@ -3005,7 +3005,7 @@ fn align_fill(
         overlay_root: &overlay_root,
         history: Some(Arc::clone(ctx.history_db)),
         catalog_path: ctx.catalog.map(|c| c.path.clone()),
-        plexdb_path: crate::audio_facts::snapshot_path_from_env(),
+        plexdb: crate::plexdb_ex::Explorer::from_env(),
         plans,
         pools: fill_pools,
         item_map: &item_map,

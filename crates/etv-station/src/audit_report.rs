@@ -4,7 +4,7 @@
 //! This reads the channel's chunk files exactly as they sit on disk — the
 //! same files ETV-next reads to play the channel — and reports what will
 //! actually air, not what a re-simulation of a plugin's `pick()` believes
-//! would air. Opens no catalog, no plexdb snapshot, and evaluates no plugin.
+//! would air. Opens no catalog, reads no plex-db-ex explorer, and evaluates no plugin.
 //!
 //! Reading and rendering are two separate functions on purpose: [`upcoming`]
 //! does the file I/O, [`render`] turns an already-built item list into text,

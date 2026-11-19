@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
 # Run the station's web UI (`etv-station --serve-ui`, crates/etv-station/src/web_ui/)
-# locally, against the real catalog + plexdb snapshot and this checkout's
+# locally, against the real catalog and this checkout's
 # in-development plugin scripts. The container runs the same mode on its own.
 #
 # A release build is not optional: a debug build's score::pick() takes 15-22s
 # against the real ~11,634-movie catalog, which makes a live-tuning loop
 # unusable. See the module's own doc for the rest of that story.
 #
-# Keeps a local catalog/plexdb cache
-# (tmp/claude/scratchpad/station-cache/, kept in step with the host by
-# tools/taste-cache.sh) rather than a second one. ETV_STATION_CATALOG points the
-# station config's `catalog_path` at that copy, and PLEXDB_SNAPSHOT_PATH makes
-# every pool's own `datastores: [{ path: "${PLEXDB_SNAPSHOT_PATH}" }]` resolve to
-# it instead of the production mount .env normally points it at.
+# Keeps a local catalog cache (tmp/claude/scratchpad/station-cache/, kept in
+# step with the host by tools/taste-cache.sh) rather than a second one.
+# ETV_STATION_CATALOG points the station config's `catalog_path` at that copy.
+# plex-db-ex is read over its explorer API at PLEXDB_EX_URL from .env.
 #
 # --ui-private-catalog makes the UI serve a migrated copy (catalog.db.ui-copy)
 # of that cache, so a checkout whose schema is ahead of prod's still answers;
@@ -33,10 +31,9 @@ fi
 
 CACHE_DIR="tmp/claude/scratchpad/station-cache"
 
-bash tools/taste-cache.sh catalog.db plexdb.snapshot.db || exit 1
+bash tools/taste-cache.sh catalog.db || exit 1
 
 export ETV_STATION_CATALOG="$CACHE_DIR/catalog.db"
-export PLEXDB_SNAPSHOT_PATH="$CACHE_DIR/plexdb.snapshot.db"
 
 # No `--quiet`: on a cold target/ the release build compiles ~480 crates
 # (the vello/wgpu stack included) for minutes, and cargo's per-crate

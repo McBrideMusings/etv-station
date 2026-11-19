@@ -140,7 +140,6 @@ fn channel(plugin: &Path) -> ChannelConfig {
                     constraints: None,
                     config: None,
                     capabilities: vec!["catalog_read".into()],
-                    datastores: Vec::new(),
                     guide: None,
                 }],
                 pattern: vec![PatternStep {

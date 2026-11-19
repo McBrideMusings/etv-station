@@ -11,7 +11,7 @@
 //! no `${VAR}` expansion, no block splicing, no validation, no catalog. That is
 //! the point — the failure being guarded is "the file no longer matches the
 //! struct", and answering that must not depend on a populated catalog, real
-//! media on disk, or a `PLEXDB_SNAPSHOT_PATH` pointing at a live Plex snapshot.
+//! media on disk, or a `PLEXDB_EX_URL` naming a live plex-db-ex explorer.
 //!
 //! `examples/overlays/` is not covered: those parse through the overlay crate's
 //! own loader, which reroots script and image paths as it reads.

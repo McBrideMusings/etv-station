@@ -186,7 +186,6 @@ fn plugin_channel(plugin: &Path, take: usize, cycles: usize) -> ChannelConfig {
                     // unconditionally (#167 predates this file), so this
                     // helper grants it for every test that uses it.
                     capabilities: vec!["catalog_read".into()],
-                    datastores: Vec::new(),
                     guide: None,
                 }],
                 pattern: vec![PatternStep {

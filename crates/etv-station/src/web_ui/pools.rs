@@ -7,7 +7,7 @@
 //! exploration slots — what the profile alone ranks first. It runs over
 //! `score::{ScoreCache, pick}`, the real scoring path (ADR-0020), with the
 //! pool's own deployed plugin (or its namesake in [`Options::plugins_dir`]),
-//! its real `sources:`, `config:`, capabilities and datastores. Scoring a pool
+//! its real `sources:`, `config:` and capabilities. Scoring a pool
 //! runs its plugin with the `exec`/`http` calls it is granted, exactly as a
 //! generation would.
 //!
@@ -31,8 +31,8 @@
 //! Nothing here writes a file. "Copy profile YAML" returns the edited profile
 //! as it would read in `channel.yaml`; the person pastes it in.
 //!
-//! Each pool's plexdb path comes from its `datastores:` grant, not a flag —
-//! set `PLEXDB_SNAPSHOT_PATH` (or whatever env var the grant references).
+//! A scorer reaches plex-db-ex itself over `ctx.http` (`{{PLEXDB_EX_URL}}`);
+//! a profile's `keyword:` entries resolve against [`AppState::plexdb`].
 
 use super::lineup::{has_scorer, lineup_keys};
 use super::*;
@@ -291,20 +291,17 @@ fn default_account(state: &mut AppState, key: &str, loc: &Located) -> Result<Opt
     Ok(id)
 }
 
-/// A scorer pool, ready to rank: a working copy with its datastore paths
-/// expanded, and the plugin script it scores against.
+/// A scorer pool, ready to rank: a working copy, and the plugin script it
+/// scores against.
 struct Scorer {
     pool: Pool,
     plugin_path: PathBuf,
-    plexdb_path: PathBuf,
-    datastore_name: String,
     sources_effective: Option<Vec<(String, String)>>,
 }
 
 /// Resolve which plugin script to score against (the pool's deployed one, or
-/// its namesake in [`Options::plugins_dir`]), expand the datastore grant's env
-/// references, and clone the pool so profile edits never touch the real
-/// `channel.yaml`.
+/// its namesake in [`Options::plugins_dir`]), and clone the pool so profile
+/// edits never touch the real `channel.yaml`.
 fn build_scorer(state: &AppState, channel_dir: &Path, pool: &Pool) -> Result<Scorer, String> {
     let plugin = pool
         .plugin
@@ -331,29 +328,12 @@ fn build_scorer(state: &AppState, channel_dir: &Path, pool: &Pool) -> Result<Sco
             deployed_path.display()
         ));
     }
-    if pool.datastores.is_empty() {
-        return Err(format!("pool {:?} declares no datastores", pool.name));
-    }
-
-    let mut owned = clone_pool(pool)?;
-    // `ScoreCache::prepare_profile` opens `pool.datastores.first()` itself,
-    // reading its raw `path`, unlike `score::pick`, which is handed an
-    // explicitly-expanded grant. Expanding here is what makes a `keyword:`
-    // profile entry resolve instead of failing to open a literal
-    // `${PLEXDB_SNAPSHOT_PATH}`.
-    for ds in &mut owned.datastores {
-        ds.path = config::expand_process_env(&ds.path)?;
-    }
-    let first = owned.datastores.first().expect("checked non-empty above");
-    let plexdb_path = PathBuf::from(&first.path);
-    let datastore_name = first.name.clone();
+    let owned = clone_pool(pool)?;
     let sources_effective =
         crate::score::effective_sources(&plugin_path, owned.sources.as_ref()).ok();
     Ok(Scorer {
         pool: owned,
         plugin_path,
-        plexdb_path,
-        datastore_name,
         sources_effective,
     })
 }
@@ -364,17 +344,19 @@ struct Ranked {
 }
 
 /// One full-pool `pick()` against the pool's real `sources:`, the profile the
-/// scorer's working copy holds, and its real capabilities and datastores.
+/// scorer's working copy holds, and its real capabilities.
 /// A fresh [`ScoreCache`] each time: it keys a resolved profile by pool name
 /// alone, so one shared across channels would answer one channel's "movies"
 /// with another's.
 fn rank(
     catalog: &Catalog,
+    explorer: Option<&crate::plexdb_ex::Explorer>,
     scorer: &Scorer,
     channel_dir: &Path,
     account_id: Option<i64>,
 ) -> Result<Ranked, String> {
     let mut cache = ScoreCache::default();
+    cache.explorer = explorer.cloned();
     cache
         .prepare_pool(catalog, &scorer.pool, &scorer.plugin_path, channel_dir)
         .map_err(|e| format!("prepare: {e}"))?;
@@ -392,12 +374,7 @@ fn rank(
         account_id,
         ..Default::default()
     };
-    let grant = GrantedCapabilities::from_names(&scorer.pool.capabilities).with_datastores(&[
-        DatastoreGrant {
-            name: scorer.datastore_name.clone(),
-            path: scorer.plexdb_path.display().to_string(),
-        },
-    ])?;
+    let grant = GrantedCapabilities::from_names(&scorer.pool.capabilities);
     let full = crate::score::pick(
         &cache,
         &scorer.plugin_path,
@@ -462,10 +439,7 @@ fn baseline(
     scorer: &Scorer,
     account_id: Option<i64>,
 ) -> Result<Arc<Baseline>, String> {
-    let stamp = (
-        mtime(&loc.config_path),
-        mtime(&scorer.plugin_path).max(mtime(&scorer.plexdb_path)),
-    );
+    let stamp = (mtime(&loc.config_path), mtime(&scorer.plugin_path));
     let cache_key = (key.to_string(), scorer.pool.name.clone(), account_id);
     if let Some(b) = state.pools.baselines.get(&cache_key)
         && b.stamp == stamp
@@ -473,7 +447,13 @@ fn baseline(
         return Ok(Arc::clone(b));
     }
     let began = Instant::now();
-    let ranked = rank(&state.catalog, scorer, &loc.dir, account_id)?;
+    let ranked = rank(
+        &state.catalog,
+        state.plexdb.as_ref(),
+        scorer,
+        &loc.dir,
+        account_id,
+    )?;
     let places = ranked
         .full
         .iter()
@@ -598,7 +578,13 @@ fn pool_body(
                 obj.insert("edited".to_string(), json!(true));
                 obj.insert("profile_yaml".to_string(), json!(profile_yaml(entries)));
                 let began = Instant::now();
-                let ranked = rank(&state.catalog, &scorer, &loc.dir, account_id)?;
+                let ranked = rank(
+                    &state.catalog,
+                    state.plexdb.as_ref(),
+                    &scorer,
+                    &loc.dir,
+                    account_id,
+                )?;
                 obj.insert("profile".to_string(), ranked.profile);
                 obj.insert(
                     "ranking".to_string(),
@@ -1035,66 +1021,53 @@ fn profile_json(cache: &ScoreCache, pool_name: &str) -> Value {
     })
 }
 
-fn open_plexdb_readonly(path: &Path) -> Result<Connection, String> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| format!("open {}: {e}", path.display()))
+/// How long the dashboard keeps the explorer's keyword list before walking
+/// `GET /keywords` again (25 pages, 1.7 MB, 4.5 s on prod).
+const KEYWORDS_FRESH: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Every stored keyword and its spellings, from the cache when it is fresh.
+fn keyword_list(state: &AppState) -> Result<super::KeywordList, String> {
+    let explorer = state.plexdb.as_ref().ok_or_else(|| {
+        format!(
+            "{} is not set, so there are no keywords to search",
+            crate::plexdb_ex::URL_ENV
+        )
+    })?;
+    let mut slot = state.keywords.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, list)) = slot.as_ref()
+        && at.elapsed() < KEYWORDS_FRESH
+    {
+        return Ok(Arc::clone(list));
+    }
+    let list = Arc::new(
+        explorer
+            .keywords()
+            .map_err(|e| format!("cannot read the plex-db-ex explorer: {e}"))?,
+    );
+    *slot = Some((std::time::Instant::now(), Arc::clone(&list)));
+    Ok(list)
 }
 
-/// The plexdb a keyword search reads: the datastore of the pool `pool_name`
-/// names on channel `channel`, or of the channel's first scorer pool when no
-/// pool is named. A channel's scorer pools nearly always share one grant.
-fn resolve_search_plexdb(
-    state: &AppState,
-    params: &HashMap<String, String>,
-) -> Result<PathBuf, String> {
-    let key = params
-        .get("channel")
-        .ok_or_else(|| "missing `channel`".to_string())?;
-    let loc = match require(state, key)? {
-        Ok(l) => l,
-        Err((_, m)) => return Err(m),
-    };
-    let pools = pools_of(&loc.channel);
-    let pool = match params.get("pool_name") {
-        Some(name) => pools
-            .into_iter()
-            .find(|p| p.name == *name)
-            .ok_or_else(|| format!("no pool named {name:?} in channel {key:?}"))?,
-        None => pools
-            .into_iter()
-            .find(|p| p.plugin.is_some())
-            .ok_or_else(|| format!("channel {key:?} has no plugin-scored pool"))?,
-    };
-    let grant = pool
-        .datastores
-        .first()
-        .ok_or_else(|| format!("pool {:?} declares no datastores", pool.name))?;
-    Ok(PathBuf::from(config::expand_process_env(&grant.path)?))
-}
-
+/// `GET /api/search/keyword?q=`: up to 30 `(surface, keyword)` pairs whose
+/// spelling or stored form contains `q`, case-insensitively, by surface.
 pub(super) fn api_search_keyword(state: &AppState, query: &str) -> Result<(u16, Value), String> {
     let params = parse_query(query);
-    let q = params.get("q").cloned().unwrap_or_default();
-    let plexdb_path = resolve_search_plexdb(state, &params)?;
-    let conn = open_plexdb_readonly(&plexdb_path)?;
-    let pattern = format!("%{}%", like_escape(&q));
-    let mut stmt = conn
-        .prepare(
-            "SELECT DISTINCT surface, keyword FROM keyword_forms \
-             WHERE surface LIKE ?1 COLLATE NOCASE OR keyword LIKE ?1 COLLATE NOCASE \
-             ORDER BY surface LIMIT 30",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([&pattern], |r| {
-            Ok(json!({
-                "surface": r.get::<_, String>(0)?,
-                "keyword": r.get::<_, String>(1)?,
-            }))
+    let q = params.get("q").cloned().unwrap_or_default().to_lowercase();
+    let list = keyword_list(state)?;
+    let mut rows: Vec<(&str, &str)> = list
+        .iter()
+        .flat_map(|(keyword, surfaces)| {
+            surfaces.iter().map(move |s| (s.as_str(), keyword.as_str()))
         })
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
+        .filter(|(surface, keyword)| surface.to_lowercase().contains(&q) || keyword.contains(&q))
+        .collect();
+    rows.sort();
+    rows.dedup();
+    rows.truncate(30);
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .map(|(surface, keyword)| json!({ "surface": surface, "keyword": keyword }))
+        .collect();
     Ok((200, json!({ "results": rows })))
 }
 
@@ -1141,29 +1114,18 @@ pub(super) fn api_search_item(state: &AppState, query: &str) -> Result<(u16, Val
     Ok((200, json!({ "results": results })))
 }
 
-/// The audio facts the snapshot holds for `ids`, or why it cannot say.
+/// The audio facts the explorer holds for `ids`, or why it cannot say.
 fn snapshot_facts(
     state: &AppState,
     ids: &[String],
 ) -> Result<std::collections::HashMap<String, Value>, String> {
-    let snapshot = state.plexdb.as_deref().ok_or_else(|| {
-        format!(
-            "{} is not set, so no entry has audio facts",
-            crate::audio_facts::SNAPSHOT_ENV
-        )
-    })?;
-    crate::audio_facts::facts_for_entries(snapshot, ids).map_err(|e| {
-        format!(
-            "cannot read the plex-db-ex snapshot {}: {e}",
-            snapshot.display()
-        )
-    })
+    crate::audio_facts::facts_for_entries(state.plexdb.as_ref(), ids)
 }
 
-/// `GET /api/audio/{entry_id}`: the entry's audio facts from the snapshot, the
+/// `GET /api/audio/{entry_id}`: the entry's audio facts from the explorer, the
 /// same JSON `admin facts <entry>` prints. 404 when the entry is unknown; 503
-/// with an `error` string when the snapshot is unset or cannot be read, so a
-/// broken snapshot never reads as "not analyzed".
+/// with an `error` string when the explorer is unset or unreachable, so a
+/// broken explorer never reads as "not analyzed".
 pub(super) fn api_audio_fact(state: &AppState, entry_id: &str) -> Result<(u16, Value), String> {
     if state
         .catalog
@@ -1188,13 +1150,56 @@ pub(super) fn api_audio_fact(state: &AppState, entry_id: &str) -> Result<(u16, V
     })
 }
 
-/// `GET /api/health/audio`: how many catalog entries the plex-db-ex snapshot
-/// holds audio facts for, and which snapshot answered.
+/// How long a coverage count stands before the next request starts another:
+/// 6 h for a full count, a minute for one that could not read the explorer.
+fn coverage_fresh_for(counted: &Value) -> std::time::Duration {
+    if counted["problem"].is_null() {
+        std::time::Duration::from_secs(6 * 3600)
+    } else {
+        std::time::Duration::from_secs(60)
+    }
+}
+
+/// The last coverage count and whether one is running.
+#[derive(Debug, Default)]
+pub(super) struct Coverage {
+    counted: Option<(std::time::Instant, Value)>,
+    running: bool,
+}
+
+/// `GET /api/health/audio`: how many catalog entries the plex-db-ex store
+/// holds audio facts for, and which explorer answered. Counting walks every
+/// title in the store (66 s on prod), so it runs on its own thread: the reply
+/// is the last count, with `counting: true` while a new one runs, and the
+/// first request after start answers zeros and `counting: true`.
 pub(super) fn api_health_audio(state: &AppState) -> Result<(u16, Value), String> {
-    Ok((
-        200,
-        crate::audio_facts::coverage(&state.catalog, state.plexdb.as_deref())?,
-    ))
+    let mut slot = state.coverage.lock().unwrap_or_else(|e| e.into_inner());
+    let stale = slot
+        .counted
+        .as_ref()
+        .is_none_or(|(at, v)| at.elapsed() >= coverage_fresh_for(v));
+    if stale && !slot.running {
+        let live = state.catalog.live_entry_ids().map_err(|e| e.to_string())?;
+        slot.running = true;
+        let explorer = state.plexdb.clone();
+        let shared = Arc::clone(&state.coverage);
+        std::thread::spawn(move || {
+            let counted = crate::audio_facts::coverage(live, explorer.as_ref());
+            let mut slot = shared.lock().unwrap_or_else(|e| e.into_inner());
+            slot.counted = Some((std::time::Instant::now(), counted));
+            slot.running = false;
+        });
+    }
+    let mut body = match &slot.counted {
+        Some((_, v)) => v.clone(),
+        None => json!({
+            "entries": 0, "in_store": 0, "with_facts": 0, "without_facts": 0,
+            "explorer": { "url": state.plexdb.as_ref().map(|e| e.base()), "env": crate::plexdb_ex::URL_ENV },
+            "problem": null,
+        }),
+    };
+    body["counting"] = json!(slot.running);
+    Ok((200, body))
 }
 
 pub(super) fn api_plex_accounts() -> Result<(u16, Value), String> {
@@ -1214,6 +1219,21 @@ mod tests {
     use crate::catalog::{EntrySource, Source};
 
     #[test]
+    fn a_coverage_count_that_could_not_read_the_explorer_is_retried_within_a_minute() {
+        let ok = json!({"with_facts": 10, "problem": null});
+        let failed =
+            json!({"with_facts": 0, "problem": "cannot read the plex-db-ex explorer: refused"});
+        assert_eq!(
+            coverage_fresh_for(&ok),
+            std::time::Duration::from_secs(6 * 3600)
+        );
+        assert_eq!(
+            coverage_fresh_for(&failed),
+            std::time::Duration::from_secs(60)
+        );
+    }
+
+    #[test]
     fn inline_index_follows_position_not_ctx_profile_order() {
         let entry = |v: Value| v.as_object().unwrap().clone();
         // Inline entry 3 in the file, though `exclude:` entries 1-2 and a
@@ -1228,48 +1248,45 @@ mod tests {
         );
     }
 
-    /// A station of two channels over a four-movie catalog and a hand-built
-    /// plexdb: `foryou` ranks movies with the committed taste-cosine script,
+    /// A station of two channels over a four-movie catalog and a fake
+    /// plex-db-ex explorer: `foryou` ranks movies with the committed taste-cosine script,
     /// `plain` has one CEL pool. Account 42 watched `mov-a` (keywords contact
     /// and time), so `mov-c` (contact) and `mov-d` (time, desert) rank on
     /// profile alone; a `desert` entry lifts `mov-d`.
     struct Fixture {
         _dir: tempfile::TempDir,
+        _explorer: crate::plexdb_ex::fake::Server,
         state: AppState,
     }
 
     fn fixture() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let db = root.join("plexdb.db");
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(&format!(
-            "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version (version) VALUES ({v});
-             CREATE TABLE reader_shape (version INTEGER NOT NULL);
-             INSERT INTO reader_shape (version) VALUES ({v});
-             CREATE TABLE items (item_id TEXT PRIMARY KEY, type TEXT NOT NULL,
-                 show_item_id TEXT, season INTEGER, episode INTEGER);
-             CREATE TABLE enrichment (item_id TEXT NOT NULL, namespace TEXT NOT NULL,
-                 key TEXT NOT NULL, value TEXT NOT NULL, fetched_at TEXT NOT NULL);
-             CREATE TABLE plays (history_key TEXT PRIMARY KEY, item_id TEXT NOT NULL,
-                 plex_account_id INTEGER NOT NULL, viewed_at INTEGER NOT NULL);
-             CREATE TABLE keyword_forms (surface TEXT PRIMARY KEY, keyword TEXT NOT NULL);
-             INSERT INTO items (item_id, type) VALUES
-                 ('mov-a','movie'),('mov-b','movie'),('mov-c','movie'),('mov-d','movie');
-             INSERT INTO enrichment (item_id, namespace, key, value, fetched_at) VALUES
-                 ('mov-a','keywords','keyword','contact','2026-01-01T00:00:00+00:00'),
-                 ('mov-a','keywords','keyword','time','2026-01-01T00:00:00+00:00'),
-                 ('mov-c','keywords','keyword','contact','2026-01-01T00:00:00+00:00'),
-                 ('mov-d','keywords','keyword','time','2026-01-01T00:00:00+00:00'),
-                 ('mov-d','keywords','keyword','desert','2026-01-01T00:00:00+00:00');
-             INSERT INTO plays (history_key, item_id, plex_account_id, viewed_at)
-                 VALUES ('h1','mov-a',42,1700000000);
-             INSERT INTO keyword_forms (surface, keyword) VALUES
-                 ('desert','desert'),('contact','contact');",
-            v = plexdb_reader::SUPPORTED_READER_SHAPE
-        ))
-        .unwrap();
+        let mut store = crate::plexdb_ex::fake::Store::default();
+        for (id, keyword) in [
+            ("mov-a", "contact"),
+            ("mov-a", "time"),
+            ("mov-c", "contact"),
+            ("mov-d", "time"),
+            ("mov-d", "desert"),
+        ] {
+            store.fact(id, "keywords", "keyword", keyword);
+        }
+        store.item("mov-b", "movie");
+        store.keyword("desert", &["desert"]);
+        store.keyword("contact", &["contact"]);
+        // mov-a's one play, split evenly over its two keywords (ADR-0011's
+        // sqrt(seasons) weight is 1 for a film); the only account, so the
+        // house vector is the same.
+        let taste = json!({"attributes": [
+            {"namespace": "keywords", "key": "keyword", "value": "contact", "weight": 0.5},
+            {"namespace": "keywords", "key": "keyword", "value": "time", "weight": 0.5}
+        ], "shows_without_seasons": []});
+        store.pooled_taste = Some(taste.clone());
+        let account = store.account(42);
+        account.watched = vec!["mov-a".into()];
+        account.taste = taste;
+        let explorer = crate::plexdb_ex::fake::serve(store);
 
         let plugin = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/plugins/taste-cosine.rhai")
@@ -1288,12 +1305,12 @@ mod tests {
                  rule:\n  blocks:\n    - mode: all\n      program:\n        title: \"For You\"\n      pools:\n\
                  \x20       - name: movies\n          plugin: \"{plugin}\"\n\
                  \x20         capabilities: [catalog_read, http]\n\
-                 \x20         datastores:\n            - name: taste\n              path: \"{db}\"\n\
                  \x20         config:\n            exploration_fraction: 0.0\n\
+                 \x20           plexdb_url: \"{explorer}\"\n\
                  \x20         select: round_robin\n          advance: restart\n\
                  \x20     pattern:\n        - pool: movies\n          take: 2\n",
                 plugin = plugin.display(),
-                db = db.display()
+                explorer = explorer.url
             ),
         )
         .unwrap();
@@ -1337,10 +1354,16 @@ mod tests {
         let state = AppState {
             catalog: Catalog::open_readonly(&catalog_path).unwrap(),
             pools: PoolState::default(),
-            review: ReviewState::new(station.clone(), catalog_path.clone()),
+            review: ReviewState::new(
+                station.clone(),
+                catalog_path.clone(),
+                Some(crate::plexdb_ex::Explorer::new(&explorer.url)),
+            ),
             mcp: None,
             arr: super::arr::ArrEnv::default(),
-            plexdb: None,
+            plexdb: Some(crate::plexdb_ex::Explorer::new(&explorer.url)),
+            keywords: Default::default(),
+            coverage: Default::default(),
             options: Options {
                 station,
                 catalog: catalog_path,
@@ -1351,7 +1374,11 @@ mod tests {
             },
         };
         state.review.sims.spawn();
-        Fixture { _dir: dir, state }
+        Fixture {
+            _dir: dir,
+            _explorer: explorer,
+            state,
+        }
     }
 
     fn call(state: &mut AppState, method: Method, path: &str, body: &str) -> (u16, Value) {

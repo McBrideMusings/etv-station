@@ -15,8 +15,8 @@
 //!   entry's shape. It needs only the filesystem, so config validation runs it
 //!   and a malformed entry fails the load.
 //! - [`resolve`] looks every reference up in the catalog, and a `keyword`
-//!   reference against the pool's granted datastore's `keyword_forms` table
-//!   ([`plexdb_reader::Reader::keyword_for_surface`]). It runs in the
+//!   reference against plex-db-ex's recorded spellings through its explorer
+//!   ([`crate::plexdb_ex::Explorer::keyword_for_surface`], ADR 0024). It runs in the
 //!   catalog-reading half of a generation ([`crate::score::ScoreCache`]'s
 //!   prepare step), so an unmatched item or keyword spelling fails the
 //!   generation, not the load.
@@ -450,29 +450,28 @@ pub fn check_ignore_keywords(pool: &Pool) -> Result<(), String> {
 }
 
 /// The stored keyword a normalized surface spelling maps to, via the
-/// datastore's `keyword_forms` table (etv-station-sctf.1) — the one function
-/// a keyword's resolution goes through, so a spelling `keyword_forms` has
-/// never seen fails naming itself rather than being passed through unmatched.
+/// explorer's `GET /keywords?surface=` (etv-station-sctf.1) — the one function
+/// a keyword's resolution goes through, so a spelling the store has never
+/// recorded fails naming itself rather than being passed through unmatched.
 fn resolve_keyword_surface(
-    reader: &plexdb_reader::Reader,
+    explorer: &crate::plexdb_ex::Explorer,
     surface: &str,
 ) -> Result<String, String> {
-    reader
+    explorer
         .keyword_for_surface(surface)
         .map_err(|e| format!("keyword {surface:?}: {e}"))?
         .ok_or_else(|| format!("keyword {surface:?} matches no stored keyword"))
 }
 
 /// Resolve every loaded entry against the catalog. `keyword_store` is the
-/// pool's granted datastore (its first grant — the same one a channel author
-/// points a `keyword:`-reading scorer at), needed only when an entry or
-/// `ignore_keywords` names a keyword; `None` fails such an entry naming the
-/// pool's missing grant, rather than resolving nothing.
+/// plex-db-ex explorer ([`crate::plexdb_ex::URL_ENV`]), needed only when an
+/// entry or `ignore_keywords` names a keyword; `None` fails such an entry
+/// naming the unset variable, rather than resolving nothing.
 pub fn resolve(
     catalog: &Catalog,
     entries: &[LoadedEntry],
     ignore_keywords: &[String],
-    keyword_store: Option<&plexdb_reader::Reader>,
+    keyword_store: Option<&crate::plexdb_ex::Explorer>,
 ) -> Result<ResolvedProfile, String> {
     let mut out = Array::with_capacity(entries.len());
     let mut exclusions = Vec::new();
@@ -507,10 +506,11 @@ pub fn resolve(
             Reference::Keyword(k) => {
                 let reader = keyword_store.ok_or_else(|| {
                     format!(
-                        "{}: `keyword: {}` needs a granted datastore to resolve its spelling \
-                         against — this pool grants none",
+                        "{}: `keyword: {}` needs the plex-db-ex explorer ({}) to resolve its \
+                         spelling against — it is not set",
                         entry.locate(),
-                        entry.written
+                        entry.written,
+                        crate::plexdb_ex::URL_ENV
                     )
                 })?;
                 let stored = resolve_keyword_surface(reader, k)
@@ -557,9 +557,11 @@ pub fn resolve(
         Array::new()
     } else {
         let reader = keyword_store.ok_or_else(|| {
-            "`ignore_keywords` needs a granted datastore to resolve its spellings against — \
-             this pool grants none"
-                .to_string()
+            format!(
+                "`ignore_keywords` needs the plex-db-ex explorer ({}) to resolve its spellings \
+                 against — it is not set",
+                crate::plexdb_ex::URL_ENV
+            )
         })?;
         let mut resolved = Array::with_capacity(ignore_keywords.len());
         for raw in ignore_keywords {
@@ -594,7 +596,7 @@ pub fn resolve(
 /// The catalog entries one `exclude: true` or `require: true` entry matches.
 /// A tag value matches ASCII-case-insensitively (`Horror` = `horror`, but
 /// `É` ≠ `é`); an item resolves exactly as a weighted `item:` does; a keyword
-/// resolves its spelling through `keyword_forms`, then matches every entry
+/// resolves its spelling through the explorer, then matches every entry
 /// whose movie or show carries that stored keyword in `keyword_store` — an
 /// episode by its show's keywords, since it has none of its own. `keywords`
 /// holds the catalog's keyword index once the first keyword entry built it.
@@ -604,7 +606,7 @@ pub fn resolve(
 fn resolve_match(
     catalog: &Catalog,
     entry: &LoadedEntry,
-    keyword_store: Option<&plexdb_reader::Reader>,
+    keyword_store: Option<&crate::plexdb_ex::Explorer>,
     keywords: &mut Option<KeywordIndex>,
     verb: &str,
 ) -> Result<ResolvedMatch, String> {
@@ -612,10 +614,11 @@ fn resolve_match(
         Reference::Keyword(k) => {
             let reader = keyword_store.ok_or_else(|| {
                 format!(
-                    "{}: a {verb} `keyword: {}` needs a granted datastore to read keywords \
-                     from — this pool grants none",
+                    "{}: a {verb} `keyword: {}` needs the plex-db-ex explorer ({}) to read \
+                     keywords from — it is not set",
                     entry.locate(),
-                    entry.written
+                    entry.written,
+                    crate::plexdb_ex::URL_ENV
                 )
             })?;
             let stored = resolve_keyword_surface(reader, k)
@@ -667,8 +670,8 @@ fn resolve_match(
 }
 
 /// Every catalog entry beside the stored keywords its movie or show carries:
-/// one catalog pass for each entry's fact id, one bulk keyword read for the
-/// distinct fact ids. Built once per profile, however many keyword entries
+/// one catalog pass for each entry's fact id, one walk of the explorer's
+/// movie and show keywords for the distinct fact ids. Built once per profile, however many keyword entries
 /// it has.
 struct KeywordIndex {
     units: Vec<(String, String)>,
@@ -676,14 +679,15 @@ struct KeywordIndex {
 }
 
 impl KeywordIndex {
-    fn build(catalog: &Catalog, reader: &plexdb_reader::Reader) -> Result<Self, String> {
+    fn build(catalog: &Catalog, explorer: &crate::plexdb_ex::Explorer) -> Result<Self, String> {
         let units = catalog.fact_units().map_err(|e| e.to_string())?;
-        let facts = reader
-            .enrichment_for_many(units.iter().map(|(_, unit)| unit.as_str()), "keywords")
-            .map_err(|e| format!("reading keywords: {e}"))?;
-        let by_unit = facts
+        let wanted: std::collections::HashSet<&str> =
+            units.iter().map(|(_, unit)| unit.as_str()).collect();
+        let by_unit = explorer
+            .keywords_by_unit(&wanted)
+            .map_err(|e| format!("reading keywords: {e}"))?
             .into_iter()
-            .map(|(unit, fs)| (unit, fs.into_iter().map(|f| f.value).collect()))
+            .map(|(unit, values)| (unit, values.into_iter().collect()))
             .collect();
         Ok(Self { units, by_unit })
     }
