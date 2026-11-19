@@ -46,6 +46,8 @@ pub struct Store {
     /// The store holds no play history: every taste and watched read is a
     /// 500, so a test can prove a plugin never asked for one.
     pub no_plays: bool,
+    /// Titles whose `GET /items/{id}/audio-facts` answers 500.
+    pub audio_failing: std::collections::BTreeSet<String>,
 }
 
 impl Store {
@@ -514,6 +516,9 @@ fn answer(store: &Store, path: &str, query: &str) -> (u16, Value) {
             Some(it) => (200, facts(it, q.get("namespace"))),
             None => not_found(id),
         },
+        ["items", id, "audio-facts"] if store.audio_failing.contains(*id) => {
+            (500, json!({"error": "audio facts unreadable"}))
+        }
         ["items", id, "audio-facts"] => match store.items.get(*id) {
             Some(it) => (200, it.audio.clone().unwrap_or(Value::Null)),
             None => not_found(id),

@@ -27,6 +27,9 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// so a dashboard read and a daemon read at the same moment still fit.
 pub const WORKERS: usize = 4;
 
+/// One audio-facts worker's titles with facts, and its first failed read.
+type WorkerReads = (Vec<(String, Value)>, Option<Error>);
+
 /// The largest page the API serves.
 const PAGE: usize = 1000;
 
@@ -155,35 +158,70 @@ impl Explorer {
     /// or one the store does not hold, is absent. One
     /// `GET /items/{id}/audio-facts` per id, [`WORKERS`] at a time: the API has
     /// no read by a set of ids, and walking every title with its facts is 93
-    /// pages and 280 MB on prod.
+    /// pages and 280 MB on prod. A failed read drops only its own title; the
+    /// workers stop after [`WORKERS`] failures, and the call is an error only
+    /// when no read answered.
     pub fn audio_facts_for(&self, ids: &[String]) -> Result<HashMap<String, Value>, Error> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let started = Instant::now();
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let results: Vec<Result<Vec<(String, Value)>, Error>> = std::thread::scope(|s| {
+        let next = AtomicUsize::new(0);
+        let failed = AtomicUsize::new(0);
+        let answered = AtomicUsize::new(0);
+        let per_worker: Vec<WorkerReads> = std::thread::scope(|s| {
             let workers: Vec<_> = (0..WORKERS.min(ids.len()))
                 .map(|_| {
                     s.spawn(|| {
                         let mut found = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut first_error = None;
+                        while failed.load(Ordering::Relaxed) < WORKERS {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
                             let Some(id) = ids.get(i) else { break };
-                            match self.get(&format!("/items/{}/audio-facts", encode(id)))? {
-                                Some(Value::Null) | None => {}
-                                Some(facts) => found.push((id.clone(), facts)),
+                            match self.get(&format!("/items/{}/audio-facts", encode(id))) {
+                                Ok(facts) => {
+                                    answered.fetch_add(1, Ordering::Relaxed);
+                                    match facts {
+                                        Some(Value::Null) | None => {}
+                                        Some(facts) => found.push((id.clone(), facts)),
+                                    }
+                                }
+                                Err(e) => {
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                    first_error.get_or_insert(e);
+                                }
                             }
                         }
-                        Ok(found)
+                        (found, first_error)
                     })
                 })
                 .collect();
             workers
                 .into_iter()
-                .map(|w| w.join().unwrap_or_else(|_| Err("worker panicked".into())))
+                .map(|w| {
+                    w.join()
+                        .unwrap_or_else(|_| (Vec::new(), Some("worker panicked".into())))
+                })
                 .collect()
         });
         let mut out = HashMap::new();
-        for r in results {
-            out.extend(r?);
+        let mut first_error = None;
+        for (found, error) in per_worker {
+            out.extend(found);
+            if first_error.is_none() {
+                first_error = error;
+            }
+        }
+        if let Some(e) = first_error {
+            if answered.load(Ordering::Relaxed) == 0 {
+                return Err(e);
+            }
+            tracing::warn!(
+                event = "plexdb_ex.audio_facts",
+                asked = ids.len(),
+                found = out.len(),
+                failed = failed.load(Ordering::Relaxed),
+                error = %e,
+                "some audio-facts reads failed; those titles have no facts"
+            );
         }
         tracing::info!(
             event = "plexdb_ex.audio_facts",
@@ -342,6 +380,21 @@ mod tests {
             Some("bank heist")
         );
         assert_eq!(ex.keyword_for_surface("nope").unwrap(), None);
+    }
+
+    #[test]
+    fn one_failed_audio_read_drops_only_its_own_title() {
+        let mut store = fake::Store::default();
+        for i in 0..6 {
+            store.audio(&format!("fs:{i}"), json!({"bpm": i}));
+        }
+        store.audio_failing.insert("fs:3".into());
+        let server = fake::serve(store);
+        let ex = Explorer::new(&server.url);
+        let ids: Vec<String> = (0..6).map(|i| format!("fs:{i}")).collect();
+        let facts = ex.audio_facts_for(&ids).unwrap();
+        assert_eq!(facts.len(), 5);
+        assert!(!facts.contains_key("fs:3"));
     }
 
     #[test]
