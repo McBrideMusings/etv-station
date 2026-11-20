@@ -348,8 +348,6 @@ fn call_arrange(
     window: Window,
     dice: crate::variety::Dice,
 ) -> Result<Vec<String>, String> {
-    let source = std::fs::read_to_string(sequencer)
-        .map_err(|e| format!("read sequencer plugin {}: {e}", sequencer.display()))?;
     // The station's configured tz (ADR 0004), or UTC at the stateless entry
     // points that carry no station config — see the doc note on
     // `ScoreInputs::tz`. Baked into `local_time` via closure rather than
@@ -358,9 +356,7 @@ fn call_arrange(
     let tz = score_env.inputs.tz.unwrap_or(time_tz::timezones::db::UTC);
     let mut engine = crate::score::engine();
     engine.register_fn("local_time", move |secs: i64| local_time_map(secs, tz));
-    let ast = engine
-        .compile(&source)
-        .map_err(|e| format!("compile sequencer plugin {}: {e}", sequencer.display()))?;
+    let ast = crate::score::compile_script(&engine, sequencer, "sequencer plugin")?;
 
     let mut window_map = Map::new();
     window_map.insert("from".into(), window.from.into());

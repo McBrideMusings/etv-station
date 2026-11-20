@@ -129,7 +129,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use etv_overlay::config_carrier;
 use rhai::serde::DynamicDeserializer;
@@ -347,12 +347,99 @@ pub const KNOWN_HOOKS: &[&str] = &["pool_provider", "sequencer", "annotate", "bu
 pub fn compile_plugin(script_path: &Path) -> Result<rhai::AST, String> {
     #[cfg(test)]
     test_support::note_compile();
+    compile_script(&engine(), script_path, "plugin")
+}
+
+/// Read and compile the script at `script_path` with `engine`, recording the
+/// script's absolute path as the AST's source. Rhai resolves a relative
+/// `import` against the folder of the running AST's source, so this is what
+/// makes `import "megamix/drop"` inside `plugins/megamix.rhai` load
+/// `plugins/megamix/drop.rhai` whatever the process's working directory.
+/// `what` names the script in the read and compile errors ("scorer plugin").
+pub(crate) fn compile_script(
+    engine: &Engine,
+    script_path: &Path,
+    what: &str,
+) -> Result<rhai::AST, String> {
     let source = std::fs::read_to_string(script_path)
-        .map_err(|e| format!("read plugin {}: {e}", script_path.display()))?;
-    let engine = engine();
-    engine
+        .map_err(|e| format!("read {what} {}: {e}", script_path.display()))?;
+    let mut ast = engine
         .compile(&source)
-        .map_err(|e| format!("compile plugin {}: {e}", script_path.display()))
+        .map_err(|e| format!("compile {what} {}: {e}", script_path.display()))?;
+    let absolute = std::fs::canonicalize(script_path).unwrap_or_else(|_| script_path.to_path_buf());
+    ast.set_source(absolute.to_string_lossy().into_owned());
+    Ok(ast)
+}
+
+/// Loads a plugin's `import "<path>"` from `<path>.rhai` beside the importing
+/// script, and records each module's absolute path as its source so the
+/// module's own imports resolve beside it too. Rhai's `FileModuleResolver`
+/// records the path as written ("megamix/drop"), which would send a module's
+/// imports back to the process's working directory, and its not-found error
+/// carries only the written path; this one names the file it looked for.
+/// One per engine; modules are cached by file for that engine's life.
+#[derive(Default)]
+struct PluginModuleResolver {
+    cache: Mutex<HashMap<PathBuf, Arc<rhai::Module>>>,
+    /// Files mid-load: an import that reaches one again is a cycle, refused
+    /// rather than recursing until the stack overflows.
+    loading: Mutex<std::collections::HashSet<PathBuf>>,
+}
+
+impl rhai::ModuleResolver for PluginModuleResolver {
+    fn resolve(
+        &self,
+        engine: &Engine,
+        source: Option<&str>,
+        path: &str,
+        pos: rhai::Position,
+    ) -> Result<Arc<rhai::Module>, Box<EvalAltResult>> {
+        let base = source
+            .and_then(|s| Path::new(s).parent())
+            .unwrap_or_else(|| Path::new(""));
+        let mut file = base.join(path);
+        file.set_extension("rhai");
+        let file = std::path::absolute(&file).unwrap_or(file);
+        if let Some(module) = self.cache.lock().unwrap().get(&file) {
+            return Ok(module.clone());
+        }
+        let text = std::fs::read_to_string(&file).map_err(|e| {
+            let what = if e.kind() == std::io::ErrorKind::NotFound {
+                "no file".to_string()
+            } else {
+                format!("cannot read ({e})")
+            };
+            EvalAltResult::ErrorRuntime(
+                format!("module {path:?} not found: {what} {}", file.display()).into(),
+                pos,
+            )
+        })?;
+        let in_module = |err: Box<EvalAltResult>| {
+            Box::new(EvalAltResult::ErrorInModule(
+                file.display().to_string(),
+                err,
+                pos,
+            ))
+        };
+        let mut ast = engine.compile(&text).map_err(|e| in_module(e.into()))?;
+        ast.set_source(file.to_string_lossy().into_owned());
+        if !self.loading.lock().unwrap().insert(file.clone()) {
+            return Err(EvalAltResult::ErrorRuntime(
+                format!(
+                    "module {path:?} imports itself: {} is already loading",
+                    file.display()
+                )
+                .into(),
+                pos,
+            )
+            .into());
+        }
+        let evaluated = rhai::Module::eval_ast_as_new(Scope::new(), &ast, engine);
+        self.loading.lock().unwrap().remove(&file);
+        let module = Arc::new(evaluated.map_err(in_module)?);
+        self.cache.lock().unwrap().insert(file, module.clone());
+        Ok(module)
+    }
 }
 
 /// [`declared_hooks`], given a script already compiled by [`compile_plugin`]
@@ -1031,6 +1118,7 @@ pub(crate) fn set_plugin_clock(start: f64, step: f64) -> ClockGuard {
 pub(crate) fn engine() -> Engine {
     let mut engine = Engine::new();
     engine.set_max_expr_depths(128, 64);
+    engine.set_module_resolver(PluginModuleResolver::default());
     engine
         .register_type_with_name::<ScoreCtx>("ScoreCtx")
         .register_get("sets", ScoreCtx::get_sets)
@@ -1836,11 +1924,7 @@ fn compile_and_resolve(
     pool_sources: Option<&PoolSources>,
     narrowing: &crate::profile::Narrowing,
 ) -> Result<CachedScript, String> {
-    let source = std::fs::read_to_string(script_path)
-        .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
-    let ast = engine
-        .compile(&source)
-        .map_err(|e| format!("compile scorer plugin {}: {e}", script_path.display()))?;
+    let ast = compile_script(engine, script_path, "scorer plugin")?;
 
     let declared = declared_sources(engine, &ast, script_path, pool_sources)?;
     let whose = source_error_prefix(script_path, pool_sources);
@@ -1886,11 +1970,7 @@ pub fn effective_sources(
     pool_sources: Option<&PoolSources>,
 ) -> Result<Vec<(String, String)>, String> {
     let engine = engine();
-    let source = std::fs::read_to_string(script_path)
-        .map_err(|e| format!("read scorer plugin {}: {e}", script_path.display()))?;
-    let ast = engine
-        .compile(&source)
-        .map_err(|e| format!("compile scorer plugin {}: {e}", script_path.display()))?;
+    let ast = compile_script(&engine, script_path, "scorer plugin")?;
     declared_sources(&engine, &ast, script_path, pool_sources)
 }
 
@@ -2868,6 +2948,23 @@ fn audit(ctx, picks, workspace) { #{} }
     fn declared_hooks_reads_pool_provider() {
         let dir = tempfile::tempdir().unwrap();
         let p = write(&dir, r#"fn hooks() { ["pool_provider"] }"#);
+        assert_eq!(declared_hooks(&p).unwrap(), vec!["pool_provider"]);
+    }
+
+    #[test]
+    fn a_plugins_relative_import_resolves_against_its_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("lib")).unwrap();
+        std::fs::write(
+            dir.path().join("lib/names.rhai"),
+            r#"fn hook() { "pool_provider" }"#,
+        )
+        .unwrap();
+        let p = write(
+            &dir,
+            r#"fn hooks() { import "lib/names" as n; [n::hook()] }"#,
+        );
+        assert_ne!(std::env::current_dir().unwrap(), dir.path());
         assert_eq!(declared_hooks(&p).unwrap(), vec!["pool_provider"]);
     }
 

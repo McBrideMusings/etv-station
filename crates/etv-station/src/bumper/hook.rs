@@ -1572,6 +1572,78 @@ fn build(ctx) {
     }
 
     #[test]
+    fn build_imports_a_module_beside_the_script_named_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("megamix")).unwrap();
+        std::fs::write(
+            dir.path().join("megamix/drop.rhai"),
+            "import \"common\" as c; fn arrange(t) { t.push(c::green()); t }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("megamix/common.rhai"),
+            "fn green() { segment().color(\"#00ff00\").fixed(3.0) }",
+        )
+        .unwrap();
+        let script_text = r#"
+fn hooks() { ["bumper"] }
+fn build(ctx) {
+    import "megamix/" + ctx.config.blend as m;
+    m::arrange(timeline())
+}
+"#;
+        let mut inp = input(None);
+        inp.config = Some(serde_json::json!({ "blend": "drop" }));
+        let built = build(&script(&dir, script_text), &inp).unwrap();
+        assert_eq!(built.timeline.segments.len(), 1);
+        assert_eq!(built.timeline.segments[0].duration, Duration::Fixed(3000));
+    }
+
+    #[test]
+    fn a_missing_module_fails_naming_the_file_it_looked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let script_text = r#"
+fn hooks() { ["bumper"] }
+fn build(ctx) {
+    import "megamix/nope" as m;
+    m::arrange(timeline())
+}
+"#;
+        let err = build(&script(&dir, script_text), &input(None)).unwrap_err();
+        let tried = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("megamix/nope.rhai");
+        let message = err.to_string();
+        assert!(message.contains(&tried.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn modules_that_import_each_other_fail_instead_of_recursing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("x.rhai"),
+            "import \"y\" as y; fn f() { 1 } let n = y::f();",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("y.rhai"),
+            "import \"x\" as x; fn f() { 2 } let n = x::f();",
+        )
+        .unwrap();
+        let script_text = r#"
+fn hooks() { ["bumper"] }
+fn build(ctx) {
+    import "x" as x;
+    x::f();
+    timeline()
+}
+"#;
+        let err = build(&script(&dir, script_text), &input(None)).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("imports itself"), "{message}");
+    }
+
+    #[test]
     fn pending_sets_a_stand_in_source_and_counts_the_call() {
         let dir = tempfile::tempdir().unwrap();
         let script_text = r#"

@@ -121,6 +121,16 @@ of the block's pools, or the generation fails naming it. A timeline that overrun
 window is cut at the boundary; one that falls short is not padded.
 `examples/plugins/foryou-sequencer.rhai` is the worked example.
 
+## Splitting a plugin into modules
+
+`import "<path>" as <name>` loads `<path>.rhai` from the folder of the script doing the
+import, whatever directory the station runs in. Inside `plugins/megamix.rhai`,
+`import "megamix/drop" as m` loads `plugins/megamix/drop.rhai`, and an `import "common"`
+inside `drop.rhai` loads `plugins/megamix/common.rhai`. The path is any expression, so
+`import "megamix/" + ctx.config.blend as m` picks a module from the channel's config. A
+module that is not there fails the call, naming the file it looked for:
+`module "megamix/nope" not found: no file /…/plugins/megamix/nope.rhai`.
+
 ## The determinism contract
 
 A plugin must be a pure function of `(catalog, config, resume state, seed, external-store snapshot)`.
