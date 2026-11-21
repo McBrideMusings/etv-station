@@ -287,6 +287,7 @@ Fixture files needed by `cargo test` are tracked; personal/host-specific configs
 | `vendor/etv-next/` | [ErsatzTV/next](https://github.com/ErsatzTV/next) plus this project's modifications to it, as tracked files. Its own Cargo workspace, excluded from the station's. Upstream absorbed with `git subtree pull --prefix=vendor/etv-next etv-upstream main --squash`. |
 | `vendor/etv-next/crates/ersatztv-playout/` | The schema crate `etv-station` depends on via path. Compile-time check for schema drift. |
 | `vendor/etv-next/schema/playout.json` | The JSON Schema for emitted playout files. |
+| `vendor/etv-next/crates/ersatztv/src/captions/` | CEA-608 closed captions for Plex's `/stream/{number}.ts`: `cea608.rs` encodes a WebVTT cue as 608 pop-on byte pairs, `mod.rs` schedules them per frame in display order, `ts.rs` inserts them into the H.264 as A/53 SEI and re-packetizes the TS. |
 
 ## Operational
 
