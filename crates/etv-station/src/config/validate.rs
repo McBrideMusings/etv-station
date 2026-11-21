@@ -67,6 +67,21 @@ pub(super) fn validate_station(path: &Path, station: &StationConfig) -> Result<(
         station.temperature.as_ref(),
     )?;
 
+    if let Some(url) = &station.guide_image_url {
+        let host = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("http://"))
+            .map(|rest| rest.split('/').next().unwrap_or(""));
+        if host.is_none_or(str::is_empty) || url.contains(['?', '#']) {
+            return Err(ConfigError::Validation {
+                path: path.to_path_buf(),
+                message: format!(
+                    "guide_image_url {url:?} must be an http:// or https:// URL with a host and no query or fragment"
+                ),
+            });
+        }
+    }
+
     if station.output_base.as_os_str().is_empty() {
         return Err(ConfigError::Validation {
             path: path.to_path_buf(),
@@ -1983,6 +1998,60 @@ mod tests {
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
         assert!(format!("{err}").contains("output_base"));
+    }
+
+    #[test]
+    fn guide_image_url_needs_a_scheme_and_host() {
+        let mut s = StationConfig {
+            active_profile: None,
+            ffmpeg_profiles: Default::default(),
+            temperature: None,
+            tracks: None,
+            overlay: None,
+            seed: None,
+            tz: "UTC".into(),
+            output_base: PathBuf::from("out"),
+            channels: vec!["channels/a.yaml".into()],
+            categories: Vec::new(),
+            chronologies: Vec::new(),
+            arcs: Vec::new(),
+            source_roots: vec![],
+            identity_roots: vec![],
+            catalog_path: None,
+            artwork_cache_dir: None,
+            extras_url: None,
+            renderer: Default::default(),
+            catalog_refresh_secs: 900,
+            full_sweep_after_secs: 86_400,
+            device_id: None,
+            hooks: Vec::new(),
+            ffmpeg: crate::config::station::default_ffmpeg(),
+            normalization: crate::config::station::empty_normalization_for_test(),
+            guide: Default::default(),
+            idle_grace_seconds: None,
+            prewarm: false,
+            guide_image_url: None,
+            fonts: vec![],
+        };
+        for bad in [
+            "etv.example.com",
+            "",
+            "https://",
+            "https:///logo",
+            "https://x.example?a=1",
+        ] {
+            s.guide_image_url = Some(bad.into());
+            let err = validate_station(&dummy_path(), &s).unwrap_err();
+            assert!(format!("{err}").contains("guide_image_url"), "{bad}: {err}");
+        }
+        for good in [
+            "https://etv.example.com",
+            "http://10.0.0.1:8409/",
+            "https://x.example/iptv",
+        ] {
+            s.guide_image_url = Some(good.into());
+            validate_station(&dummy_path(), &s).unwrap();
+        }
     }
 
     /// The daemon exits at startup on a zone it cannot parse, so the config is
