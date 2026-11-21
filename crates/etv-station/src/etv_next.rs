@@ -117,6 +117,9 @@ pub struct RenderOptions {
     /// `server.prewarm` in the emitted lineup. Comes from the station config,
     /// like `idle_grace_seconds`.
     pub prewarm: bool,
+    /// `guide_image_url` in the emitted lineup. Comes from the station config,
+    /// like `idle_grace_seconds`.
+    pub guide_image_url: Option<String>,
 }
 
 impl RenderOptions {
@@ -168,6 +171,7 @@ impl RenderOptions {
             artwork_dir: var("ETV_STATION_ARTWORK_CACHE"),
             idle_grace_seconds: None,
             prewarm: false,
+            guide_image_url: None,
         })
     }
 }
@@ -331,6 +335,7 @@ pub fn render_with(
     let opts = RenderOptions {
         idle_grace_seconds: station.station.idle_grace_seconds,
         prewarm: station.station.prewarm,
+        guide_image_url: station.station.guide_image_url.clone(),
         ..opts.clone()
     };
     let rendered = render_channels(
@@ -605,6 +610,9 @@ pub fn render_channels(
     if let Some(dir) = &opts.artwork_dir {
         lineup["artwork"] = serde_json::json!({"folder": dir});
     }
+    if let Some(url) = &opts.guide_image_url {
+        lineup["guide_image_url"] = Value::String(url.clone());
+    }
     let lineup_path = opts.out_dir.join("lineup.json");
     write_json(&lineup_path, &lineup)?;
 
@@ -848,6 +856,7 @@ mod tests {
             artwork_dir: None,
             idle_grace_seconds: None,
             prewarm: false,
+            guide_image_url: None,
         }
     }
 
@@ -1136,6 +1145,28 @@ mod tests {
         let rendered = render_with_defaults(&chans(&folders), &with, "test-device-id").unwrap();
         let lineup = read(&rendered.lineup_path);
         assert_eq!(lineup["artwork"]["folder"], "/data/artwork");
+    }
+
+    #[test]
+    fn a_configured_guide_image_url_reaches_the_lineup_and_parses_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let folders = vec![PathBuf::from("out/star-trek")];
+
+        let rendered =
+            render_with_defaults(&chans(&folders), &opts(dir.path()), "test-device-id").unwrap();
+        assert!(read(&rendered.lineup_path).get("guide_image_url").is_none());
+
+        let with = RenderOptions {
+            guide_image_url: Some("https://img.example".to_string()),
+            ..opts(dir.path())
+        };
+        let rendered = render_with_defaults(&chans(&folders), &with, "test-device-id").unwrap();
+        let text = std::fs::read_to_string(&rendered.lineup_path).unwrap();
+        let parsed: ersatztv::config::LineupConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            parsed.guide_image_url.as_deref(),
+            Some("https://img.example")
+        );
     }
 
     const SEASONAL_LOGOS: &str = r#"

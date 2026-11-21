@@ -273,6 +273,12 @@ pub struct StationConfig {
     #[serde(default)]
     pub prewarm: bool,
 
+    /// Base URL a guide reader fetches the station's channel logos and
+    /// programme posters from, written to the rendered `lineup.json`. Unset
+    /// publishes them on whatever host the guide was requested from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_image_url: Option<String>,
+
     /// Fonts overlay text may name, beyond the OS's own: font files, or
     /// directories whose `.ttf`/`.otf`/`.ttc` files all count, resolved
     /// relative to the station config's directory. Station-wide — every

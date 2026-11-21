@@ -1940,6 +1940,7 @@ mod tests {
             guide: Default::default(),
             idle_grace_seconds: None,
             prewarm: false,
+            guide_image_url: None,
             fonts: vec![],
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
@@ -1977,6 +1978,7 @@ mod tests {
             guide: Default::default(),
             idle_grace_seconds: None,
             prewarm: false,
+            guide_image_url: None,
             fonts: vec![],
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
@@ -2015,6 +2017,7 @@ mod tests {
             guide: Default::default(),
             idle_grace_seconds: None,
             prewarm: false,
+            guide_image_url: None,
             fonts: vec![],
         };
         let err = validate_station(&dummy_path(), &s).unwrap_err();
@@ -2051,6 +2054,7 @@ mod tests {
             guide: Default::default(),
             idle_grace_seconds: None,
             prewarm: false,
+            guide_image_url: None,
             fonts: vec![],
         };
         assert!(validate_station(&dummy_path(), &s).is_err());

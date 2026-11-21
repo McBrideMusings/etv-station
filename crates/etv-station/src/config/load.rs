@@ -1647,6 +1647,7 @@ mod tests {
             guide: Default::default(),
             idle_grace_seconds: None,
             prewarm: false,
+            guide_image_url: None,
             fonts: vec![],
         }
     }
