@@ -1,3 +1,4 @@
+mod captions;
 mod channel_health;
 mod channel_model;
 mod channel_session;
@@ -410,6 +411,9 @@ async fn ts_stream(
 
     let channel = tune_in(&state, &number).await?;
     let output_folder = channel.output_folder().to_owned();
+    let playout_folder = channel
+        .has_subtitle_track()
+        .then(|| channel.playout_folder().to_owned());
     log::info!("ts stream started: channel={number}");
 
     let (mut writer, reader) = tokio::io::duplex(1 << 20);
@@ -420,10 +424,15 @@ async fn ts_stream(
             let (active, number) = (Arc::clone(&active), number.clone());
             async move { active.lock().await.contains_key(&number) }
         };
-        let (segments, bytes, reason) =
-            write_ts_stream(&output_folder, &mut writer, worker_alive).await;
+        let (segments, bytes, captioned, reason) = write_ts_stream(
+            &output_folder,
+            playout_folder.as_deref(),
+            &mut writer,
+            worker_alive,
+        )
+        .await;
         log::info!(
-            "ts stream ended: channel={number} segments={segments} bytes={bytes} secs={} reason={reason}",
+            "ts stream ended: channel={number} segments={segments} captioned={captioned} bytes={bytes} secs={} reason={reason}",
             started.elapsed().as_secs()
         );
     });
@@ -437,62 +446,173 @@ async fn ts_stream(
 /// Follow `live.m3u8` in `output_folder` and copy each newly listed segment
 /// into `out`, starting with the newest two so a client gets data at once,
 /// and keep the worker's heartbeat fresh while `worker_alive` says it runs.
-/// Returns segments and bytes written and why it stopped.
+///
+/// With `playout_folder` (a channel converting subtitles to WebVTT), a
+/// segment whose airing item asks for a subtitle carries that item's WebVTT
+/// cues as CEA-608 captions in its H.264 ([`captions`]): Plex reads captions
+/// from there and from nowhere else in a TS. Such a segment waits until the
+/// next one is listed, because a caption has to be loaded ahead of its start
+/// and the next segment's `.vtt` is where the next cues are.
+///
+/// Returns segments, bytes and captioned segments written and why it stopped.
 async fn write_ts_stream<Alive>(
     output_folder: &std::path::Path,
+    playout_folder: Option<&std::path::Path>,
     out: &mut (impl tokio::io::AsyncWrite + Unpin),
     worker_alive: impl Fn() -> Alive,
-) -> (u64, u64, &'static str)
+) -> (u64, u64, u64, &'static str)
 where
     Alive: std::future::Future<Output = bool>,
 {
-    use tokio::io::AsyncWriteExt as _;
-
     let playlist = output_folder.join("live.m3u8");
     let heartbeat = output_folder.join(HEARTBEAT_FILE_NAME);
     let mut last_sent: Option<String> = None;
     let mut last_progress = Instant::now();
-    let (mut segments, mut bytes) = (0u64, 0u64);
+    let (mut segments, mut bytes, mut captioned) = (0u64, 0u64, 0u64);
+    // Kept from the first captioned segment on, so the video PID's continuity
+    // counter, which captioning shifts, stays continuous after captions stop.
+    let mut captions: Option<(captions::Captioner, captions::Rewriter)> = None;
+    // The segments whose cues the captioner already has (this one and the next).
+    let mut cues_read: Vec<String> = Vec::new();
+    // Whether the last segment asked about wants captions, so a held segment
+    // does not re-read the playout every poll.
+    let mut wanted: Option<(String, bool)> = None;
 
     loop {
         if !worker_alive().await {
-            return (segments, bytes, "worker exited");
+            return (segments, bytes, captioned, "worker exited");
         }
         // A TS client never touches /session, so nothing else keeps the
         // worker from idling out under it.
         let _ = filetime::set_file_mtime(&heartbeat, filetime::FileTime::now());
 
-        let listed = tokio::fs::read_to_string(&playlist)
+        let body = tokio::fs::read_to_string(&playlist)
             .await
-            .map(|body| segment_uris(&body))
             .unwrap_or_default();
+        let listed = segment_uris(&body);
 
         let owed = match unsent_segments(&listed, last_sent.as_deref()) {
             Owed::Segments(owed) => owed,
-            Owed::NewRun => return (segments, bytes, "worker restarted"),
-            Owed::LostPlace => return (segments, bytes, "last segment left the playlist"),
+            Owed::NewRun => return (segments, bytes, captioned, "worker restarted"),
+            Owed::LostPlace => {
+                return (segments, bytes, captioned, "last segment left the playlist");
+            }
         };
-        for uri in owed {
-            let Ok(data) = tokio::fs::read(output_folder.join(uri)).await else {
-                // Sending the next one would leave an unmarked hole.
-                return (segments, bytes, "listed segment missing on disk");
+        for (k, uri) in owed.iter().enumerate() {
+            let wants_captions = match (playout_folder, &wanted) {
+                (None, _) => false,
+                (Some(_), Some((asked, answer))) if asked == uri => *answer,
+                (Some(folder), _) => {
+                    let at =
+                        segment_midpoint(&body, uri).unwrap_or_else(time::OffsetDateTime::now_utc);
+                    let answer =
+                        ersatztv_playout::playout::schedule_requests_subtitle(folder, at).await;
+                    wanted = Some((uri.clone(), answer));
+                    answer
+                }
             };
-            match tokio::time::timeout(TS_STREAM_WRITE_TIMEOUT, out.write_all(&data)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => return (segments, bytes, "client closed"),
-                Err(_) => return (segments, bytes, "client stopped reading"),
+            let Some(next) = owed.get(k + 1).filter(|_| wants_captions) else {
+                if wants_captions {
+                    break;
+                }
+                cues_read.clear();
+                let captions = captions.as_mut().map(|(captioner, rewriter)| {
+                    captioner.close();
+                    (captioner, rewriter)
+                });
+                match send_segment(output_folder, uri, captions, out).await {
+                    Ok(n) => bytes += n,
+                    Err(reason) => return (segments, bytes, captioned, reason),
+                }
+                segments += 1;
+                last_sent = Some(uri.to_owned());
+                last_progress = Instant::now();
+                continue;
+            };
+            let (captioner, rewriter) = captions.get_or_insert_with(Default::default);
+            if captioner.is_closed() {
+                *captioner = captions::Captioner::default();
+            }
+            for cue_uri in [uri, next] {
+                if !cues_read.contains(cue_uri) {
+                    let vtt = tokio::fs::read_to_string(output_folder.join(vtt_uri(cue_uri)))
+                        .await
+                        .unwrap_or_default();
+                    captioner.add_vtt(&vtt);
+                    cues_read.push(cue_uri.clone());
+                }
+            }
+            cues_read.retain(|read| read == next);
+            match send_segment(output_folder, uri, Some((captioner, rewriter)), out).await {
+                Ok(n) => bytes += n,
+                Err(reason) => return (segments, bytes, captioned, reason),
             }
             segments += 1;
-            bytes += data.len() as u64;
+            captioned += 1;
             last_sent = Some(uri.to_owned());
             last_progress = Instant::now();
         }
 
         if last_progress.elapsed() > TS_STREAM_STALL {
-            return (segments, bytes, "no new segment");
+            return (segments, bytes, captioned, "no new segment");
         }
         tokio::time::sleep(TS_STREAM_POLL).await;
     }
+}
+
+/// Copy one listed segment into `out`, through the caption rewriter when
+/// given one.
+/// Returns the bytes written, or why the stream must end.
+async fn send_segment(
+    output_folder: &std::path::Path,
+    uri: &str,
+    captions: Option<(&mut captions::Captioner, &mut captions::Rewriter)>,
+    out: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<u64, &'static str> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let Ok(mut data) = tokio::fs::read(output_folder.join(uri)).await else {
+        // Sending the next one would leave an unmarked hole.
+        return Err("listed segment missing on disk");
+    };
+    if let Some((captioner, rewriter)) = captions {
+        data = rewriter.rewrite(&data, captioner);
+    }
+    match tokio::time::timeout(TS_STREAM_WRITE_TIMEOUT, out.write_all(&data)).await {
+        Ok(Ok(())) => Ok(data.len() as u64),
+        Ok(Err(_)) => Err("client closed"),
+        Err(_) => Err("client stopped reading"),
+    }
+}
+
+/// The WebVTT sidecar the worker writes beside a segment.
+fn vtt_uri(segment: &str) -> String {
+    format!("{}.vtt", segment.strip_suffix(".ts").unwrap_or(segment))
+}
+
+/// The middle of `uri`'s span in a media playlist, from the
+/// `#EXT-X-PROGRAM-DATE-TIME` and `#EXTINF` before it.
+fn segment_midpoint(playlist: &str, uri: &str) -> Option<time::OffsetDateTime> {
+    const FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3][offset_hour sign:mandatory][offset_minute]"
+    );
+    let (mut start, mut duration) = (None, 0.0f64);
+    for line in playlist.lines().map(str::trim) {
+        if let Some(extinf) = line.strip_prefix("#EXTINF:") {
+            duration = extinf
+                .split(',')
+                .next()
+                .and_then(|d| d.parse().ok())
+                .unwrap_or(0.0);
+        } else if let Some(at) = line.strip_prefix("#EXT-X-PROGRAM-DATE-TIME:") {
+            start = time::OffsetDateTime::parse(at, FORMAT).ok();
+        } else if line == uri {
+            return start.map(|s| s + Duration::from_secs_f64(duration.max(0.0) / 2.0));
+        } else if !line.is_empty() && !line.starts_with('#') {
+            start = None;
+        }
+    }
+    None
 }
 
 /// The segment URIs a media playlist lists, in order.
@@ -1567,7 +1687,7 @@ mod ts_stream_tests {
         let (mut writer, mut reader) = tokio::io::duplex(64);
         let task_folder = folder.clone();
         let task = tokio::spawn(async move {
-            write_ts_stream(&task_folder, &mut writer, || async { true }).await
+            write_ts_stream(&task_folder, None, &mut writer, || async { true }).await
         });
 
         let mut first = [0u8; 8];
@@ -1586,7 +1706,7 @@ mod ts_stream_tests {
 
         drop(reader);
         write_playlist(&folder, &["r1/live3.ts", "r1/live4.ts", "r1/live5.ts"]);
-        assert_eq!(task.await.unwrap(), (3, 12, "client closed"));
+        assert_eq!(task.await.unwrap(), (3, 12, 0, "client closed"));
     }
 
     #[tokio::test]
@@ -1598,7 +1718,7 @@ mod ts_stream_tests {
         let (mut writer, mut reader) = tokio::io::duplex(64);
         let task_folder = folder.clone();
         let task = tokio::spawn(async move {
-            write_ts_stream(&task_folder, &mut writer, || async { true }).await
+            write_ts_stream(&task_folder, None, &mut writer, || async { true }).await
         });
         let mut first = [0u8; 8];
         reader.read_exact(&mut first).await.unwrap();
@@ -1606,7 +1726,7 @@ mod ts_stream_tests {
         std::fs::create_dir(folder.join("r2")).unwrap();
         std::fs::write(folder.join("r2/live1.ts"), b"ZZZZ").unwrap();
         write_playlist(&folder, &["r1/live1.ts", "r1/live2.ts", "r2/live1.ts"]);
-        assert_eq!(task.await.unwrap(), (2, 8, "worker restarted"));
+        assert_eq!(task.await.unwrap(), (2, 8, 0, "worker restarted"));
     }
 
     #[tokio::test]
@@ -1614,12 +1734,81 @@ mod ts_stream_tests {
         let dir = segment_folder(1);
         write_playlist(dir.path(), &["r1/live1.ts"]);
         let (mut writer, _reader) = tokio::io::duplex(64);
-        let ended = write_ts_stream(dir.path(), &mut writer, || async { false }).await;
-        assert_eq!(ended, (0, 0, "worker exited"));
+        let ended = write_ts_stream(dir.path(), None, &mut writer, || async { false }).await;
+        assert_eq!(ended, (0, 0, 0, "worker exited"));
 
         write_playlist(dir.path(), &["r1/live1.ts", "r1/gone.ts"]);
-        let ended = write_ts_stream(dir.path(), &mut writer, || async { true }).await;
-        assert_eq!(ended, (1, 4, "listed segment missing on disk"));
+        let ended = write_ts_stream(dir.path(), None, &mut writer, || async { true }).await;
+        assert_eq!(ended, (1, 4, 0, "listed segment missing on disk"));
+    }
+
+    /// A playlist with a program date time on each segment, 4 s apart from
+    /// 2026-01-01T00:00:00Z.
+    fn write_dated_playlist(folder: &std::path::Path, uris: &[&str]) {
+        let body: String = uris
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                format!(
+                    "#EXTINF:4.0,\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:{:02}.000+0000\n{u}\n",
+                    i * 4
+                )
+            })
+            .collect();
+        std::fs::write(folder.join("live.m3u8"), body).unwrap();
+    }
+
+    #[test]
+    fn segment_midpoint_reads_the_date_time_and_duration_before_the_uri() {
+        let playlist = "#EXTINF:4.000000,\n#EXT-X-PROGRAM-DATE-TIME:2026-01-01T00:00:08.000+0000\nr1/live3.ts\n#EXTINF:4.0,\nr1/live4.ts\n";
+        assert_eq!(
+            segment_midpoint(playlist, "r1/live3.ts"),
+            Some(time::macros::datetime!(2026-01-01 00:00:10 UTC))
+        );
+        assert_eq!(segment_midpoint(playlist, "r1/live4.ts"), None);
+        assert_eq!(segment_midpoint(playlist, "r1/gone.ts"), None);
+    }
+
+    #[tokio::test]
+    async fn a_segment_whose_item_wants_subtitles_waits_for_the_next_ones_cues() {
+        let dir = segment_folder(4);
+        let folder = dir.path().to_owned();
+        let playout = tempfile::tempdir().unwrap();
+        std::fs::write(
+            playout.path().join("chunk.json"),
+            r#"{"version":"https://ersatztv.org/playout/version/0.0.3","items":[{"id":"a","start":"2025-12-31T23:00:00Z","finish":"2026-01-01T01:00:00Z","source":{"source_type":"local","path":"/a.mkv"},"tracks":{"subtitle":{}}}]}"#,
+        )
+        .unwrap();
+        write_dated_playlist(&folder, &["r1/live1.ts", "r1/live2.ts"]);
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let (task_folder, playout_folder) = (folder.clone(), playout.path().to_owned());
+        let task = tokio::spawn(async move {
+            write_ts_stream(&task_folder, Some(&playout_folder), &mut writer, || async {
+                true
+            })
+            .await
+        });
+
+        let mut first = [0u8; 4];
+        reader.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"AAAA");
+        // live2 is the newest: held until live3 brings the cues after it.
+        let mut more = [0u8; 1];
+        let held = tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut more)).await;
+        assert!(held.is_err(), "live2 went out before live3 was listed");
+
+        write_dated_playlist(&folder, &["r1/live1.ts", "r1/live2.ts", "r1/live3.ts"]);
+        let mut next = [0u8; 4];
+        reader.read_exact(&mut next).await.unwrap();
+        assert_eq!(&next, b"BBBB");
+
+        drop(reader);
+        write_dated_playlist(
+            &folder,
+            &["r1/live1.ts", "r1/live2.ts", "r1/live3.ts", "r1/live4.ts"],
+        );
+        assert_eq!(task.await.unwrap(), (2, 8, 2, "client closed"));
     }
 
     #[tokio::test]
