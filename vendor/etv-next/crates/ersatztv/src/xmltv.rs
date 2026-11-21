@@ -155,7 +155,7 @@ fn write_channel<W: std::io::Write>(
     write_text_element(w, "display-name", channel.name())?;
 
     if let Some(logo) = channel.logo() {
-        let resolved = resolve_icon_url(logo, base_url);
+        let resolved = resolve_icon_url(&logo, base_url);
         let mut icon = BytesStart::new("icon");
         icon.push_attribute(("src", resolved.as_str()));
         w.write_event(Event::Empty(icon)).map_err(xml_err)?;
@@ -901,6 +901,38 @@ mod tests {
             xml.contains(r#"<icon src="http://viewer.example:8409/logo/1.png?v="#),
             "{xml}"
         );
+    }
+
+    // The station swaps `channel-logos/{number}.{ext}` while ETV-next runs, so
+    // the `?v=` is read from the file on each guide request, not once at startup.
+    #[tokio::test]
+    async fn a_logo_swapped_after_startup_changes_the_published_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("playout")).unwrap();
+        std::fs::create_dir(dir.path().join("channel-logos")).unwrap();
+        let logo = dir.path().join("channel-logos/1.png");
+        std::fs::write(&logo, b"spring").unwrap();
+        let cfg_path = dir.path().join("channel.json");
+        std::fs::write(&cfg_path, r#"{"playout":{"folder":"playout"}}"#).unwrap();
+        let cfg = ersatztv::config::ChannelConfig {
+            number: "1".into(),
+            name: "ETV 1".into(),
+            config: cfg_path.to_string_lossy().into_owned(),
+            overlays: Vec::new(),
+            tvg_id: None,
+            logo: Some("./channel-logos/1.png".into()),
+            group: None,
+        };
+        let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).await.unwrap();
+
+        let before = channel.logo().unwrap();
+        assert_eq!(channel.logo().unwrap(), before, "same bytes, same version");
+        std::fs::write(&logo, b"summer").unwrap();
+        let after = channel.logo().unwrap();
+        assert_ne!(before, after);
+        assert!(after.starts_with("/logo/1.png?v="), "{after}");
+        let xml = build_xmltv(std::slice::from_ref(&channel), &[], "http://h:1").unwrap();
+        assert!(xml.contains(&format!("http://h:1{after}")), "{xml}");
     }
 
     // `Some(Credits::default())` — every role list present but empty — is

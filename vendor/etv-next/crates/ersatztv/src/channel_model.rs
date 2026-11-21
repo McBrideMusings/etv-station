@@ -207,8 +207,26 @@ impl ChannelModel {
         self.playout_folder.as_path()
     }
 
-    pub fn logo(&self) -> Option<&str> {
-        self.logo.as_deref()
+    /// The logo URL the guide publishes. For a file logo the `?v=` is taken
+    /// from the file's bytes on every call, so a file the station swapped
+    /// since startup is published under a new URL and guide clients refetch it.
+    /// A file that has become unreadable publishes no logo.
+    pub fn logo(&self) -> Option<String> {
+        let route = self.logo.as_deref()?;
+        let Some(file) = self.logo_file.as_deref() else {
+            return Some(route.to_string());
+        };
+        match std::fs::read(file) {
+            Ok(bytes) => Some(format!("{route}?v={:016x}", logo_version(&bytes))),
+            Err(e) => {
+                log::warn!(
+                    "channel {}: logo {} unreadable, publishing no logo: {e}",
+                    self.number,
+                    file.display()
+                );
+                None
+            }
+        }
     }
 
     /// The image file `/logo/{number}.{ext}` serves, when the lineup named a
@@ -258,8 +276,9 @@ impl ChannelModel {
 /// A value with a URL scheme (`https://…`) or a leading `/` is a URL already
 /// and passes through untouched, with no file. Anything else is an image file
 /// relative to the lineup's own folder: the server serves it at
-/// `/logo/{number}.{ext}` and publishes that path with a `?v=` taken from the
-/// file's bytes, because guide clients cache a channel icon by URL and would
+/// `/logo/{number}.{ext}` and the guide publishes that path with a `?v=` taken
+/// from the file's bytes at the time of each request ([`ChannelModel::logo`]),
+/// because guide clients cache a channel icon by URL and would
 /// otherwise keep showing a replaced image. A file that cannot be read is
 /// logged and the channel goes out with no logo rather than not at all.
 async fn resolve_logo(
@@ -275,16 +294,12 @@ async fn resolve_logo(
     }
     let file = lineup_dir.join(logo);
     match tokio::fs::read(&file).await {
-        Ok(bytes) => {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::hash::DefaultHasher::new();
-            bytes.hash(&mut hasher);
+        Ok(_) => {
             let ext = file
                 .extension()
                 .map(|e| e.to_string_lossy().to_ascii_lowercase())
                 .unwrap_or_else(|| "png".to_string());
-            let url = format!("/logo/{number}.{ext}?v={:016x}", hasher.finish());
-            (Some(url), Some(file))
+            (Some(format!("/logo/{number}.{ext}")), Some(file))
         }
         Err(e) => {
             log::warn!(
@@ -294,6 +309,13 @@ async fn resolve_logo(
             (None, None)
         }
     }
+}
+
+fn logo_version(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Resolves `playout.folder` the same way `ersatztv-channel` does: through
