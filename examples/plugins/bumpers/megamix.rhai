@@ -21,8 +21,15 @@
 //   hooks_min/max:   hooks per chapter, default 3 and 5
 //   tempo_band_pct:  a cluster's tempo window around its seed, +/- percent, default 4
 //   max_shift:       most semitones a hook may move, default 3
-//   vocal_over_bars: bars a hook's vocal sings over the previous song, default 2
-//   tail:            recent chapters whose hooks are not reused, default 12
+//   blend:           the arrangement module, plugins/megamix/<blend>.rhai, that lays
+//                    the chapter's audio layers (required); its own keys are in its file
+//   picture_margin_db:  dB another song must be louder than the one on screen to
+//                    take the picture, default 3
+//   picture_hold_beats: fewest beats a song keeps the picture before a louder one
+//                    takes it, and the length of a b-roll window, default 16
+//   broll_share:     share of each song's picture windows given to Frame index shots
+//                    when `phrase` finds them, default 0.5
+//   tail:           recent chapters whose hooks are not reused, default 12
 //   seeds:           most cluster seeds tried per build, default 60
 //   artist_field:    item field holding the artist for the card, default "show"; an
 //                    item without it (an extra) is looked up by entry id in the
@@ -32,12 +39,12 @@
 //                    channel config's directory; unset carries no overlay
 //   ffmpeg:          program that makes the stand-in, default "ffmpeg"
 //   plexdb_url:      base URL of the plex-db-ex explorer, e.g. "http://host:8765"; with
-//                    `phrase`, the picture between a hook's own cuts is drawn from the
-//                    Frame index instead of another hook's video (needs the `http` grant)
+//                    `phrase`, `broll_share` of the picture is drawn from the Frame
+//                    index (needs the `http` grant)
 //   phrase:          text the Frame index search looks for; the shots come from the
 //                    pool's songs that are not hooks of this chapter. Unset, or an
 //                    explorer that is ungranted, unreachable or finds nothing, leaves
-//                    the alternating hook pictures
+//                    the audible songs' own pictures
 //
 // Beside each render it writes <stem>.plan.json (the renderer's plan: audio
 // layers and picture cuts, with the chapter's tempo, key and hooks in its
@@ -54,8 +61,9 @@
 // generation pass, before they reach the ledger.
 //
 // A hook is 16 bars, or 8 when 16 bars would pass 40 seconds. Hooks start on
-// 8-bar boundaries of the chapter. Every hook but the first begins with
-// `vocal_over_bars` bars of its vocal over the previous song's instrumental.
+// 8-bar boundaries of the chapter. This script picks the songs; the `blend`
+// module lays their audio; this script then cuts the picture from that audio:
+// the song whose vocal is heard, else the loudest song heard.
 fn hooks() { ["bumper"] }
 fn capabilities() { ["probe", "catalog_read", "exec", "http"] }
 
@@ -447,105 +455,198 @@ fn extras_artists(ctx, cfg, chosen, field) {
     artists
 }
 
-// A fade in at the start and a fade out at the end of a `len_s`-second layer,
-// each at most half the layer.
-fn edge_fades(len_s, fade_in, fade_out) {
-    let fi = if fade_in < len_s / 2.0 { fade_in } else { len_s / 2.0 };
-    let fo = if fade_out < len_s / 2.0 { fade_out } else { len_s / 2.0 };
-    [
-        #{ kind: "in", start_s: 0.0, len_s: fi },
-        #{ kind: "out", start_s: len_s - fo, len_s: fo },
-    ]
-}
-
-// `bars` bars of hook `h`'s `stem`, read from `from_bar` bars past its landing
-// and placed at chapter bar `at_bar`, stretched to the chapter tempo and
-// shifted to its key.
-fn hook_layer(name, h, stem, from_bar, bars, at_bar, bar_s, level_db, fade_in, fade_out) {
-    let native_bar = 240.0 / h.native_bpm;
-    let len_s = bars * bar_s;
-    #{
-        name: name,
-        source: h.entry_id,
-        stem: stem,
-        src_start_s: h.landing_s + from_bar * native_bar,
-        out_start_s: at_bar * bar_s,
-        out_len_s: len_s,
-        ratio: h.ratio,
-        pitch: h.pitch,
-        level_db: level_db,
-        fades: edge_fades(len_s, fade_in, fade_out),
+// What each song does in the chapter, in play order: its landing, tempo and the
+// shift to the chapter key, and the `bars` it is given. The arrangement module
+// reads these; the plan's `notes` keep them for the audit.
+fn song_records(chosen, chapter_bpm, chapter, shape, cfg) {
+    let max_shift = conf(cfg, "max_shift", 3);
+    let songs = [];
+    for item in chosen {
+        let a = item.audio;
+        let move_by = best_shift(a.camelot, chapter.audio.camelot, max_shift);
+        let native_bpm = num(a.bpm);
+        songs.push(#{
+            entry_id: item.entry_id,
+            landing_s: num(a.landing_bar_s),
+            landing_bar: a.landing_bar,
+            native_bpm: native_bpm,
+            semitones: move_by.semitones,
+            bars: shape.bars,
+            // Source seconds per chapter second, and the pitch ratio of the shift.
+            ratio: chapter_bpm / native_bpm,
+            pitch: 2.0 ** (move_by.semitones / 12.0),
+        });
     }
+    songs
 }
 
-// The chapter's audio. The first hook is its vocal and instrumental together.
-// Every later hook opens with `vocal_over_bars` bars of its vocal over the
-// previous song's instrumental, which carries on from where its own bars ended
-// and fades out over one bar; then its own vocal and instrumental play together.
-fn chapter_layers(hooks, bar_s) {
-    let vocal_db = -20.0;
-    let seam_vocal_db = -19.0;
-    let instrumental_db = -17.0;
-    let layers = [];
-    let at = 0;
-    for i in 0..hooks.len() {
-        let h = hooks[i];
-        let label = "hook " + (i + 1) + " (" + h.entry_id + ") ";
-        let over = h.vocal_over_bars;
-        if i > 0 && over > 0 {
-            let prev = hooks[i - 1];
-            layers.push(hook_layer("hook " + i + " (" + prev.entry_id + ") instrumental under the next vocal",
-                prev, "instrumental", prev.vocal_over_bars + prev.full_bars, over, at, bar_s,
-                instrumental_db, 0.02, bar_s));
-            layers.push(hook_layer(label + "vocals over the previous song",
-                h, "vocals", 0, over, at, bar_s, seam_vocal_db, 0.5, 0.02));
+// The level layer `l` plays at chapter second `t` in dB, or () when it is silent
+// there. Every fade is read as a linear ramp, whatever its curve.
+fn layer_db(l, t) {
+    let at = t - num(l.out_start_s);
+    if at < 0.0 || at >= num(l.out_len_s) { return (); }
+    let g = 1.0;
+    for f in l.fades ?? [] {
+        let from = num(f.start_s);
+        let len = num(f.len_s);
+        if f.kind == "in" {
+            if at < from { return (); }
+            if len > 0.0 && at < from + len { g *= (at - from) / len; }
+        } else {
+            if at >= from + len { return (); }
+            if len > 0.0 && at > from { g *= 1.0 - (at - from) / len; }
         }
-        let full_at = at + over;
-        let instrumental_in = if i == 0 { 1.0 } else { 0.3 };
-        layers.push(hook_layer(label + "vocals",
-            h, "vocals", over, h.full_bars, full_at, bar_s, vocal_db, 0.02, 0.02));
-        layers.push(hook_layer(label + "instrumental",
-            h, "instrumental", over, h.full_bars, full_at, bar_s, instrumental_db, instrumental_in, 0.02));
-        at += over + h.full_bars;
     }
-    layers
+    if g <= 0.0 { return (); }
+    num(l.level_db ?? 0.0) + num(l.gain_db ?? 0.0) + 20.0 * g.log()
+}
+
+// Every song audible at chapter second `t`: source -> #{ db, vocal, offset,
+// ratio }. `db` sums its layers' power; `vocal` is true when one of them is its
+// vocal stem; `offset` and `ratio` place its picture where its loudest layer
+// reads, source second = offset + t * ratio.
+fn heard_at(layers, t) {
+    let heard = #{};
+    for l in layers {
+        let db = layer_db(l, t);
+        if db == () { continue; }
+        let ratio = num(l.ratio ?? 1.0);
+        let offset = num(l.src_start_s) - num(l.out_start_s) * ratio;
+        let s = heard[l.source];
+        if s == () {
+            s = #{ power: 0.0, vocal: false, top_db: db, offset: offset, ratio: ratio };
+        } else if db > s.top_db {
+            s.top_db = db;
+            s.offset = offset;
+            s.ratio = ratio;
+        }
+        s.power += 10.0 ** (db / 10.0);
+        if l.stem == "vocals" { s.vocal = true; }
+        heard[l.source] = s;
+    }
+    for id in heard.keys() {
+        let s = heard[id];
+        s.db = 10.0 * s.power.log();
+        heard[id] = s;
+    }
+    heard
+}
+
+// The picture, derived from the audio in sixteenths of a bar: the song whose
+// vocal is heard, else the loudest song heard. The song on screen keeps the
+// picture until it stops being a candidate, or until another candidate is
+// `picture_margin_db` louder after `picture_hold_beats` beats on screen.
+// Returns runs #{ source, from, to, offset, ratio } in sixteenths, covering the
+// chapter end to end; a silent sixteenth keeps the song before it.
+fn picture_runs(layers, duration_s, bar_s, cfg) {
+    let margin = num(conf(cfg, "picture_margin_db", 3.0));
+    let hold = conf(cfg, "picture_hold_beats", 16) * 4;
+    let step = bar_s / 16.0;
+    let n = (duration_s / step).round().to_int();
+    let runs = [];
+    let cur = ();
+    let since = 0;
+    for k in 0..n {
+        let heard = heard_at(layers, (k + 0.5) * step);
+        let pool = #{};
+        for id in heard.keys() { if heard[id].vocal { pool[id] = heard[id]; } }
+        if pool.len() == 0 { pool = heard; }
+        let best = ();
+        for id in pool.keys() {
+            if best == () || pool[id].db > pool[best].db { best = id; }
+        }
+        if best != () {
+            if cur == () || !pool.contains(cur) {
+                cur = best;
+                since = k;
+            } else if best != cur && k - since >= hold && pool[best].db > pool[cur].db + margin {
+                cur = best;
+                since = k;
+            }
+        }
+        if cur == () { continue; }
+        let at = if pool.contains(cur) { pool[cur] } else { () };
+        let last = runs.len() - 1;
+        let same = last >= 0 && runs[last].source == cur
+            && (at == () || ((runs[last].offset - at.offset).abs() < 1e-6 && (runs[last].ratio - at.ratio).abs() < 1e-9));
+        if same {
+            runs[last].to = k + 1;
+        } else {
+            runs.push(#{ source: cur, from: if runs.len() == 0 { 0 } else { k }, to: k + 1, offset: at.offset, ratio: at.ratio });
+        }
+    }
+    runs
+}
+
+// The `picture_hold_beats`-long windows of each run that show a Frame index shot
+// instead, as [run index, window index] pairs: `broll_share` of each run's
+// whole windows, spread evenly, its first window always its own picture.
+fn broll_windows(runs, cfg) {
+    let share = num(conf(cfg, "broll_share", 0.5));
+    let hold = conf(cfg, "picture_hold_beats", 16) * 4;
+    let picked = [];
+    if share <= 0.0 || hold <= 0 { return picked; }
+    for r in 0..runs.len() {
+        let windows = (runs[r].to - runs[r].from) / hold;
+        for j in 0..windows {
+            if ((j + 1) * share).floor() > (j * share).floor() { picked.push([r, j]); }
+        }
+    }
+    picked
+}
+
+// The picture cuts: each run is its song read where its audio plays, broken by a
+// Frame index shot in each b-roll window that drew one.
+fn picture_cuts(runs, windows, shots, bar_s, cfg) {
+    let step = bar_s / 16.0;
+    let hold = conf(cfg, "picture_hold_beats", 16) * 4;
+    let shot_at = #{};
+    for i in 0..windows.len() {
+        if i >= shots.len() { break; }
+        shot_at["" + windows[i][0] + "/" + windows[i][1]] = shots[i];
+    }
+    let cuts = [];
+    for r in 0..runs.len() {
+        let run = runs[r];
+        let whole = if hold > 0 { (run.to - run.from) / hold } else { 0 };
+        let own_from = run.from;
+        for j in 0..whole {
+            let shot = shot_at["" + r + "/" + j];
+            if shot == () { continue; }
+            let at = run.from + j * hold;
+            if at > own_from { cuts.push(own_cut(run, own_from, at, step)); }
+            cuts.push(#{ source: shot.entry_id, src_start_s: shot.in_s, out_start_s: at * step, out_len_s: hold * step });
+            own_from = at + hold;
+        }
+        if run.to > own_from { cuts.push(own_cut(run, own_from, run.to, step)); }
+    }
+    cuts
+}
+
+// Run `run`'s song from sixteenth `from` to `to`, read where its audio plays.
+fn own_cut(run, from, to, step) {
+    #{
+        source: run.source,
+        src_start_s: run.offset + from * step * run.ratio,
+        out_start_s: from * step,
+        out_len_s: (to - from) * step,
+        ratio: run.ratio,
+    }
 }
 
 // The plan the renderer reads (docs/schema.md § Render plan), and the card copy.
-// The chapter's tempo, key and hooks go in `notes`, for the audit.
-fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem, shots) {
+// The chapter's tempo, key, blend and songs go in `notes`, for the audit.
+fn plan_for(ctx, cfg, chosen, songs, layers, cuts, shots, chapter_bpm, chapter, shape, stem) {
     let bar_s = 240.0 / chapter_bpm;
-    let over = conf(cfg, "vocal_over_bars", 2);
-    let max_shift = conf(cfg, "max_shift", 3);
     let dir = cfg.dir;
-    if over < 0 || shape.bars + over > region_bars() {
-        throw "megamix: config.vocal_over_bars must be between 0 and " + (region_bars() - shape.bars) + " for " + shape.bars + "-bar hooks";
-    }
-    let hooks = [];
     let cards = [];
-    let cuts = [];
     let sources = [];
     let fields = conf(cfg, "artist_field", "show");
     let extra_artists = extras_artists(ctx, cfg, chosen, fields);
     for i in 0..chosen.len() {
         let item = chosen[i];
         let a = item.audio;
-        let move_by = best_shift(a.camelot, chapter.audio.camelot, max_shift);
-        let vocal_over = if i == 0 { 0 } else { over };
-        let native_bpm = num(a.bpm);
-        hooks.push(#{
-            entry_id: item.entry_id,
-            landing_s: num(a.landing_bar_s),
-            landing_bar: a.landing_bar,
-            native_bpm: native_bpm,
-            semitones: move_by.semitones,
-            vocal_over_bars: vocal_over,
-            full_bars: shape.bars - vocal_over,
-            // Source seconds per chapter second, and the pitch ratio of the shift.
-            ratio: chapter_bpm / native_bpm,
-            pitch: 2.0 ** (move_by.semitones / 12.0),
-        });
-        let native_bar = 240.0 / native_bpm;
+        let native_bar = 240.0 / num(a.bpm);
         let sep_start = num(a.landing_bar_s) - lead_bars() * native_bar;
         if sep_start < 0.0 { sep_start = 0.0; }
         sources.push(#{
@@ -564,46 +665,16 @@ fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem, shots) {
         if item.year != () { card.year = item.year; }
         cards.push(card);
     }
-    // Four-bar cuts: the hook's own picture, then a Frame index shot when there
-    // is one left, else another song's, alternating.
-    let piece_bars = 4;
-    let piece_s = piece_bars * bar_s;
     let broll = #{};
-    let next_shot = 0;
-    for i in 0..chosen.len() {
-        let pieces = shape.bars / piece_bars;
-        for p in 0..pieces {
-            let out_start = (i * shape.bars + p * piece_bars) * bar_s;
-            if p % 2 == 1 && next_shot < shots.len() {
-                let shot = shots[next_shot];
-                next_shot += 1;
-                broll[shot.entry_id] = shot.path;
-                cuts.push(#{
-                    source: shot.entry_id,
-                    src_start_s: shot.in_s,
-                    out_start_s: out_start,
-                    out_len_s: piece_s,
-                });
-                continue;
-            }
-            let other = (i + 1 + p / 2) % chosen.len();
-            let src = if p % 2 == 0 || other == i { i } else { other };
-            let h = hooks[src];
-            cuts.push(#{
-                source: h.entry_id,
-                src_start_s: h.landing_s + p * piece_s * h.ratio,
-                out_start_s: out_start,
-                out_len_s: piece_s,
-                ratio: h.ratio,
-            });
-        }
-    }
+    for s in shots { broll[s.entry_id] = s.path; }
+    let shown = #{};
+    for c in cuts { shown[c.source] = true; }
     let shot_ids = broll.keys();
     shot_ids.sort(|a, b| if a < b { -1 } else if a > b { 1 } else { 0 });
-    for id in shot_ids { sources.push(#{ id: id, path: broll[id] }); }
+    for id in shot_ids { if shown.contains(id) { sources.push(#{ id: id, path: broll[id] }); } }
     #{
         sources: sources,
-        layers: chapter_layers(hooks, bar_s),
+        layers: layers,
         cuts: cuts,
         duration_s: chosen.len() * shape.bars * bar_s,
         cards: cards,
@@ -613,7 +684,8 @@ fn plan_for(ctx, cfg, chosen, chapter_bpm, chapter, shape, stem, shots) {
             key: chapter.audio.key + " " + chapter.audio.scale,
             camelot: chapter.audio.camelot,
             bar_seconds: bar_s,
-            hooks: hooks,
+            blend: cfg.blend,
+            hooks: songs,
         },
     }
 }
@@ -633,7 +705,7 @@ fn seam_notes(plan, chosen, bars) {
         let item = chosen[i];
         let shift = if h.semitones > 0 { "+" + h.semitones } else { h.semitones.to_string() };
         text += "seam " + (i + 1) + " at bar " + (i * bars) + ": " + item.title + " (" + h.entry_id + ") lands source bar "
-            + item.audio.landing_bar + " at " + h.landing_s + "s, " + shift + " semitones, vocal over " + h.vocal_over_bars + " bars\n";
+            + item.audio.landing_bar + " at " + h.landing_s + "s, " + shift + " semitones, " + h.bars + " bars, blend " + plan.notes.blend + "\n";
     }
     let hooked = #{};
     for h in hooks { hooked[h.entry_id] = true; }
@@ -682,6 +754,9 @@ fn build(ctx) {
     let cfg = ctx.config;
     if cfg.expr == () { throw "megamix: config.expr (the pool's CEL) is required"; }
     if cfg.dir == () { throw "megamix: config.dir (where plans and renders go) is required"; }
+    if type_of(cfg.blend) != "string" || cfg.blend == "" || cfg.blend.contains("/") || cfg.blend.contains(".") {
+        throw "megamix: config.blend must name a module in plugins/megamix/, e.g. \"vocal_over\"";
+    }
     let ranker = conf(cfg, "ranker", "rule");
     if ranker != "rule" && ranker != "model" {
         throw "megamix: config.ranker must be \"rule\" or \"model\", got " + ranker;
@@ -742,13 +817,23 @@ fn build(ctx) {
     for d in drawn { hooked[d.entry_id] = true; }
     let others = [];
     for item in pool { if !hooked.contains(item.entry_id) { others.push(item); } }
-    // Every hook's odd four-bar cuts take a shot: 2 per 16-bar hook, 1 per 8-bar hook.
-    let want = drawn.len() * (fitted.bars / 4 / 2);
-    let shots = broll_shots(ctx, cfg, others, want, 4 * bar_s);
-    // The shots are part of the stem, so a different picture is a different render.
+
+    let songs = song_records(drawn, chapter_bpm, seed, fitted, cfg);
+    let arrange_cfg = cfg;
+    arrange_cfg.bar_s = bar_s;
+    arrange_cfg.region_bars = region_bars();
+    import "megamix/" + cfg.blend as arrangement;
+    let layers = arrangement::plan(songs, arrange_cfg);
+    let runs = picture_runs(layers, drawn.len() * fitted.bars * bar_s, bar_s, cfg);
+    let windows = broll_windows(runs, cfg);
+    let hold_s = conf(cfg, "picture_hold_beats", 16) * bar_s / 4.0;
+    let shots = broll_shots(ctx, cfg, others, windows.len(), hold_s);
+    let cuts = picture_cuts(runs, windows, shots, bar_s, cfg);
+    // The blend and the shots are part of the stem: a different mix or picture is a different render.
+    ids += cfg.blend + "|";
     for s in shots { ids += s.entry_id + "@" + s.in_s + "|"; }
     let stem = "ch" + ctx.channel.number + "-" + hex(fnv(ids + chapter_bpm));
-    let plan = plan_for(ctx, cfg, drawn, chapter_bpm, seed, fitted, stem, shots);
+    let plan = plan_for(ctx, cfg, drawn, songs, layers, cuts, shots, chapter_bpm, seed, fitted, stem);
     let plan_path = cfg.dir + "/" + stem + ".plan.json";
     write_file(ctx, plan_path, to_json(plan));
     let notes = seam_notes(plan, drawn, fitted.bars);

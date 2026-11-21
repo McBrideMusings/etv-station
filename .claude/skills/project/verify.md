@@ -706,7 +706,7 @@ for ch in json.load(open(sys.argv[1]))["chapters"]:
     p = ch.get("plan") or {}
     if "notes" not in p: print(ch["name"][:22], ch["state"], "plan has no layers (older format, or none): render it again before judging"); continue
     bar = p["notes"]["bar_seconds"]
-    per_song = [round((h["vocal_over_bars"] + h["full_bars"]) * bar, 1) for h in p["notes"]["hooks"]]
+    per_song = [round(h["bars"] * bar, 1) for h in p["notes"]["hooks"]]
     bad, t = 0.0, 0.0
     while t < p["duration_s"]:
         heard = {l["source"] for l in p["layers"] if l["stem"] == "vocals" and l["out_start_s"] <= t < l["out_start_s"] + l["out_len_s"]}
