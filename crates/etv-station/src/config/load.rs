@@ -343,6 +343,36 @@ fn resolve_fonts(
     Ok(())
 }
 
+/// On a channel whose slots set `logo:`, every slot logo and the channel's own
+/// must be a file beside the channel config. ETV-next learns at startup whether
+/// a channel has a logo, so one missing file at that moment leaves the guide
+/// without a logo until the next restart.
+fn check_slot_logo_files(
+    channel_path: &Path,
+    channel_dir: &Path,
+    config: &ChannelConfig,
+) -> Result<(), ConfigError> {
+    let slot_logos: Vec<&Path> = config
+        .rule
+        .slots
+        .values()
+        .filter_map(|b| b.logo.as_deref())
+        .collect();
+    if slot_logos.is_empty() {
+        return Ok(());
+    }
+    for logo in config.logo.as_deref().into_iter().chain(slot_logos) {
+        let file = channel_dir.join(logo);
+        if !file.is_file() {
+            return Err(ConfigError::Validation {
+                path: channel_path.to_path_buf(),
+                message: format!("logo {} is not a file", file.display()),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The station-wide files every channel is resolved against.
 struct StationLookups<'a> {
     categories: &'a Categories,
@@ -391,6 +421,7 @@ fn load_one_channel(
             path: channel_path.to_path_buf(),
             message,
         })?;
+    check_slot_logo_files(channel_path, &channel_dir, &config)?;
     // Verbatim relative to CWD (matching how the daemon writes, see
     // `daemon::channel_loop`), NOT joined to the station config's directory.
     // Unique per channel because `reject_collisions` drops shared names.
@@ -1329,6 +1360,23 @@ mod tests {
         );
         assert_eq!(inc.entries().len(), 1);
         assert!(matches!(inc.entries()[0], Entry::Item(_)));
+    }
+
+    #[test]
+    fn a_missing_slot_logo_file_fails_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel_path = dir.path().join("channel.yaml");
+        std::fs::write(
+            &channel_path,
+            "number: 1\nname: x\nlogo: ch.png\nrule:\n  blocks: []\n  slots:\n    a:\n      mode: all\n      order: manual\n      logo: fall.png\n      entries:\n        - kind: item\n          id: x\n          source:\n            kind: lavfi\n            params: testsrc\n",
+        )
+        .unwrap();
+        let config: ChannelConfig = read_config_file(&channel_path).unwrap();
+        std::fs::write(dir.path().join("ch.png"), b"c").unwrap();
+        let err = check_slot_logo_files(&channel_path, dir.path(), &config).unwrap_err();
+        assert!(err.to_string().contains("fall.png"), "{err}");
+        std::fs::write(dir.path().join("fall.png"), b"f").unwrap();
+        check_slot_logo_files(&channel_path, dir.path(), &config).unwrap();
     }
 
     #[test]

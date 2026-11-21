@@ -109,6 +109,7 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     let mut announce = Announce {
         startup: true,
         config_reload: false,
+        etv_next_render: None,
     };
     // Set when a reload reverted, so the generation that re-spawns the last-known-good
     // config does not overwrite that outcome with `applied`.
@@ -173,6 +174,8 @@ pub async fn run(station: Station) -> Result<(), StationError> {
         // Spawn the generation, run it until a signal, then tear it down. The
         // whole generation is joined before we return here, which is what lets
         // the `station` Arc be swapped safely below (no task still reads it).
+        announce.etv_next_render =
+            etv_next_out_dir_from_env().map(|out| (config_path.clone(), out));
         let (do_reload, first_err) = run_generation(
             &station,
             tz,
@@ -231,6 +234,34 @@ pub async fn run(station: Station) -> Result<(), StationError> {
                 );
             }
         }
+    }
+}
+
+/// How far ahead a guide-logo change is looked for. A seasonal channel's next
+/// slot can be months away.
+const LOGO_LOOKAHEAD: time::Duration = time::Duration::days(400);
+
+/// The soonest instant any channel's guide logo changes after `from`.
+fn next_logo_change(
+    station: &Station,
+    tz: &'static Tz,
+    from: OffsetDateTime,
+) -> Option<OffsetDateTime> {
+    station
+        .channels
+        .iter()
+        .filter_map(|ch| etv_next::next_guide_logo_change(ch, tz, from, from + LOGO_LOOKAHEAD))
+        .min()
+}
+
+/// Sleeps until `at`; never completes when there is none.
+async fn sleep_until_instant(at: Option<OffsetDateTime>) {
+    match at {
+        Some(at) => {
+            let wait = (at - OffsetDateTime::now_utc()).max(time::Duration::ZERO);
+            tokio::time::sleep(std::time::Duration::from_secs_f64(wait.as_seconds_f64())).await;
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -931,6 +962,9 @@ struct Announce {
     /// in force (the new one, or the last good one if the new one would not
     /// prepare).
     config_reload: bool,
+    /// Where this generation re-renders ETV-next's lineup: the station config
+    /// path and the output folder. `None` when no `ETV_NEXT_DIR` is set.
+    etv_next_render: Option<(PathBuf, PathBuf)>,
 }
 
 async fn run_generation(
@@ -940,7 +974,7 @@ async fn run_generation(
     history_db: &Arc<HistoryDb>,
     plex: Option<&PlexEnv>,
     signals: &Signals,
-    announce: Announce,
+    mut announce: Announce,
 ) -> (bool, Option<StationError>) {
     let Signals {
         shutdown,
@@ -1102,11 +1136,25 @@ async fn run_generation(
     // multi-minute Plex sweep first. SIGUSR1 sits above the timer so an operator
     // asking for a refresh now is not made to queue behind one that was about
     // to fire anyway.
+    //
+    // The guide logo follows the slot on air (etv-station-d83c): the render
+    // that publishes it reruns at the instant the answer changes. Only a
+    // station with ETV-next to publish to has one to wait for.
+    let etv_next_render = announce.etv_next_render.take();
+    let mut next_logo = etv_next_render
+        .as_ref()
+        .and_then(|_| next_logo_change(station, tz, OffsetDateTime::now_utc()));
     let do_reload = loop {
         select! {
             biased;
             _ = shutdown.notified() => break false,
             _ = reload.notified() => break true,
+            _ = sleep_until_instant(next_logo) => {
+                if let Some((config_path, out_dir)) = &etv_next_render {
+                    rerender_etv_next(config_path, out_dir.clone());
+                }
+                next_logo = next_logo_change(station, tz, OffsetDateTime::now_utc());
+            }
             _ = refresh_now.notified() => {
                 run_catalog_refresh(station, plex, RefreshKind::Forced, cancel).await;
             }

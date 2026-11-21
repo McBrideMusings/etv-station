@@ -2838,6 +2838,7 @@ mod tests {
         BlockInclude {
             tracks: None,
             overlay: None,
+            logo: None,
             block: None,
             program: None,
             guide: None,

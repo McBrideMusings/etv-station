@@ -53,6 +53,7 @@ fn base_channel(blocks: Vec<BlockInclude>, guide: Option<GuideConfig>) -> Channe
 
 fn inline_block(entries: Vec<ConfigEntry>, guide: Option<GuideConfig>) -> BlockInclude {
     BlockInclude {
+        logo: None,
         tracks: None,
         overlay: None,
         block: None,

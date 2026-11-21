@@ -812,6 +812,7 @@ Defines one channel's playout window and the rule that composes blocks. Source:
 | `seed` | no — inherited from the station `seed` when unset | a number, or a rotation — seeds `random` order, a plugin's `ctx.seed` and every other seeded draw on the channel. Set here it wins outright; unset it falls back to the station `seed` salted with this channel's `name`, then to a new seed each local day — see [Seed and temperature](#seed-and-temperature). |
 | `temperature` | no — inherited from the station when unset, else `0` | a number ≥ 0, or a rotation — how far a plugin's draw may stray from its own ranking, handed to scripts as `ctx.temperature`. See [Seed and temperature](#seed-and-temperature). |
 | `overlay` | no | `clear` \| `{ file: <path> }` \| an inline overlay spec — see [Overlay cascade](#overlay-cascade) |
+| `logo` | no | slots only: the guide logo shown while this slot is on air — see [Channel logo](#channel-logo-—-logo) |
 | `tracks` | no | the channel level of the [track-selection](#track-selection) rules; blocks, pools and items refine it |
 | `subtitle` | no | `{ default_on: true \| false }` — announce this channel's subtitle track as `DEFAULT=YES`; unset leaves the station's `normalization.subtitle.default_on` |
 | `ffmpeg_profile` | no — inherits the station `active_profile` | a key of the station's `ffmpeg_profiles`; this channel encodes with that picture. A key the station lacks drops this channel from the lineup, with the key and this file named in the reason |
@@ -951,8 +952,29 @@ lineup channel's `logo`. ETV-next serves that file at `/logo/<number>.<ext>`
 and publishes the URL, resolved against the requesting host, as the XMLTV
 `<channel><icon src>` and the M3U `tvg-logo`. The URL carries a `?v=` taken
 from the image's bytes, so a guide client that caches icons by URL picks up a
-new one. ETV-next reads the lineup when it starts, so a changed logo appears
-on the next container start.
+new one. ETV-next reads the file on every guide request, so a replaced image
+appears under a new `?v=` without a restart; the lineup itself (which channels
+have a logo, and its extension) is read when ETV-next starts.
+
+**Per slot.** A `rule.slots` entry takes its own `logo:`, relative to the
+channel file's directory:
+
+```yaml
+logo: logo-guide.png
+rule:
+  slots:
+    autumn: { logo: logo-fall.png, pools: [...] }
+```
+
+The guide shows the `logo:` of the slot the schedules put on air now, and the
+channel's `logo:` when no schedule claims the minute or the slot sets none. The
+station publishes the on-air image at render time and again at each instant the
+on-air image changes (`lineup.logo.published` names it). A rotation shows its
+own `logo:`, not its drawn member's. A channel whose slots set `logo:` must set
+its own `logo:` too, every one of those files must exist when the config
+loads, and every slot logo must share its extension, because ETV-next learns
+the `/logo/<number>.<ext>` URL once, when it starts; a `rule.blocks` entry may
+not set `logo:`.
 
 It is separate from the overlay: the on-screen mark is usually white on
 transparent, which disappears in a light-themed guide, so a channel commonly

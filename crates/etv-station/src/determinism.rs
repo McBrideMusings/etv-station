@@ -360,6 +360,7 @@ mod tests {
 
     fn manual_block(ids: &[&str]) -> BlockInclude {
         BlockInclude {
+            logo: None,
             tracks: None,
             overlay: None,
             block: None,
@@ -405,6 +406,7 @@ mod tests {
 
     fn manual_block_secs(ids: &[(&str, u64)]) -> BlockInclude {
         BlockInclude {
+            logo: None,
             tracks: None,
             overlay: None,
             block: None,
@@ -476,6 +478,7 @@ mod tests {
 
     fn shuffled_block(ids: &[&str]) -> BlockInclude {
         BlockInclude {
+            logo: None,
             tracks: None,
             overlay: None,
             block: None,
@@ -689,6 +692,7 @@ fn audit(ctx, picks, workspace) {
 
     fn pattern_block(script: &Path, take: usize) -> BlockInclude {
         BlockInclude {
+            logo: None,
             tracks: None,
             overlay: None,
             block: None,

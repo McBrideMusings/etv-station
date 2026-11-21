@@ -116,6 +116,7 @@ fn plugin_channel(plugin: &Path) -> ChannelConfig {
         groups: Vec::new(),
         rule: RuleConfig {
             blocks: vec![BlockInclude {
+                logo: None,
                 tracks: None,
                 overlay: None,
                 block: None,

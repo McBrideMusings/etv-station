@@ -301,6 +301,7 @@ fn validate_channel_with_plex(
 
     validate_rotation_cycles(path, &channel.rule)?;
     validate_schedules(path, &channel.rule)?;
+    validate_slot_logos(path, channel)?;
     validate_channel_repeat(path, &channel.rule)?;
 
     Ok(())
@@ -1463,6 +1464,38 @@ fn validate_rotation_cycles(path: &Path, rule: &super::RuleConfig) -> Result<(),
     Ok(())
 }
 
+/// A slot's `logo:` swaps the file ETV-next serves at `/logo/<number>.<ext>`.
+/// ETV-next learns that URL, extension included, when it starts, so the
+/// channel's own `logo:` must exist (it airs outside every logo slot and gives
+/// the lineup a logo to start with) and every slot logo must share its extension.
+fn validate_slot_logos(path: &Path, channel: &super::ChannelConfig) -> Result<(), ConfigError> {
+    let ext = |p: &Path| {
+        p.extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    };
+    for (name, block) in &channel.rule.slots {
+        let Some(logo) = &block.logo else { continue };
+        let bad = |message: String| ConfigError::Validation {
+            path: path.to_path_buf(),
+            message,
+        };
+        let Some(base) = &channel.logo else {
+            return Err(bad(format!(
+                "slot {name:?} sets `logo`, so the channel needs its own `logo:` for the time no slot airs"
+            )));
+        };
+        if ext(logo) != ext(base) {
+            return Err(bad(format!(
+                "slot {name:?} logo {} and the channel logo {} differ in file extension; \
+                 ETV-next serves one `/logo/<number>.<ext>` URL per channel",
+                logo.display(),
+                base.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `rule.schedules` and `rule.slots` (ADR 0004): every schedule names
 /// itself uniquely, places at least one range, places only slots that exist,
 /// and never places two slots over the same minute; every slot is placed by
@@ -1480,6 +1513,13 @@ fn validate_schedules(path: &Path, rule: &super::RuleConfig) -> Result<(), Confi
         return Err(bad(format!(
             "{} sets `cycles`, which would run it past the next schedule boundary; \
              a channel with `rule.schedules` bounds every block by the schedule instead",
+            rule.block_label(idx)
+        )));
+    }
+    if let Some(idx) = rule.blocks.iter().position(|b| b.logo.is_some()) {
+        return Err(bad(format!(
+            "{} sets `logo`, which a guide shows only for a slot a schedule places; \
+             set it on a `rule.slots` entry, or `logo:` on the channel",
             rule.block_label(idx)
         )));
     }
@@ -1569,6 +1609,7 @@ mod tests {
         BlockInclude {
             tracks: None,
             overlay: None,
+            logo: None,
             block: None,
             program: None,
             guide: None,
@@ -3491,6 +3532,34 @@ fn capabilities() { [] }
             serde_norway::from_str(r#"[{name: nightly, hours: {"19..23": prime}}]"#).unwrap();
         edit(&mut c.rule);
         c
+    }
+
+    // A slot logo needs a channel logo of the same extension: ETV-next learns
+    // the `/logo/<number>.<ext>` URL once, at startup.
+    #[test]
+    fn a_slot_logo_needs_a_channel_logo_with_the_same_extension() {
+        let with = |channel: Option<&str>, slot: &str| {
+            let mut c = rotation_channel(|r| {
+                r.slots.get_mut("a").unwrap().logo = Some(slot.into());
+            });
+            c.logo = channel.map(Into::into);
+            validate_channel(&dummy_path(), &c).map_err(|e| format!("{e}"))
+        };
+        assert!(with(Some("ch.png"), "fall.PNG").is_ok());
+        assert!(with(None, "fall.png").unwrap_err().contains("own `logo:`"));
+        assert!(
+            with(Some("ch.png"), "fall.jpg")
+                .unwrap_err()
+                .contains("extension")
+        );
+        let mut c = channel_with(vec![inline_block(vec![item_entry("any")])]);
+        c.rule.blocks[0].logo = Some("x.png".into());
+        assert!(
+            validate_channel(&dummy_path(), &c)
+                .unwrap_err()
+                .to_string()
+                .contains("slot a schedule places")
+        );
     }
 
     fn rotation_error(edit: impl FnOnce(&mut RuleConfig)) -> String {

@@ -292,6 +292,9 @@ pub fn render_with(
             dropped: station.dropped,
         });
     }
+    let tz =
+        crate::tz::parse(&station.station.tz).map_err(|e| RenderError::Config(e.to_string()))?;
+    let now = time::OffsetDateTime::now_utc();
     let channels: Vec<ChannelRender> = station
         .channels
         .iter()
@@ -302,11 +305,7 @@ pub fn render_with(
             overlay: crate::daemon::load_overlay_playout_spec(ch),
             subtitle_default_on: ch.config.subtitle.as_ref().and_then(|s| s.default_on),
             show_bumpers: resolve_show_bumpers(ch.config.guide.as_ref(), &station.station.guide),
-            logo: ch
-                .config
-                .logo
-                .as_ref()
-                .map(|l| config_dir(&ch.config_path).join(l)),
+            logo: guide_logo(ch, tz, now),
             // The channel's own profile replaces the station's `active_profile`
             // outright; a field the channel's profile omits keeps the
             // station's `normalization.video`, not the active profile's.
@@ -615,6 +614,75 @@ pub fn render_channels(
         device_id: device_id.to_string(),
         dropped: Vec::new(),
     })
+}
+
+/// The image a channel's guide tile shows at `at`: the `logo:` of the slot its
+/// schedules put on air, else the channel's own `logo:`, resolved against the
+/// channel file's directory. A rotation shows the rotation's own `logo:`, not
+/// its drawn member's.
+pub fn guide_logo(
+    ch: &config::LoadedChannel,
+    tz: &'static time_tz::Tz,
+    at: time::OffsetDateTime,
+) -> Option<PathBuf> {
+    guide_logo_of(
+        &ch.config.rule,
+        ch.config.logo.as_deref(),
+        config_dir(&ch.config_path),
+        tz,
+        at,
+    )
+}
+
+fn guide_logo_of(
+    rule: &config::RuleConfig,
+    channel_logo: Option<&Path>,
+    dir: &Path,
+    tz: &'static time_tz::Tz,
+    at: time::OffsetDateTime,
+) -> Option<PathBuf> {
+    let slot_logo = crate::calendar::Calendar::new(rule, tz)
+        .and_then(|cal| match cal.on_air(at) {
+            crate::calendar::OnAir::Slot { slot, .. } => rule.slots.get(slot),
+            crate::calendar::OnAir::AnyTime => None,
+        })
+        .and_then(|b| b.logo.as_deref());
+    slot_logo.or(channel_logo).map(|l| dir.join(l))
+}
+
+/// The first instant in `(from, until)` at which [`guide_logo`] answers
+/// differently than at `from`, or `None` when it never does. Walks the
+/// schedule boundaries rather than every minute, so a seasonal channel finds a
+/// change months away cheaply.
+pub fn next_guide_logo_change(
+    ch: &config::LoadedChannel,
+    tz: &'static time_tz::Tz,
+    from: time::OffsetDateTime,
+    until: time::OffsetDateTime,
+) -> Option<time::OffsetDateTime> {
+    next_guide_logo_change_of(
+        &ch.config.rule,
+        ch.config.logo.as_deref(),
+        config_dir(&ch.config_path),
+        tz,
+        from,
+        until,
+    )
+}
+
+fn next_guide_logo_change_of(
+    rule: &config::RuleConfig,
+    channel_logo: Option<&Path>,
+    dir: &Path,
+    tz: &'static time_tz::Tz,
+    from: time::OffsetDateTime,
+    until: time::OffsetDateTime,
+) -> Option<time::OffsetDateTime> {
+    let cal = crate::calendar::Calendar::new(rule, tz)?;
+    let now = guide_logo_of(rule, channel_logo, dir, tz, from);
+    cal.boundaries(from, until)
+        .into_iter()
+        .find(|t| guide_logo_of(rule, channel_logo, dir, tz, *t) != now)
 }
 
 /// The folder beside `lineup.json` that holds channel logos. The lineup names
@@ -1068,6 +1136,91 @@ mod tests {
         let rendered = render_with_defaults(&chans(&folders), &with, "test-device-id").unwrap();
         let lineup = read(&rendered.lineup_path);
         assert_eq!(lineup["artwork"]["folder"], "/data/artwork");
+    }
+
+    const SEASONAL_LOGOS: &str = r#"
+blocks: [{ entries: [] }]
+slots:
+  autumn: { entries: [], logo: fall.png }
+  winter: { entries: [], logo: winter.png }
+  plain: { entries: [] }
+schedules:
+  - name: nov
+    dates: ["11-01..11-05"]
+    hours: { "00..24": plain }
+  - name: fall
+    dates: ["09-22..12-20"]
+    hours: { "00..24": autumn }
+  - name: winter
+    dates: ["12-21..12-31"]
+    hours: { "00..24": winter }
+"#;
+
+    fn logo_at(at: time::OffsetDateTime) -> Option<PathBuf> {
+        let rule: config::RuleConfig = serde_norway::from_str(SEASONAL_LOGOS).unwrap();
+        guide_logo_of(
+            &rule,
+            Some(Path::new("channel.png")),
+            Path::new("/c"),
+            time_tz::timezones::db::UTC,
+            at,
+        )
+    }
+
+    // The slot on air names the guide image; outside every slot, or on a slot
+    // with no `logo:`, the channel's own image shows.
+    #[test]
+    fn the_guide_logo_is_the_on_air_slots_else_the_channels() {
+        use time::macros::datetime;
+        assert_eq!(
+            logo_at(datetime!(2026-10-10 12:00 UTC)),
+            Some("/c/fall.png".into())
+        );
+        assert_eq!(
+            logo_at(datetime!(2026-12-25 12:00 UTC)),
+            Some("/c/winter.png".into())
+        );
+        assert_eq!(
+            logo_at(datetime!(2026-11-03 12:00 UTC)),
+            Some("/c/channel.png".into())
+        );
+        assert_eq!(
+            logo_at(datetime!(2027-03-01 12:00 UTC)),
+            Some("/c/channel.png".into())
+        );
+    }
+
+    // The daemon sleeps until this instant and republishes.
+    #[test]
+    fn the_next_guide_logo_change_is_the_first_boundary_where_the_image_differs() {
+        use time::macros::datetime;
+        let rule: config::RuleConfig = serde_norway::from_str(SEASONAL_LOGOS).unwrap();
+        let next = |from| {
+            next_guide_logo_change_of(
+                &rule,
+                Some(Path::new("channel.png")),
+                Path::new("/c"),
+                time_tz::timezones::db::UTC,
+                from,
+                datetime!(2028-01-01 0:00 UTC),
+            )
+        };
+        assert_eq!(
+            next(datetime!(2026-10-10 12:00 UTC)),
+            Some(datetime!(2026-11-01 0:00 UTC))
+        );
+        assert_eq!(
+            next(datetime!(2026-11-03 12:00 UTC)),
+            Some(datetime!(2026-11-06 0:00 UTC))
+        );
+        assert_eq!(
+            next(datetime!(2026-12-25 12:00 UTC)),
+            Some(datetime!(2027-01-01 0:00 UTC))
+        );
+        assert_eq!(
+            next(datetime!(2027-03-01 12:00 UTC)),
+            Some(datetime!(2027-09-22 0:00 UTC))
+        );
     }
 
     // #342: a channel's `logo:` is copied beside the lineup and named in its

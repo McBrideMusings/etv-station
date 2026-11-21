@@ -113,6 +113,12 @@ pub struct BlockInclude {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<OverlayDecl>,
 
+    /// The guide logo while this slot is on air: an image file relative to the
+    /// channel file's directory, published in place of the channel-level
+    /// `logo:` (etv-station-d83c). Only a `rule.slots` entry takes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<PathBuf>,
+
     /// Inline form: within-block duplicate policy. `None` resolves to the
     /// [`Duplicates`] default (`collapse`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
