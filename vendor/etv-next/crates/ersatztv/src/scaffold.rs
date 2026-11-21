@@ -83,6 +83,7 @@ pub async fn add_lineup(lineup_path: &Path, channels: u32, force: bool) -> Resul
             folder: String::from("./xmltv"),
         }),
         artwork: None,
+        guide_image_url: None,
         channels: channels_config,
     };
 

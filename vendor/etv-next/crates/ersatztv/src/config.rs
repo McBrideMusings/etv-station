@@ -21,6 +21,13 @@ pub struct LineupConfig {
     /// has itself cached the file this config point at.
     #[serde(default)]
     pub artwork: Option<ArtworkConfig>,
+    /// Base URL the guide publishes this server's own images on (`/logo/...`,
+    /// `/artwork/...`) in the XMLTV `<icon>` and M3U `tvg-logo`. `None`
+    /// resolves them against the requesting host. Set it when a guide reader
+    /// fetches images from somewhere other than where it fetched the guide:
+    /// Plex's image fetcher refuses any host that resolves to a private address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide_image_url: Option<String>,
     pub channels: Vec<ChannelConfig>,
 }
 

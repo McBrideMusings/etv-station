@@ -35,8 +35,8 @@ pub async fn xmltv_epg(
     // paths relative to this server's own root (`/artwork/...`, #187) and
     // this request supplies what to resolve them against — the same
     // `X-Forwarded-*`/`Host` derivation `hdhr_discover` already uses for the
-    // HDHomeRun endpoints.
-    let base_url = crate::get_scheme_host(request.headers());
+    // HDHomeRun endpoints — unless the lineup names `guide_image_url`.
+    let base_url = state.image_base(request.headers());
 
     let mut sections: Vec<(String, Vec<PlayoutItem>)> = Vec::with_capacity(state.channels.len());
     for channel in &state.channels {
@@ -526,6 +526,7 @@ mod tests {
             active: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
             device_id: "test-device".into(),
+            guide_image_url: None,
         });
 
         let app = Router::new()

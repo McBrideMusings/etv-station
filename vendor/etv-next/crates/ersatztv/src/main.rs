@@ -142,6 +142,10 @@ async fn run() -> Result<(), LineupError> {
                 active: Arc::new(Mutex::new(HashMap::new())),
                 health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
                 device_id: lineup_config.server.device_id.clone(),
+                guide_image_url: lineup_config
+                    .guide_image_url
+                    .as_deref()
+                    .map(|u| u.trim_end_matches('/').to_owned()),
             });
 
             // Per-run segment folders (etv-station-262) mean a channel's exit-time
@@ -632,6 +636,17 @@ struct LineupState {
     health: Arc<Mutex<crate::channel_health::HealthMap>>,
     /// Reported verbatim as the HDHomeRun `DeviceID`. See `ServerConfig::device_id`.
     device_id: String,
+    /// `LineupConfig::guide_image_url`, with no trailing `/`.
+    guide_image_url: Option<String>,
+}
+
+impl LineupState {
+    /// What the guide resolves this server's own image paths against.
+    fn image_base(&self, headers: &HeaderMap) -> String {
+        self.guide_image_url
+            .clone()
+            .unwrap_or_else(|| get_scheme_host(headers))
+    }
 }
 
 /// How much to write per request in the access log.
@@ -853,13 +868,14 @@ async fn channel_playlist(
     let mut content = String::new();
     let scheme_host = get_scheme_host(request.headers());
     let xmltv_url = format!("{}/xmltv.xml", scheme_host);
+    let image_base = state.image_base(request.headers());
     content.push_str(&format!(
         "#EXTM3U url-tvg=\"{xmltv_url}\" x-tvg-url=\"{xmltv_url}\"\n"
     ));
     for channel in &state.channels {
         let logo = channel
             .logo()
-            .map(|l| crate::xmltv::resolve_icon_url(&l, &scheme_host))
+            .map(|l| crate::xmltv::resolve_icon_url(&l, &image_base))
             .map(|l| format!(" tvg-logo=\"{l}\""))
             .unwrap_or(String::new());
 
@@ -1282,6 +1298,7 @@ mod channel_health_report_tests {
             active: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
             device_id: String::new(),
+            guide_image_url: None,
         })
     }
 
@@ -1368,6 +1385,7 @@ mod forwarded_prefix_tests {
             active: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
             device_id: String::new(),
+            guide_image_url: None,
         })
     }
 
@@ -1404,6 +1422,55 @@ mod forwarded_prefix_tests {
         let m3u = channels_m3u(None).await;
         assert!(m3u.contains("url-tvg=\"https://ersatz.example.com/xmltv.xml\""));
         assert!(m3u.contains("\nhttps://ersatz.example.com/channel/1.m3u8\n"));
+    }
+
+    #[tokio::test]
+    async fn guide_image_url_moves_the_logo_and_leaves_the_stream_on_the_request_host() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("playout")).unwrap();
+        let cfg_path = dir.path().join("channel.json");
+        std::fs::write(&cfg_path, r#"{"playout":{"folder":"playout"}}"#).unwrap();
+        let cfg = ChannelConfig {
+            number: "1".into(),
+            name: "ETV 1".into(),
+            config: cfg_path.to_string_lossy().into_owned(),
+            overlays: Vec::new(),
+            tvg_id: None,
+            logo: Some("/logo/1.png".into()),
+            group: None,
+        };
+        let channel = ChannelModel::new(&cfg_path, dir.path(), cfg).await.unwrap();
+        let state = Arc::new(LineupState {
+            channels: vec![channel],
+            active: Arc::new(Mutex::new(HashMap::new())),
+            health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
+            device_id: String::new(),
+            guide_image_url: Some("https://img.example".into()),
+        });
+        let request = axum::http::Request::builder()
+            .header("host", "internal:8409")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = channel_playlist(State(state), request)
+            .await
+            .unwrap()
+            .into_response();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let m3u = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            m3u.contains("tvg-logo=\"https://img.example/logo/1.png\""),
+            "{m3u}"
+        );
+        assert!(
+            m3u.contains("\nhttp://internal:8409/channel/1.m3u8\n"),
+            "{m3u}"
+        );
+        assert!(
+            m3u.contains("url-tvg=\"http://internal:8409/xmltv.xml\""),
+            "{m3u}"
+        );
     }
 
     #[tokio::test]
@@ -1576,6 +1643,7 @@ mod ts_stream_tests {
             active: Arc::new(Mutex::new(HashMap::new())),
             health: Arc::new(Mutex::new(crate::channel_health::HealthMap::default())),
             device_id: String::new(),
+            guide_image_url: None,
         });
         let request = || {
             axum::http::Request::builder()
