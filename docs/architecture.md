@@ -74,6 +74,21 @@ language code or `forced`, `sdh`, `hi`, `cc`, `default`, so
 `Movie.Extended.en.srt` does not belong to `Movie.mp4`. The language comes from
 the tag; an untagged file has none and matches no `lang:` rule.
 
+**A text subtitle inside the media file is extracted before it airs.** ETV-next
+reads a subtitle source end to end before an item's first segment, and for a
+stream inside the media that is the whole film (109 s for a 3.1 GB mkv, longer
+than Plex waits for a tune). So `tracks::assign` writes such a stream as
+`tracks.subtitle` with its own `source`: a WebVTT file in
+`<output_base>/.subtitles/`, named for the media path and the stream index
+(`3f9a…-s3.vtt`). `crates/etv-station/src/subtitle_cache.rs` runs every 30 s:
+it reads every unaired playout file, extracts the file of each item airing now
+or within three hours, one at a time with `ffmpeg -map 0:<index> -c:s webvtt`,
+and deletes every file in the folder that no unfinished item names. An item
+whose file is not there yet plays without subtitles: ETV-next skips a local
+subtitle source that is not on disk. Each extraction logs
+`subtitle_cache.extracted` (or `subtitle_cache.failed`) with the media path,
+the stream index, the seconds it took and the bytes written.
+
 **A picture subtitle is burned in only when a rule names it.** Blu-ray and DVD
 rips carry subtitles as pictures (`hdmv_pgs_subtitle`, `dvd_subtitle`), which
 cannot become WebVTT. If a rule selects one, ETV-next paints it into the video and

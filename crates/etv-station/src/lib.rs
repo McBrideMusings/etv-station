@@ -45,6 +45,7 @@ pub mod scan;
 pub mod score;
 pub mod sequence;
 pub mod simulate;
+pub mod subtitle_cache;
 pub mod suggest;
 #[cfg(test)]
 pub(crate) mod test_tracing;

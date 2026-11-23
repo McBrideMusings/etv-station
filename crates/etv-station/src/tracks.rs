@@ -302,11 +302,17 @@ pub struct Tally {
     pub items: usize,
     pub with_subtitle: usize,
     pub burned: usize,
+    /// Items whose subtitle reads from an extract of a stream inside the file.
+    pub extracted: usize,
     pub audio_unmatched: usize,
 }
 
 /// Choose each probed local item's audio and subtitle streams and record them
 /// on the item, for [`crate::rule`] to write into the playout JSON.
+///
+/// A text subtitle stream inside the media file is pointed at its extract in
+/// `subtitles` ([`crate::subtitle_cache`]), so ETV-next never reads the whole
+/// film for its cues at tune time.
 ///
 /// Items with nothing to choose from are left alone: a lavfi or HTTP source
 /// has no probe, and an error card is not a file.
@@ -315,6 +321,7 @@ pub fn assign(
     cache: &DurationCache,
     levels: &Levels<'_>,
     channel: &str,
+    subtitles: &Path,
 ) -> Tally {
     let floor = TrackRules::floor();
     let mut tally = Tally::default();
@@ -388,6 +395,12 @@ pub fn assign(
                 selection.subtitle = Some(Pick { index: 0, ..pick });
             }
         }
+        let mut extracted = None;
+        if let (None, false, Some(pick)) = (&sidecar, is_burned, selection.subtitle) {
+            extracted = Some(crate::subtitle_cache::path_for(subtitles, path, pick.index));
+            selection.subtitle = Some(Pick { index: 0, ..pick });
+            tally.extracted += 1;
+        }
         tracing::debug!(
             event = "tracks.selected",
             channel = %channel,
@@ -396,6 +409,7 @@ pub fn assign(
             audio = ?selection.audio,
             subtitle = ?selection.subtitle,
             subtitle_sidecar = ?sidecar,
+            subtitle_extract = ?extracted,
             burned = is_burned,
             streams = streams.len(),
             "chose this item's audio and subtitle streams",
@@ -436,7 +450,7 @@ pub fn assign(
         item.selected = Some(SelectedTracks {
             audio: selection.audio.map(|p| p.index),
             subtitle: selection.subtitle.map(|p| p.index),
-            subtitle_sidecar: sidecar,
+            subtitle_sidecar: sidecar.or(extracted.map(|p| p.to_string_lossy().into_owned())),
         });
     }
     tally
@@ -711,7 +725,7 @@ mod tests {
             blocks: vec![None, Some(&anime)],
         };
         let mut items = vec![local_item(0, None), local_item(1, None)];
-        let tally = assign(&mut items, &cache, &levels, "ch");
+        let tally = assign(&mut items, &cache, &levels, "ch", Path::new("/subs"));
 
         assert_eq!(items[0].selected.as_ref().unwrap().subtitle, None);
         assert_eq!(items[1].selected.as_ref().unwrap().subtitle, Some(2));
@@ -729,7 +743,7 @@ mod tests {
             blocks: vec![Some(&block)],
         };
         let mut items = vec![local_item(0, Some(pool))];
-        assign(&mut items, &cache, &levels, "ch");
+        assign(&mut items, &cache, &levels, "ch", Path::new("/subs"));
         assert_eq!(
             picked(&items).1,
             Some(4),
@@ -748,7 +762,7 @@ mod tests {
             blocks: vec![None],
         };
         let mut items = vec![local_item(0, None)];
-        assign(&mut items, &cache, &levels, "ch");
+        assign(&mut items, &cache, &levels, "ch", Path::new("/subs"));
         // Both audio streams are excluded (one by each level), so it falls
         // back to the default-flagged one among all of them.
         assert_eq!(picked(&items).0, Some(1));
@@ -767,7 +781,7 @@ mod tests {
             params: "testsrc".into(),
         };
         let mut items = vec![lavfi, local_item(0, None)];
-        let tally = assign(&mut items, &cache, &levels, "ch");
+        let tally = assign(&mut items, &cache, &levels, "ch", Path::new("/subs"));
         assert!(items.iter().all(|i| i.selected.is_none()));
         assert_eq!(tally.items, 0);
     }
@@ -839,7 +853,7 @@ mod tests {
 
         let cache = DurationCache::with_streams(&path, vec![audio(1, "eng", "", 2, true)]);
         let mut items = vec![item(None)];
-        let tally = assign(&mut items, &cache, &levels, "ch");
+        let tally = assign(&mut items, &cache, &levels, "ch", Path::new("/subs"));
         let sel = items[0].selected.as_ref().unwrap();
         assert_eq!(sel.subtitle, Some(0));
         assert_eq!(
@@ -854,7 +868,7 @@ mod tests {
             vec![audio(1, "eng", "", 2, true), sub(2, "eng", "subrip")],
         );
         let mut items = vec![item(None)];
-        assign(&mut items, &cache, &levels, "ch");
+        assign(&mut items, &cache, &levels, "ch", Path::new("/subs"));
         let sel = items[0].selected.as_ref().unwrap();
         assert_eq!(
             (sel.subtitle, sel.subtitle_sidecar.as_deref()),
@@ -875,7 +889,7 @@ mod tests {
         };
         let cache = DurationCache::with_streams(&path, vec![audio(1, "eng", "", 2, true)]);
         let mut items = vec![item(None)];
-        assign(&mut items, &cache, &ranked_levels, "ch");
+        assign(&mut items, &cache, &ranked_levels, "ch", Path::new("/subs"));
         let sel = items[0].selected.as_ref().unwrap();
         assert_eq!(
             sel.subtitle_sidecar.as_deref(),
@@ -887,7 +901,7 @@ mod tests {
         std::fs::remove_file(dir.path().join("Movie.en.srt")).unwrap();
         let cache = DurationCache::with_streams(&path, vec![audio(1, "eng", "", 2, true)]);
         let mut items = vec![item(None)];
-        assign(&mut items, &cache, &levels, "ch");
+        assign(&mut items, &cache, &levels, "ch", Path::new("/subs"));
         assert_eq!(items[0].selected.as_ref().unwrap().subtitle, None);
     }
 
