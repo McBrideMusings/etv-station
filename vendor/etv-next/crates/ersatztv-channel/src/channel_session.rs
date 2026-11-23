@@ -686,6 +686,11 @@ impl ChannelSession {
         let subtitle_fut = async {
             if subtitle_source_is_video_source {
                 Ok::<_, ChannelError>(None)
+            } else if let Some(missing) = subtitle_source.as_ref().and_then(missing_local_file) {
+                // The scheduler extracts subtitle files ahead of air and may not
+                // have reached this one yet; the item plays without subtitles.
+                log::warn!("subtitle file not on disk yet, playing without subtitles: {missing}");
+                Ok(None)
             } else if let (Some(src), Some(s)) =
                 (subtitle_source.as_ref(), subtitle_input_source.as_ref())
             {
@@ -2108,6 +2113,42 @@ fn source_is_live(source: &PlayoutItemSource) -> bool {
             ..
         } | PlayoutItemSource::Rtsp { .. }
     )
+}
+
+/// The path of a local `source` that is not on disk. Any other failure to read
+/// it is left to the probe, which reports it.
+fn missing_local_file(source: &PlayoutItemSource) -> Option<&str> {
+    match source {
+        PlayoutItemSource::Local { path, .. }
+            if std::fs::metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Some(path)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod missing_local_file_tests {
+    use super::*;
+
+    fn local(path: &str) -> PlayoutItemSource {
+        PlayoutItemSource::local(path.to_string(), None, None)
+    }
+
+    #[test]
+    fn names_a_local_file_that_is_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("abc-s3.vtt");
+        let gone = gone.to_str().unwrap();
+        assert_eq!(missing_local_file(&local(gone)), Some(gone));
+    }
+
+    #[test]
+    fn passes_a_local_file_that_exists() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert_eq!(missing_local_file(&local(file.path().to_str().unwrap())), None);
+    }
 }
 
 fn probe_hint_to_result(hint: &ProbeHint, path: String) -> ProbeResult {

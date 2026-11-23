@@ -999,6 +999,14 @@ async fn run_generation(
     // (duration probing, catch-up emit) is never lost — unlike `notify_waiters`,
     // which only wakes already-parked waiters.
     let mut stops: Vec<Arc<Notify>> = Vec::new();
+    {
+        let stop = Arc::new(Notify::new());
+        stops.push(stop.clone());
+        supervisor_handles.push(tokio::spawn(crate::subtitle_cache::run(
+            station.station.output_base.clone(),
+            stop,
+        )));
+    }
     for idx in 0..station.channels.len() {
         if let Some(ctx) = build_overlay_context(&station.channels[idx], &station.station.fonts) {
             let stop = Arc::new(Notify::new());
@@ -3301,7 +3309,11 @@ async fn pattern_catch_up(
                 .map(|b| b.tracks())
                 .collect(),
         };
-        let tally = crate::tracks::assign(&mut items, &cache, &levels, &channel.name);
+        // A channel's folder is `output_base/<name>`, and the extracts sit beside it.
+        let subtitles = crate::subtitle_cache::dir(
+            channel.output_folder.parent().unwrap_or(&channel.output_folder),
+        );
+        let tally = crate::tracks::assign(&mut items, &cache, &levels, &channel.name, &subtitles);
         // A fill pool's items air as programmes, so they choose their audio and
         // subtitle streams the same way.
         let fill_pools: std::collections::HashMap<(usize, String), Vec<_>> = pool_keys
@@ -3309,7 +3321,7 @@ async fn pattern_catch_up(
             .zip(pool_items)
             .map(|(key, list)| {
                 let (mut pool, lengths): (Vec<_>, Vec<_>) = list.into_iter().unzip();
-                crate::tracks::assign(&mut pool, &cache, &levels, &channel.name);
+                crate::tracks::assign(&mut pool, &cache, &levels, &channel.name, &subtitles);
                 (key, pool.into_iter().zip(lengths).collect())
             })
             .collect();
@@ -3320,6 +3332,7 @@ async fn pattern_catch_up(
                 items = tally.items,
                 with_subtitle = tally.with_subtitle,
                 burned = tally.burned,
+                subtitle_extracts = tally.extracted,
                 audio_unmatched = tally.audio_unmatched,
                 "selected audio and subtitle streams for this generation",
             );

@@ -139,8 +139,10 @@ pub struct ResolvedItem {
 pub struct SelectedTracks {
     pub audio: Option<u32>,
     pub subtitle: Option<u32>,
-    /// A subtitle file beside the media file (`Movie.en.srt`). When set,
-    /// `subtitle` is a stream index inside that file, not inside the media.
+    /// A subtitle file the item reads instead of the media: one beside it
+    /// (`Movie.en.srt`), or the station's extract of a stream inside it
+    /// ([`crate::subtitle_cache`]). When set, `subtitle` is a stream index
+    /// inside that file, not inside the media.
     pub subtitle_sidecar: Option<String>,
 }
 

@@ -393,63 +393,77 @@ pub struct PendingFile {
     pub airs_at: OffsetDateTime,
 }
 
-/// The pending items of each playout file [`pending_files`] has parsed, kept
-/// with the modification time and size the file had then. A file is parsed
-/// again only when either changes; playout files are replaced whole by a
-/// rename, so a rewrite always moves them.
-#[derive(Debug, Default)]
-pub struct PendingScan {
-    files: HashMap<PathBuf, (std::time::SystemTime, u64, Vec<PendingFile>)>,
+/// What [`scan_chunks`] took from each playout file it parsed, kept with the
+/// modification time and size the file had then. A file is parsed again only
+/// when either changes; playout files are replaced whole by a rename, so a
+/// rewrite always moves them.
+#[derive(Debug)]
+pub struct ChunkScan<T> {
+    files: HashMap<PathBuf, (std::time::SystemTime, u64, Vec<T>)>,
 }
 
-/// Every pending item in a playout file, each at its own start; `None` when
-/// the file is gone, since the schedule no longer holds it.
-fn pending_items(path: &Path) -> Result<Option<Vec<PendingFile>>, String> {
+impl<T> Default for ChunkScan<T> {
+    fn default() -> Self {
+        Self {
+            files: HashMap::new(),
+        }
+    }
+}
+
+pub type PendingScan = ChunkScan<PendingFile>;
+
+/// Every pending item in a playout, each at its own start.
+fn pending_items(playout: &Playout) -> Vec<PendingFile> {
+    playout
+        .items
+        .iter()
+        .filter_map(|item| {
+            let pending = item.metadata.as_ref()?.get(PENDING_KEY)?;
+            let real = pending.get("path")?.as_str()?;
+            Some(PendingFile {
+                path: PathBuf::from(real),
+                plan: pending
+                    .get("plan")
+                    .and_then(|p| p.as_str())
+                    .map(PathBuf::from),
+                airs_at: item.start,
+            })
+        })
+        .collect()
+}
+
+/// The playout in `path`; `None` when the file is gone, since the schedule no
+/// longer holds it.
+fn read_playout(path: &Path) -> Result<Option<Playout>, String> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
-    let playout: Playout = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
-    Ok(Some(
-        playout
-            .items
-            .iter()
-            .filter_map(|item| {
-                let pending = item.metadata.as_ref()?.get(PENDING_KEY)?;
-                let real = pending.get("path")?.as_str()?;
-                Some(PendingFile {
-                    path: PathBuf::from(real),
-                    plan: pending
-                        .get("plan")
-                        .and_then(|p| p.as_str())
-                        .map(PathBuf::from),
-                    airs_at: item.start,
-                })
-            })
-            .collect(),
-    ))
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("cannot parse {}: {e}", path.display()))
 }
 
-/// Every pending file a channel under `output_base` airs after `from` and
-/// before `until`. Reads only the playout files whose names overlap that span,
-/// and parses only those that changed since `scan` last saw them.
+/// What `take` finds in every playout file of every channel under
+/// `output_base` whose span overlaps `from`..`until`. Parses only the files
+/// that changed since `scan` last saw them.
 ///
 /// All or nothing: any channel folder or overlapping file that cannot be read
 /// or parsed fails the whole answer, because a partial list reads as "these
-/// files are no longer scheduled" to a caller that drops what is missing.
-pub fn pending_files(
+/// are no longer scheduled" to a caller that drops what is missing.
+pub fn scan_chunks<T: Clone>(
     output_base: &Path,
     from: OffsetDateTime,
     until: OffsetDateTime,
-    scan: &mut PendingScan,
-) -> Result<Vec<PendingFile>, String> {
+    scan: &mut ChunkScan<T>,
+    take: impl Fn(&Playout) -> Vec<T>,
+) -> Result<Vec<T>, String> {
     let read_dir = |dir: &Path| {
         std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))
     };
-    let mut seen: HashMap<PathBuf, (std::time::SystemTime, u64, Vec<PendingFile>)> = HashMap::new();
-    let mut earliest: HashMap<PathBuf, PendingFile> = HashMap::new();
+    let mut seen: HashMap<PathBuf, (std::time::SystemTime, u64, Vec<T>)> = HashMap::new();
+    let mut out = Vec::new();
     for channel in read_dir(output_base)? {
         let channel = channel.map_err(|e| format!("cannot read {}: {e}", output_base.display()))?;
         if !channel.file_type().is_ok_and(|t| t.is_dir()) {
@@ -478,30 +492,43 @@ pub fn pending_files(
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
             let items = match scan.files.remove(&path) {
                 Some((m, len, items)) if m == modified && len == meta.len() => items,
-                _ => match pending_items(&path)? {
-                    Some(items) => items,
+                _ => match read_playout(&path)? {
+                    Some(playout) => take(&playout),
                     None => continue,
                 },
             };
-            for found in &items {
-                if found.airs_at <= from || found.airs_at >= until {
-                    continue;
-                }
-                let found = found.clone();
-                earliest
-                    .entry(found.path.clone())
-                    .and_modify(|e| {
-                        if found.airs_at < e.airs_at {
-                            *e = found.clone();
-                        }
-                    })
-                    .or_insert(found);
-            }
+            out.extend(items.iter().cloned());
             seen.insert(path, (modified, meta.len(), items));
         }
     }
     // Files outside the span or gone from disk drop out of the scan.
     scan.files = seen;
+    Ok(out)
+}
+
+/// Every pending file a channel under `output_base` airs after `from` and
+/// before `until`, each at the earliest time it airs. All or nothing, as
+/// [`scan_chunks`] is.
+pub fn pending_files(
+    output_base: &Path,
+    from: OffsetDateTime,
+    until: OffsetDateTime,
+    scan: &mut PendingScan,
+) -> Result<Vec<PendingFile>, String> {
+    let mut earliest: HashMap<PathBuf, PendingFile> = HashMap::new();
+    for found in scan_chunks(output_base, from, until, scan, pending_items)? {
+        if found.airs_at <= from || found.airs_at >= until {
+            continue;
+        }
+        earliest
+            .entry(found.path.clone())
+            .and_modify(|e| {
+                if found.airs_at < e.airs_at {
+                    *e = found.clone();
+                }
+            })
+            .or_insert(found);
+    }
     let mut out: Vec<PendingFile> = earliest.into_values().collect();
     out.sort_by(|a, b| a.airs_at.cmp(&b.airs_at).then_with(|| a.path.cmp(&b.path)));
     Ok(out)
@@ -1420,9 +1447,9 @@ mod tests {
     #[test]
     fn a_playout_file_gone_before_the_read_holds_nothing() {
         let dir = TempDir::new().unwrap();
-        assert_eq!(pending_items(&dir.path().join("gone.json")), Ok(None));
+        assert!(matches!(read_playout(&dir.path().join("gone.json")), Ok(None)));
         std::fs::write(dir.path().join("bad.json"), "{ not json").unwrap();
-        assert!(pending_items(&dir.path().join("bad.json")).is_err());
+        assert!(read_playout(&dir.path().join("bad.json")).is_err());
     }
 
     fn len_4s(_: &Path) -> Option<u64> {
