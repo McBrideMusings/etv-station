@@ -1149,6 +1149,9 @@ pub(crate) fn engine() -> Engine {
         tracing::info!(event = "score.log", "{text}");
     });
     engine
+        .register_fn("cel", crate::cel_expr::script_eval)
+        .register_fn("cel_check", crate::cel_expr::script_check);
+    engine
         .register_fn("timestamp", clock_read)
         .register_fn("elapsed", |t0: f64| clock_read() - t0);
     engine
