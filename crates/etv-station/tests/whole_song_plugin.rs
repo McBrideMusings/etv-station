@@ -1,6 +1,6 @@
 //! Acceptance tests for the whole-song bumper (`examples/plugins/bumpers/whole_song.rhai`):
 //! it reads audio facts through `ctx.catalog`, walks a set of whole songs, picks a
-//! seam recipe per pair by rule, writes a render plan the renderer accepts (the
+//! seam strategy per pair (the default list reproduces the autodj rule), writes a render plan the renderer accepts (the
 //! layers and cuts, with the songs and seams in `notes`) and airs it as a pending
 //! segment naming that plan, which the render sidecar queues as air time nears.
 //!
@@ -208,7 +208,7 @@ struct NoteSong {
 
 #[derive(Debug, Deserialize)]
 struct NoteSeam {
-    recipe: String,
+    strategy: String,
     out_s: f64,
     bars: u32,
     sweep: bool,
@@ -248,7 +248,7 @@ fn a_set_plan_fills_the_gap_with_songs_entering_at_their_landing_bars() {
     // Flat energy and close tempos: every seam is a bass swap, and a swap that
     // arrives at the song's peak is two bars with a sweep.
     for seam in &n.seams {
-        assert_eq!(seam.recipe, "bass_swap", "{seam:?}");
+        assert_eq!(seam.strategy, "bass_swap", "{seam:?}");
         assert_eq!((seam.bars, seam.sweep), (2, true));
     }
     assert!(plan.duration_s <= 600.0 + 1e-6, "{}s", plan.duration_s);
@@ -297,7 +297,7 @@ fn songs_far_apart_in_tempo_join_with_an_echo_out() {
     build(&plugin_path(), &f.input(&songs, "landing", 900_000)).unwrap();
     let n = notes(&f.plan());
     assert_eq!(n.seams.len(), 1);
-    assert_eq!(n.seams[0].recipe, "echo_out");
+    assert_eq!(n.seams[0].strategy, "echo_out");
     assert_eq!(n.songs[1].ratio, 1.0);
 }
 
@@ -320,9 +320,9 @@ fn an_arrival_louder_than_the_exit_is_a_drop_mix() {
     let n = notes(&f.plan());
     let order: Vec<&str> = n.songs.iter().map(|t| t.entry_id.as_str()).collect();
     if order[0] == "s-quiet" {
-        assert_eq!(n.seams[0].recipe, "drop_mix", "{order:?}");
+        assert_eq!(n.seams[0].strategy, "drop_mix", "{order:?}");
     } else {
-        assert_ne!(n.seams[0].recipe, "drop_mix", "{order:?}");
+        assert_ne!(n.seams[0].strategy, "drop_mix", "{order:?}");
     }
 }
 
@@ -336,7 +336,7 @@ fn a_start_entry_plays_each_song_from_its_first_second_and_never_bass_swaps() {
         assert_eq!(track.enter_s, 0.0, "{}", track.entry_id);
     }
     for seam in &n.seams {
-        assert_ne!(seam.recipe, "bass_swap", "{seam:?}");
+        assert_ne!(seam.strategy, "bass_swap", "{seam:?}");
     }
 }
 
@@ -427,7 +427,7 @@ fn a_two_song_set_lays_out_the_layers_and_cuts_of_a_bass_swap() {
     assert_eq!(n.songs.len(), 2);
     assert_eq!(
         (
-            n.seams[0].recipe.as_str(),
+            n.seams[0].strategy.as_str(),
             n.seams[0].bars,
             n.seams[0].sweep
         ),
@@ -527,6 +527,10 @@ use rhai::{Dynamic, Engine, Scope};
 use serde_json::Value;
 
 fn call(name: &str, args: (Value, Value, f64)) -> Result<Dynamic, String> {
+    call_with(name, args, json!({}))
+}
+
+fn call_with(name: &str, args: (Value, Value, f64), cfg: Value) -> Result<Dynamic, String> {
     let mut engine = Engine::new();
     // The host's limits (`hooks.rs`), so the script compiles as it does there.
     engine.set_max_expr_depths(128, 64);
@@ -537,7 +541,7 @@ fn call(name: &str, args: (Value, Value, f64)) -> Result<Dynamic, String> {
             &mut Scope::new(),
             &ast,
             name,
-            (arg(args.0), arg(args.1), args.2),
+            (arg(args.0), arg(args.1), args.2, arg(cfg)),
         )
         .map_err(|e| e.to_string())
 }
@@ -547,19 +551,22 @@ fn track(id: &str, bpm: f64, enter: f64, ratio: f64, ride: i64) -> Value {
             "enter": enter, "ratio": ratio, "ride": ride, "at": 0.0 })
 }
 
-fn seam(recipe: &str, out_s: f64, bars: i64, sweep: bool) -> Value {
-    json!({ "recipe": recipe, "out_s": out_s, "bars": bars, "sweep": sweep })
+/// A seam out of a at `out_s`. A bass swap is two bars with a sweep when the
+/// arrival is at its song's peak (`sweep`), else four.
+fn seam(strategy: &str, out_s: f64, sweep: bool) -> Value {
+    let share = if sweep { 1.0 } else { 0.5 };
+    json!({ "strategy": strategy, "out_s": out_s, "facts": { "arrival_peak_share": share } })
 }
 
 /// Song a (120 bpm, enters at 16 s) into song b (120 bpm, enters at 32 s), the
 /// seam out of a at 96 s and the set ending at 80 s of b's file.
-fn pair(recipe: &str, bars: i64, sweep: bool) -> (Value, Value, f64) {
+fn pair(strategy: &str, sweep: bool) -> (Value, Value, f64) {
     (
         json!([
             track("a", 120.0, 16.0, 1.0, 0),
             track("b", 120.0, 32.0, 1.0, 0)
         ]),
-        json!([seam(recipe, 96.0, bars, sweep)]),
+        json!([seam(strategy, 96.0, sweep)]),
         80.0,
     )
 }
@@ -608,7 +615,7 @@ fn cuts(l: &Value, want: &[(&str, f64, f64, f64)]) {
 
 #[test]
 fn a_drop_mix_cuts_a_at_its_phrase_and_starts_b_on_the_beat() {
-    let l = laid(pair("drop_mix", 0, false));
+    let l = laid(pair("drop_mix", false));
     // a plays 16 s to 96 s: 80 s. b plays 32 s to 80 s: 48 s.
     assert_eq!(l["layers"].as_array().unwrap().len(), 2);
     layer(&l, 0, "seam 1 (a) body", 16.0, 0.0, 80.0);
@@ -621,7 +628,7 @@ fn a_drop_mix_cuts_a_at_its_phrase_and_starts_b_on_the_beat() {
 
 #[test]
 fn a_bass_swap_overlaps_the_two_songs_for_its_bars_and_keeps_their_tempos_locked() {
-    let l = laid(pair("bass_swap", 4, false));
+    let l = laid(pair("bass_swap", false));
     // Four bars of 2 s: the swap lasts 8 s, half of it (4 s) before B takes over
     // alone at 80 s + 4 s.
     let names: Vec<&str> = l["layers"]
@@ -670,7 +677,7 @@ fn a_bass_swap_overlaps_the_two_songs_for_its_bars_and_keeps_their_tempos_locked
 
 #[test]
 fn a_sweeping_bass_swap_narrows_the_tail_to_a_band() {
-    let l = laid(pair("bass_swap", 2, true));
+    let l = laid(pair("bass_swap", true));
     assert_eq!(
         l["layers"][1]["filters"],
         json!([{ "kind": "highpass", "hz": 250.0 }, { "kind": "lowpass", "hz": 1200.0 }])
@@ -679,7 +686,7 @@ fn a_sweeping_bass_swap_narrows_the_tail_to_a_band() {
 
 #[test]
 fn an_echo_out_rings_the_last_bar_into_the_next_song() {
-    let l = laid(pair("echo_out", 0, false));
+    let l = laid(pair("echo_out", false));
     // The body stops one bar (2 s) early; the echo covers that bar and two more.
     layer(&l, 0, "seam 1 (a) body", 16.0, 0.0, 78.0);
     fade(&l, 0, 0, "out", 77.98, 0.02);
@@ -699,7 +706,7 @@ fn an_echo_out_rings_the_last_bar_into_the_next_song() {
 
 #[test]
 fn a_songs_ratio_stretches_its_body_in_the_set() {
-    let (mut tracks, seams, end) = pair("drop_mix", 0, false);
+    let (mut tracks, seams, end) = pair("drop_mix", false);
     tracks[0]["ratio"] = json!(1.25);
     let l = laid((tracks, seams, end));
     // 80 s of source at 1.25x is 64 s of set.
@@ -724,15 +731,16 @@ fn assert_picture_whole(l: &Value, what: &str) {
 }
 
 #[test]
-fn the_picture_has_no_gap_and_no_overlap_in_any_recipe() {
-    for (recipe, bars, sweep) in [
-        ("bass_swap", 2, false),
-        ("bass_swap", 2, true),
-        ("bass_swap", 4, false),
-        ("echo_out", 0, false),
-        ("drop_mix", 0, false),
+fn the_picture_has_no_gap_and_no_overlap_in_any_strategy() {
+    for (strategy, sweep) in [
+        ("bass_swap", true),
+        ("bass_swap", false),
+        ("echo_out", false),
+        ("drop_mix", false),
+        ("blend", false),
+        ("whole", false),
     ] {
-        assert_picture_whole(&laid(pair(recipe, bars, sweep)), recipe);
+        assert_picture_whole(&laid(pair(strategy, sweep)), strategy);
     }
     assert_picture_whole(&laid(riding()), "riding");
 }
@@ -745,7 +753,7 @@ fn riding() -> (Value, Value, f64) {
             track("a", 120.0, 16.0, 1.0, 0),
             track("b", 108.0, 32.0, 120.0 / 108.0, 4)
         ]),
-        json!([seam("bass_swap", 96.0, 2, false)]),
+        json!([seam("bass_swap", 96.0, true)]),
         80.0,
     )
 }
@@ -845,10 +853,10 @@ fn a_rides_last_song_reads_the_file_the_picture_and_sound_agree_on() {
 
 #[test]
 fn a_valid_set_passes_the_checks() {
-    call("validate_set", pair("bass_swap", 4, false))
+    call("validate_set", pair("bass_swap", false))
         .map(drop)
         .expect("a valid set passes");
-    call("validate_set", pair("echo_out", 0, false))
+    call("validate_set", pair("echo_out", false))
         .map(drop)
         .expect("a valid set passes");
     call("validate_set", riding())
@@ -864,14 +872,14 @@ fn refused(set: (Value, Value, f64), needle: &str) {
 
 #[test]
 fn a_song_without_a_tempo_is_refused() {
-    let (mut tracks, seams, end) = pair("drop_mix", 0, false);
+    let (mut tracks, seams, end) = pair("drop_mix", false);
     tracks[1]["item"]["audio"]["bpm"] = json!(0.0);
     refused((tracks, seams, end), "native_bpm must be positive");
 }
 
 #[test]
 fn a_song_entered_before_the_start_of_its_file_is_refused() {
-    let (mut tracks, seams, end) = pair("drop_mix", 0, false);
+    let (mut tracks, seams, end) = pair("drop_mix", false);
     tracks[0]["enter"] = json!(-1.0);
     refused((tracks, seams, end), "enter_s must not be negative");
 }
@@ -879,7 +887,7 @@ fn a_song_entered_before_the_start_of_its_file_is_refused() {
 #[test]
 fn a_bass_swap_tail_longer_than_the_closing_body_is_refused() {
     // 4 bars of 2 s: a 4 s tail. b plays 32 s to 35 s at the closing seam: 3 s.
-    let (tracks, seams, _) = pair("bass_swap", 4, false);
+    let (tracks, seams, _) = pair("bass_swap", false);
     refused((tracks, seams, 35.0), "the set ends");
 }
 
@@ -894,8 +902,8 @@ fn a_bass_swap_tail_longer_than_the_next_body_is_refused() {
         (
             tracks.clone(),
             json!([
-                seam("bass_swap", 96.0, 4, false),
-                seam("drop_mix", out, 0, false)
+                seam("bass_swap", 96.0, false),
+                seam("drop_mix", out, false)
             ]),
             80.0,
         )
@@ -908,7 +916,7 @@ fn a_bass_swap_tail_longer_than_the_next_body_is_refused() {
 
 #[test]
 fn the_last_song_needs_room_for_its_closing_fade() {
-    let (tracks, seams, _) = pair("drop_mix", 0, false);
+    let (tracks, seams, _) = pair("drop_mix", false);
     refused((tracks, seams, 32.5), "closing fade");
 }
 

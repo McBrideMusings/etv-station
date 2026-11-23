@@ -127,7 +127,7 @@ window is cut at the boundary; one that falls short is not padded.
 import, whatever directory the station runs in. Inside `plugins/megamix.rhai`,
 `import "megamix/drop" as m` loads `plugins/megamix/drop.rhai`, and an `import "common"`
 inside `drop.rhai` loads `plugins/megamix/common.rhai`. The path is any expression, so
-`import "megamix/" + ctx.config.blend as m` picks a module from the channel's config. A
+`import "megamix/" + ctx.config.module as m` picks a module from the channel's config. A
 module that is not there fails the call, naming the file it looked for:
 `module "megamix/nope" not found: no file /…/plugins/megamix/nope.rhai`.
 

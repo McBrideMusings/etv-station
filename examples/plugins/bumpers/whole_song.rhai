@@ -1,9 +1,9 @@
 // A whole-song bumper: fills a gap with music videos played whole, one after
-// another, each pair joined by a seam recipe chosen by rule, and hands the
-// render plan (the audio layers and picture cuts, docs/schema.md § Render plan)
-// to the renderer's queue. The recipes, tempo ride, filters, fades and the
-// picture split are resolved here into layers and cuts; the plan's `notes` keep
-// the songs and seams (recipe, bars, sweep) for audit.
+// another, each pair joined by a mixing strategy, and hands the render plan (the
+// audio layers and picture cuts, docs/schema.md § Render plan) to the renderer's
+// queue. The strategies are megamix/strategies.rhai's, drawn per seam from
+// `config.strategies`; the picture is megamix/picture.rhai's, cut from the
+// layers. The plan's `notes` keep the songs and seams for audit.
 //
 // config (the block's `fill:` entry):
 //   expr:            CEL over the catalog naming the pool, as a pool's `expr` does (required)
@@ -13,26 +13,24 @@
 //   floor:           lowest `beat_confidence` a song may have, default 2.5
 //   steady_beats:    fewest beats in a song's steady run, default 32
 //   tail:            recent sets whose songs are not reused, default 12
-//   tempo_gap_pct:   a gap wider than this between the running tempo and the next
-//                    song's, in percent, falls back to echo_out, default 8
-//   drop_step_db:    an arrival this many dB louder than the exit is a drop_mix, default 3
-//   ride_bars:       bars over which a song that entered by a bass swap at the outgoing
-//                    song's tempo steps back to its own, default 16; 0 keeps the swap's
-//                    tempo for the rest of the song
+//   strategies:      [{ name, weight, when }] drawn per seam among bass_swap, echo_out,
+//                    drop_mix, blend and whole (megamix/strategies.rhai); default
+//                    default_strategies() below
+//   ride_bars:       bars over which a song that entered at the outgoing song's tempo
+//                    (bass_swap, blend) steps back to its own, default 16; 0 keeps the
+//                    entry tempo for the rest of the song
+//   picture_margin_db, picture_hold_beats: as megamix.rhai's, one bar being the
+//                    first song's
 //   artist_field:    item field holding the artist for the card, default "show"
 //   card_script:     overlay script that draws the card copy, relative to the
 //                    channel config's directory; unset carries no overlay
 //   ffmpeg:          program that makes the stand-in, default "ffmpeg"
 //
-// The recipe per seam, as the autodj spike's round 4 settled it: echo_out when the
-// tempos are more than `tempo_gap_pct` apart or either beat is unsure; drop_mix
-// when the arrival is a step up in energy; otherwise bass_swap, 2 bars with a
-// sweep when the arrival is near the song's peak, 4 bars without. A song that
-// enters at its start has no lead-in for a bass swap, so that seam is a drop_mix
-// on a step up and an echo_out otherwise. After a bass swap the incoming song plays
-// at the outgoing song's tempo and rides back to its own over `ride_bars` bars, so
-// the next seam starts from the song's native tempo; a song with no room for the
-// ride before its seam or the end of the set keeps the swap's tempo instead.
+// A song leaves at an 8-bar phrase boundary with room for its seam, or, joined by
+// `whole`, at the end of its file. After a bass swap or a blend the incoming song
+// plays at the outgoing song's tempo and rides back to its own over `ride_bars`
+// bars, so the next seam starts from the song's native tempo; a song with no room
+// for the ride before its seam or the end of the set keeps the entry tempo.
 //
 // Beside each render it writes <stem>.plan.json and <stem>.audit.txt (one line
 // per seam). The segment is pending on <stem>.mp4 with <stem>.plan.json
@@ -43,13 +41,47 @@
 fn hooks() { ["bumper"] }
 fn capabilities() { ["probe", "catalog_read", "exec"] }
 
+// The autodj spike's rule: echo_out when the tempos are more than 8 % apart, a
+// beat is unsure, or a bass swap has no lead-in to play; drop_mix when the
+// arrival is more than 3 dB louder than the exit; otherwise bass_swap.
+fn default_strategies() {
+    let unsure = "seam.tempo_gap_pct > 8.0 || a.audio.beat_confidence < 1.5 || b.audio.beat_confidence < 1.5";
+    [
+        #{ name: "echo_out", when: unsure + " || (seam.energy_step_db <= 3.0 && !seam.fits.bass_swap)" },
+        #{ name: "drop_mix", when: "!(" + unsure + ") && seam.energy_step_db > 3.0" },
+        #{ name: "bass_swap", when: "!(" + unsure + ") && seam.energy_step_db <= 3.0" },
+    ]
+}
+
+fn allowed() { ["bass_swap", "echo_out", "drop_mix", "blend", "whole"] }
+
+// Strategies after which the incoming song plays at the outgoing song's tempo.
+fn locks_tempo(name) { name == "bass_swap" || name == "blend" }
+
+// Bars of A's file the walk keeps after A's exit point for each strategy.
+fn room_bars(name, joined) {
+    switch name {
+        "bass_swap" => joined.bars + 1,
+        "echo_out" => 2,
+        "drop_mix" => 4,
+        _ => 1,
+    }
+}
+
 // The fewest bars of a song's body before a seam out of it.
 fn min_body_bars() { 4 }
 // Seconds a last song needs between its entry and the end of the set.
 fn min_last_s() { 6.0 }
 fn end_margin_s() { 0.5 }
+fn last_fade_s() { 2.0 }
+fn max_ride_bars() { 64 }
 
 fn num(v) { v * 1.0 }
+
+fn conf(cfg, key, fallback) {
+    let v = cfg[key];
+    if v == () { fallback } else { v }
+}
 
 // Config `ride_bars` as a whole number of bars, 0 (no ride) to 64; a ride is one
 // step per bar and the plan takes 1 to 64 steps.
@@ -95,15 +127,6 @@ fn finish(tr, play) {
     }
 }
 
-// Constants of the seam arithmetic.
-fn bass_crossover_hz() { 250.0 }
-fn sweep_ceiling_hz() { 1200.0 }
-fn cut_fade_s() { 0.01 }
-fn short_fade_s() { 0.02 }
-fn last_fade_s() { 2.0 }
-fn ratio_tolerance() { 0.002 }
-fn max_ride_bars() { 64 }
-
 fn rides(tr) { tr.ride > 0 && (tr.ratio - 1.0).abs() > 0.000000001 }
 
 // Seconds in one bar as the set plays it when the song leaves.
@@ -122,37 +145,47 @@ fn mk_layer(name, tr, src, out, len, ratio) {
        ratio: ratio, fades: [], filters: [] }
 }
 
-fn mk_cut(tr, src, out, len, ratio) {
-    #{ source: tr.item.entry_id, src_start_s: src, out_start_s: out, out_len_s: len, ratio: ratio }
-}
-
-// The picture of `tr` from where it enters to `src_to` in its file, laid from set
-// second `t`: one cut, or, after a bass swap, one per bar of the tempo ride and
-// one for the rest.
-fn played_picture(tr, t, src_to) {
-    let out = [];
-    let at = t;
-    let src = tr.enter;
-    let bar = file_bar(tr.item);
-    if rides(tr) {
-        for r in ride_ratios(tr) {
-            out.push(mk_cut(tr, src, at, bar / r, r));
-            at += bar / r;
-            src += bar;
-        }
-    }
-    let ratio = exit_ratio(tr);
-    out.push(mk_cut(tr, src, at, (src_to - src) / ratio, ratio));
-    out
-}
-
 fn bad(msg) { throw "whole_song: " + msg; }
 
+// What a strategy is told about the seam from track `a`, leaving its file at
+// `out_s`, into track `b` (docs in megamix/strategies.rhai). A's `src_s` is its
+// source second at the arrival, `exit_to_frame_s` after it leaves.
+fn join_input(k, a, b, out_s, exit_to_frame_s, before_s, facts, cfg) {
+    let ra = exit_ratio(a);
+    #{
+        a: #{ label: "seam " + (k + 1) + " (" + a.item.entry_id + ")", id: a.item.entry_id,
+              src_s: out_s + exit_to_frame_s * ra, ratio: ra, before_s: before_s },
+        b: #{ label: "seam " + (k + 1) + " (" + b.item.entry_id + ")", id: b.item.entry_id,
+              src_s: b.enter, ratio: b.ratio, before_s: 0.0 },
+        bar_s: bar_out(a), full_db: (), stems: false, seam: facts, cfg: cfg,
+    }
+}
+
+// Strategy `name` joining `a` (leaving at `out_s`) into `b`, placed in its own
+// frame: it is called once to learn how long after A's exit its arrival falls,
+// then with A read from there.
+fn join_at(name, k, a, b, out_s, before_s, facts, cfg) {
+    import "megamix/strategies" as strategies;
+    let first = strategies::join(name, join_input(k, a, b, out_s, 0.0, before_s, facts, cfg));
+    if first == () { return (); }
+    strategies::join(name, join_input(k, a, b, out_s, num(first.exit_to_frame_s), before_s, facts, cfg))
+}
+
+// Whether every layer of a join reads inside its file.
+fn reads_inside(joined, files) {
+    for l in joined.layers {
+        let src = num(l.src_start_s);
+        if src < 0.0 || src + num(l.out_len_s) * num(l.ratio ?? 1.0) > files[l.source] + 0.000001 { return false; }
+    }
+    true
+}
+
 // The checks on a set that the walk in `build` does not settle by construction:
-// the facts a song's row supplies (tempo, entry time, length) and the room the
-// last song has. The seam recipes, bars, ratios, rides and card times the walk
-// derives itself are not rechecked here; the renderer refuses a bad plan.
-fn validate_set(tracks, seams, end_s) {
+// the facts a song's row supplies (tempo, entry time, length), that the song
+// after each seam plays on its own for as long as the outgoing song's seam layers
+// sound over it, and the room the last song has.
+fn validate_set(tracks, seams, end_s, cfg) {
+    import "megamix/strategies" as strategies;
     for i in 0..tracks.len() {
         let t = tracks[i];
         let at = "tracks[" + i + "] (" + t.item.entry_id + ")";
@@ -163,16 +196,15 @@ fn validate_set(tracks, seams, end_s) {
         let seam = seams[k];
         let a = tracks[k];
         let b = tracks[k + 1];
-        if seam.recipe == "bass_swap" {
-            let at = "seams[" + k + "] (" + a.item.entry_id + " -> " + b.item.entry_id + ")";
-            let half = seam.bars / 2.0 * bar_out(a);
-            let b_stops_at = if k + 1 < seams.len() { seams[k + 1].out_s } else { end_s };
-            let b_alone = play_out(b, b_stops_at - b.enter);
-            if b_stops_at >= b.enter && b_alone + 0.000000001 < half {
-                bad(at + ": " + b.item.entry_id + " plays alone for " + b_alone + "s before "
-                    + (if k + 1 < seams.len() { "the next seam" } else { "the set ends" })
-                    + ", shorter than the " + half + "s tail of " + a.item.entry_id + " the bass swap lays over it");
-            }
+        let joined = join_at(seam.strategy, k, a, b, seam.out_s, play_out(a, seam.out_s - a.enter), seam.facts, cfg);
+        if joined == () { bad("seams[" + k + "]: " + seam.strategy + " cannot join " + a.item.entry_id + " -> " + b.item.entry_id); }
+        let tail = strategies::a_tail_s(joined, a.item.entry_id);
+        let b_stops_at = if k + 1 < seams.len() { seams[k + 1].out_s } else { end_s };
+        let b_alone = play_out(b, b_stops_at - b.enter);
+        if tail > 0.0 && b_stops_at >= b.enter && b_alone + 0.000000001 < tail {
+            bad("seams[" + k + "] (" + a.item.entry_id + " -> " + b.item.entry_id + "): " + b.item.entry_id + " plays alone for " + b_alone + "s before "
+                + (if k + 1 < seams.len() { "the next seam" } else { "the set ends" })
+                + ", shorter than the " + tail + "s tail of " + a.item.entry_id + " the " + seam.strategy + " lays over it");
         }
     }
     let last = tracks[tracks.len() - 1];
@@ -183,105 +215,46 @@ fn validate_set(tracks, seams, end_s) {
     }
 }
 
-// The audio layers and picture cuts of a set, and how long it lasts: A's body to
-// its seam, the recipe's overlap or ring-out, B from its entry, and the last song
-// to `end_s` with a closing fade.
-fn layout(tracks, seams, end_s) {
+// The audio layers and picture cuts of a set, and how long it lasts: each song's
+// body from its arrival to where its seam's strategy stops it, the strategy's own
+// layers, and the last song to `end_s` with a closing fade. The picture is cut
+// from the layers, one bar being the first song's.
+fn layout(tracks, seams, end_s, cfg) {
+    import "megamix/picture" as picture;
     let layers = [];
-    let cuts = [];
     let t = 0.0;
+    let open_fade = 0.0;
     for k in 0..seams.len() {
         let seam = seams[k];
         let a = tracks[k];
         let b = tracks[k + 1];
-        let ra = exit_ratio(a);
-        let pos = a.enter;
-        let bl = bar_out(a);
-        let p = seam.out_s;
-        let body = play_out(a, p - pos);
-        let tp = t + body;
-        let an = "seam " + (k + 1) + " (" + a.item.entry_id + ") ";
-        let bn = "seam " + (k + 1) + " (" + b.item.entry_id + ") ";
-        cuts.append(played_picture(a, t, p));
-        if seam.recipe == "bass_swap" {
-            let half = seam.bars / 2.0 * bl;
-            let swap = tp + half;
-            let rb = b.ratio;
-            let through = body + half;
-            let l = mk_layer(an + "body", a, pos, t, through, a.ratio);
-            l.ride = ride_of(a);
-            l.fades.push(fade("out", through - short_fade_s(), short_fade_s()));
-            layers.push(l);
-
-            l = mk_layer(an + "tail without bass", a, p + half * ra, swap, half, ra);
-            l.filters.push(#{ kind: "highpass", hz: bass_crossover_hz() });
-            if seam.sweep { l.filters.push(#{ kind: "lowpass", hz: sweep_ceiling_hz() }); }
-            l.fades.push(fade("in", 0.0, short_fade_s()));
-            l.fades.push(fade("out", half / 2.0, half / 2.0));
-            layers.push(l);
-
-            let bass_in = b.enter - half * rb;
-            l = mk_layer(bn + "entering without bass", b, bass_in, tp, half, rb);
-            l.filters.push(#{ kind: "highpass", hz: bass_crossover_hz() });
-            l.fades.push(fade("in", 0.0, min(bl, half)));
-            l.fades.push(fade("out", half - short_fade_s(), short_fade_s()));
-            layers.push(l);
-
-            // The picture cuts between the two songs once a bar, B's share of the
-            // bar growing as the swap goes on.
-            let beat = bl / 4.0;
-            let nbars = seam.bars / 2;
-            if nbars < 1 { nbars = 1; }
-            let tt = tp;
-            for bar in 0..nbars {
-                let nb = min(4 * (bar + 1) / (nbars + 1) + 1, 4);
-                let a_beats = 4 - nb;
-                if nb < 4 {
-                    cuts.push(mk_cut(a, p + bar * bl * ra, tt, a_beats * beat, ra));
-                }
-                cuts.push(mk_cut(b, bass_in + (bar * bl + a_beats * beat) * rb, tt + a_beats * beat, nb * beat, rb));
-                tt += bl;
-            }
-            t = swap;
-        } else if seam.recipe == "echo_out" {
-            let bar_before = body - bl;
-            let l = mk_layer(an + "body", a, pos, t, bar_before, a.ratio);
-            l.ride = ride_of(a);
-            l.fades.push(fade("out", bar_before - short_fade_s(), short_fade_s()));
-            layers.push(l);
-
-            l = mk_layer(an + "echo", a, p - bl * ra, tp - bl, 3.0 * bl, ra);
-            l.filters.push(#{ kind: "echo", in_gain: 0.8, out_gain: 0.7,
-                delay_ms: (bl / 4.0 * 0.75 * 1000.0).to_int().to_float(), decay: 0.55 });
-            l.fades.push(fade("in", 0.0, short_fade_s()));
-            l.fades.push(fade("out", bl, 2.0 * bl));
-            layers.push(l);
-            t = tp;
-        } else {
-            let l = mk_layer(an + "body", a, pos, t, body, a.ratio);
-            l.ride = ride_of(a);
-            l.fades.push(fade("out", body - cut_fade_s(), cut_fade_s()));
-            layers.push(l);
-            t = tp;
+        let body = play_out(a, seam.out_s - a.enter);
+        let joined = join_at(seam.strategy, k, a, b, seam.out_s, body, seam.facts, cfg);
+        let frame = t + body + num(joined.exit_to_frame_s);
+        let len = frame + num(joined.a_until_s) - t;
+        let l = mk_layer("seam " + (k + 1) + " (" + a.item.entry_id + ") body", a, a.enter, t, len, a.ratio);
+        l.ride = ride_of(a);
+        if open_fade > 0.0 { l.fades.push(fade("in", 0.0, open_fade)); }
+        l.fades.push(fade("out", len - num(joined.a_fade_s), num(joined.a_fade_s)));
+        layers.push(l);
+        for s in joined.layers {
+            let placed = s;
+            placed.out_start_s = frame + num(s.out_start_s);
+            layers.push(placed);
         }
+        open_fade = num(joined.b_fade_s);
+        t = frame + num(joined.b_from_s);
     }
     let last = tracks[tracks.len() - 1];
     let n = play_out(last, end_s - last.enter);
     let l = mk_layer("last song (" + last.item.entry_id + ")", last, last.enter, t, n, last.ratio);
     l.ride = ride_of(last);
+    if open_fade > 0.0 { l.fades.push(fade("in", 0.0, open_fade)); }
     l.fades.push(fade("out", n - last_fade_s(), last_fade_s()));
     layers.push(l);
-    cuts.append(played_picture(last, t, end_s));
-    cuts.sort(|x, y| if x.out_start_s < y.out_start_s { -1 } else if x.out_start_s > y.out_start_s { 1 } else { 0 });
-    #{ layers: layers, cuts: cuts, duration_s: t + n }
+    let duration_s = t + n;
+    #{ layers: layers, cuts: picture::cuts_of(layers, duration_s, file_bar(tracks[0].item), cfg), duration_s: duration_s }
 }
-
-fn conf(cfg, key, fallback) {
-    let v = cfg[key];
-    if v == () { fallback } else { v }
-}
-
-fn db(x) { 20.0 * (num(x) + 0.000000001).log() }
 
 fn fnv(text) {
     let h = 2166136261;
@@ -354,50 +327,6 @@ fn recent_entries(ctx, tail) {
     seen
 }
 
-// The recipe for the seam from `a` (playing at `ratio`, entering at `enter`) into
-// `b` (entering at `b_enter`), with the numbers behind the choice.
-fn choose(a, ratio, b, b_enter, cfg) {
-    let running = num(a.audio.bpm) * ratio;
-    let gap = (running - num(b.audio.bpm)).abs() / running;
-    let a_bar = bar_seconds(a);
-    let po = phrase_out(a, 0.0, 5.0 * a_bar);
-    let exit_e = 0.0;
-    for j in (po - 4)..po { exit_e += num(a.audio.bar_energy[j]) / 4.0; }
-    let b_bar = if conf(cfg, "entry", "landing") == "start" { 0 } else { b.audio.landing_bar };
-    let arrive_e = num(b.audio.bar_energy[b_bar]);
-    let peak = 0.0;
-    let i = 8;
-    while i < b.audio.bar_energy.len() {
-        if num(b.audio.bar_energy[i]) > peak { peak = num(b.audio.bar_energy[i]); }
-        i += 4;
-    }
-    let step = db(arrive_e) - db(exit_e);
-    let recipe = "bass_swap";
-    let bars = 4;
-    let sweep = false;
-    if gap > num(conf(cfg, "tempo_gap_pct", 8.0)) / 100.0
-        || num(a.audio.beat_confidence) < 1.5 || num(b.audio.beat_confidence) < 1.5 {
-        recipe = "echo_out";
-    } else if step > num(conf(cfg, "drop_step_db", 3.0)) {
-        recipe = "drop_mix";
-    } else if arrive_e >= 0.9 * peak {
-        bars = 2;
-        sweep = true;
-    }
-    if recipe == "bass_swap" {
-        // The swap brings B's bass in before its entry: it needs that much file.
-        let half = bars / 2.0 * (a_bar / ratio);
-        let rb = running / num(b.audio.bpm);
-        if b_enter < half * rb - 0.000001 {
-            recipe = if step > num(conf(cfg, "drop_step_db", 3.0)) { "drop_mix" } else { "echo_out" };
-        }
-    }
-    #{
-        recipe: recipe, bars: if recipe == "bass_swap" { bars } else { 0 }, sweep: recipe == "bass_swap" && sweep,
-        gap_pct: (gap * 1000.0).round() / 10.0, step_db: (step * 10.0).round() / 10.0, running_bpm: (running * 10.0).round() / 10.0,
-    }
-}
-
 fn cfg_dir_of(path) {
     let at = path.len() - 1;
     while at > 0 && path.sub_string(at, 1) != "/" { at -= 1; }
@@ -456,7 +385,23 @@ fn next_song(ctx, rest, running) {
     ranked[ctx.rng.int(0, n - 1)]
 }
 
+// Where track `cur` leaves its file for strategy `name`: its file's end for an
+// `exit: "end"` strategy, else the latest phrase boundary with the strategy's
+// room after it; () when the song cannot be left that way.
+fn exit_point(cur, name, joined, cfg) {
+    let a = cur.item;
+    let a_bar = bar_seconds(a);
+    let earliest = cur.enter + ride_src(cur) + min_body_bars() * a_bar;
+    if joined.exit == "end" {
+        let end = num(a.duration_ms) / 1000.0 - end_margin_s();
+        return if end > earliest { end } else { () };
+    }
+    let po = phrase_out(a, earliest, room_bars(name, joined) * a_bar);
+    if po == () { () } else { bar_time(a, po) }
+}
+
 fn build(ctx) {
+    import "megamix/strategies" as strategies;
     let cfg = ctx.config;
     if cfg.expr == () { throw "whole_song: config.expr (the pool's CEL) is required"; }
     if cfg.dir == () { throw "whole_song: config.dir (where plans and renders go) is required"; }
@@ -464,6 +409,8 @@ fn build(ctx) {
     if entry != "landing" && entry != "start" {
         throw "whole_song: config.entry must be \"landing\" or \"start\", got " + entry;
     }
+    let list = conf(cfg, "strategies", default_strategies());
+    strategies::validate(list, allowed(), "whole_song");
 
     let recent = recent_entries(ctx, conf(cfg, "tail", 12));
     let cands = [];
@@ -483,6 +430,8 @@ fn build(ctx) {
     // `layout` lays it out.
     let songs = [first];
     let tracks = [#{ item: first, enter: entry_of(first, cfg), ratio: 1.0, ride: 0, at: 0.0 }];
+    let files = #{};
+    files[first.entry_id] = num(first.duration_ms) / 1000.0;
     let seams = [];
     let notes = [];
     let t = 0.0;
@@ -509,48 +458,74 @@ fn build(ctx) {
             tracks[tracks.len() - 1].ride = fin.ride;
             break;
         }
-        let b = next_song(ctx, cands, num(a.audio.bpm) * ra);
+        let running = num(a.audio.bpm) * ra;
+        let b = next_song(ctx, cands, running);
         let b_enter = entry_of(b, cfg);
-        let pick = choose(a, ra, b, b_enter, cfg);
-        let room_bars = if pick.recipe == "bass_swap" { pick.bars + 1 } else if pick.recipe == "echo_out" { 2 } else { 4 };
-        let po = phrase_out(a, cur.enter + ride_src(cur) + min_body_bars() * a_bar, room_bars * a_bar);
-        if po == () {
-            // This song cannot be left from here; end the set on it.
+        files[b.entry_id] = num(b.duration_ms) / 1000.0;
+        let k = seams.len();
+        let facts = strategies::seam_facts(a, b, phrase_out(a, 0.0, 5.0 * a_bar),
+            if entry == "start" { 0 } else { b.audio.landing_bar }, running);
+        // Each listed strategy laid where it would leave A, to learn which fit.
+        let fits = #{};
+        let tried = #{};
+        for e in list {
+            if tried.contains(e.name) { continue; }
+            let b_ratio = if locks_tempo(e.name) { running / num(b.audio.bpm) } else { 1.0 };
+            let bt = #{ item: b, enter: b_enter, ratio: b_ratio, ride: 0, at: 0.0 };
+            let probe = join_at(e.name, k, cur, bt, cur.enter + 1e6, 1e9, facts, cfg);
+            let out_s = if probe == () { () } else { exit_point(cur, e.name, probe, cfg) };
+            let joined = if out_s == () { () } else { join_at(e.name, k, cur, bt, out_s, play_out(cur, out_s - cur.enter), facts, cfg) };
+            tried[e.name] = #{ out_s: out_s, joined: joined, b_ratio: b_ratio };
+            fits[e.name] = joined != () && reads_inside(joined, files);
+        }
+        facts.fits = fits;
+        let pick = strategies::draw(ctx, list, #{ a: a, b: b, seam: facts }, fits, "whole_song");
+        let chosen = tried[pick];
+        if chosen == () || !(fits[pick] ?? false) {
+            // `whole` drawn as the fallback, or nothing that can leave this song: end the set on it.
+            let bt = #{ item: b, enter: b_enter, ratio: 1.0, ride: 0, at: 0.0 };
+            let probe = join_at("whole", k, cur, bt, cur.enter + 1e6, 1e9, facts, cfg);
+            let out_s = exit_point(cur, "whole", probe, cfg);
+            chosen = if out_s == () { () } else { #{ out_s: out_s, b_ratio: 1.0,
+                joined: join_at("whole", k, cur, bt, out_s, play_out(cur, out_s - cur.enter), facts, cfg) } };
+        }
+        if chosen == () || chosen.joined == () {
             let fin = finish(cur, room);
             end_s = fin.end_s;
             tracks[tracks.len() - 1].ride = fin.ride;
             break;
         }
-        let out_s = bar_time(a, po);
-        let bl = a_bar / ra;
+        let joined = chosen.joined;
+        let out_s = chosen.out_s;
         let body = play_out(cur, out_s - cur.enter);
-        let half = pick.bars / 2.0 * bl;
-        let landed = t + body + (if pick.recipe == "bass_swap" { half } else { 0.0 });
-        let room_after = if pick.recipe == "bass_swap" && half > min_last_s() { half } else { min_last_s() };
+        let landed = t + body + num(joined.exit_to_frame_s) + num(joined.b_from_s);
+        let tail = strategies::a_tail_s(joined, a.entry_id);
+        let room_after = if tail > min_last_s() { tail } else { min_last_s() };
         if landed > gap_s - room_after {
             let fin = finish(cur, room);
             end_s = fin.end_s;
             tracks[tracks.len() - 1].ride = fin.ride;
             break;
         }
-        let b_ratio = if pick.recipe == "bass_swap" { num(a.audio.bpm) * ra / num(b.audio.bpm) } else { 1.0 };
-        let b_ride = if pick.recipe == "bass_swap" && (b_ratio - 1.0).abs() > 0.000001 { ride_bars_of(cfg) } else { 0 };
-        seams.push(#{ recipe: pick.recipe, out_s: out_s, bars: pick.bars, sweep: pick.sweep });
-        notes.push("seam " + seams.len() + " at " + (t + body) + "s: " + pick.recipe
-            + (if pick.recipe == "bass_swap" { " " + pick.bars + " bars" + (if pick.sweep { " sweep" } else { "" }) } else { "" })
-            + ", " + a.title + " (" + a.entry_id + ") out at source bar " + po + " -> " + b.title + " (" + b.entry_id + ") enters at "
-            + b_enter + "s, tempo gap " + pick.gap_pct + "%, energy step " + pick.step_db + " dB, running " + pick.running_bpm + " bpm\n");
+        let b_ratio = chosen.b_ratio;
+        let b_ride = if (b_ratio - 1.0).abs() > 0.000001 { ride_bars_of(cfg) } else { 0 };
+        seams.push(#{ strategy: pick, out_s: out_s, bars: joined.bars ?? 0, sweep: joined.sweep ?? false, facts: facts });
+        notes.push("seam " + seams.len() + " at " + (t + body) + "s: " + pick
+            + (if pick == "bass_swap" { " " + joined.bars + " bars" + (if joined.sweep { " sweep" } else { "" }) } else { "" })
+            + ", " + a.title + " (" + a.entry_id + ") out at " + out_s + "s -> " + b.title + " (" + b.entry_id + ") enters at "
+            + b_enter + "s, tempo gap " + facts.tempo_gap_pct + "%, energy step " + facts.energy_step_db + " dB, running " + facts.running_bpm + " bpm\n");
         songs.push(b);
         cands = without(cands, b.entry_id);
         tracks.push(#{ item: b, enter: b_enter, ratio: b_ratio, ride: b_ride, at: t + body });
         t = landed;
     }
-    validate_set(tracks, seams, end_s);
-    let lay = layout(tracks, seams, end_s);
+    validate_set(tracks, seams, end_s, cfg);
+    let lay = layout(tracks, seams, end_s, cfg);
     let set_s = lay.duration_s;
 
     let ids = "";
     for s in songs { ids += s.entry_id + "|"; }
+    for s in seams { ids += s.strategy + "|"; }
     let stem = "ch" + ctx.channel.number + "-set-" + fnv(ids + entry).to_hex();
     let fields = conf(cfg, "artist_field", "show");
     let sources = [];
@@ -569,6 +544,8 @@ fn build(ctx) {
         song_notes.push(#{ entry_id: it.entry_id, title: (it.title ?? "").to_string(), native_bpm: num(it.audio.bpm),
                            enter_s: tr.enter, ratio: tr.ratio, ride_bars: tr.ride, at_s: tr.at });
     }
+    let seam_notes = [];
+    for s in seams { seam_notes.push(#{ strategy: s.strategy, out_s: s.out_s, bars: s.bars, sweep: s.sweep }); }
     let plan = #{
         sources: sources,
         layers: lay.layers,
@@ -576,7 +553,7 @@ fn build(ctx) {
         duration_s: set_s,
         cards: cards,
         output: cfg.dir + "/" + stem + ".mp4",
-        notes: #{ entry: entry, end_s: end_s, songs: song_notes, seams: seams },
+        notes: #{ entry: entry, end_s: end_s, songs: song_notes, seams: seam_notes },
     };
     let plan_path = cfg.dir + "/" + stem + ".plan.json";
     write_file(ctx, plan_path, to_json(plan));
