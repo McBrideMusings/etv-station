@@ -166,7 +166,7 @@ impl Fixture {
                 "dir": self.work,
                 "ffmpeg": ffmpeg,
                 "floor": 2.5,
-                "blend": "vocal_over",
+                "strategies": [{ "name": "vocal_over" }],
                 "card_script": "overlays/hook_card.rhai",
             })),
             channel: ChannelInfo {
@@ -209,6 +209,13 @@ struct Notes {
     camelot: String,
     bar_seconds: f64,
     hooks: Vec<NoteHook>,
+    seams: Vec<NoteSeam>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NoteSeam {
+    strategy: String,
+    facts: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -561,7 +568,8 @@ fn assert_cuts_tile(plan: &Plan) {
     );
 }
 
-/// Seconds of picture showing a song with no vocal layer playing, sampled every
+/// Seconds of picture showing a song with no voice playing (a vocals or full
+/// layer), sampled every
 /// 10 ms: the number `.claude/skills/project/verify.md` § Verifying the megamix
 /// prints per chapter.
 fn unheard_on_screen_s(plan: &Plan) -> f64 {
@@ -575,7 +583,7 @@ fn unheard_on_screen_s(plan: &Plan) -> f64 {
         let heard = |src: &str| {
             plan.layers.iter().any(|l| {
                 l.source == src
-                    && l.stem == Stem::Vocals
+                    && matches!(l.stem, Stem::Vocals | Stem::Full)
                     && l.out_start_s <= t
                     && t < l.out_start_s + l.out_len_s
             })
@@ -588,40 +596,65 @@ fn unheard_on_screen_s(plan: &Plan) -> f64 {
     bad
 }
 
-/// The `vocal_over` module's `plan`, called directly with the two hooks the
-/// renderer's own layer tests pinned: `a` at 100 bpm landing at 30 s with 4
-/// bars, `b` at 120 bpm two semitones down with 6 bars, 2 of them its vocal
-/// over `a`, in a 120 bpm chapter.
-/// Every number below is the one those tests pinned, read in source seconds.
-#[test]
-fn vocal_over_puts_each_stem_where_the_renderer_used_to() {
+/// A hook's audio facts as `arrange` reads them: landing at 30 s on bar 12,
+/// long enough for every strategy, flat energy.
+fn hook_item(id: &str, bpm: f64) -> rhai::Dynamic {
+    rhai::serde::to_dynamic(json!({
+        "entry_id": id,
+        "duration_ms": 240_000,
+        "audio": { "bpm": bpm, "landing_bar": 12, "landing_bar_s": 30.0,
+                   "bar_energy": vec![0.5; 100] },
+    }))
+    .unwrap()
+}
+
+fn hook_song(id: &str, bpm: f64, semis: i64, bars: i64) -> rhai::Dynamic {
+    rhai::serde::to_dynamic(json!({
+        "entry_id": id, "landing_s": 30.0, "native_bpm": bpm, "bars": bars,
+        "ratio": 120.0 / bpm, "pitch": 2f64.powf(semis as f64 / 12.0),
+    }))
+    .unwrap()
+}
+
+/// megamix.rhai's `arrange` over `a` (100 bpm, 4 bars) and `b` (120 bpm, two
+/// semitones down, 6 bars) in a 120 bpm chapter, with one strategy listed so
+/// the draw needs no rng: the layers in order, as JSON.
+fn arranged(strategy: serde_json::Value) -> Vec<serde_json::Value> {
     let mut engine = rhai::Engine::new();
     // The host's limits (hooks.rs): the plugin nests deeper than rhai's default.
     engine.set_max_expr_depths(128, 64);
-    let ast = engine
-        .compile_file(plugin_path().with_file_name("megamix/vocal_over.rhai"))
+    let ast = engine.compile_file(plugin_path()).unwrap();
+    let drawn: rhai::Array = vec![hook_item("a", 100.0), hook_item("b", 120.0)];
+    let songs: rhai::Array = vec![
+        hook_song("a", 100.0, 0, 4),
+        hook_song("b", 120.0, -2, 6),
+    ];
+    let cfg = rhai::serde::to_dynamic(json!({ "strategies": [strategy] })).unwrap();
+    let out: rhai::Map = engine
+        .call_fn(
+            &mut rhai::Scope::new(),
+            &ast,
+            "arrange",
+            ((), cfg, drawn, songs, 2.0_f64),
+        )
         .unwrap();
-    let hook = |id: &str, bpm: f64, semis: i64, bars: i64| {
-        let mut m = Map::new();
-        m.insert("entry_id".into(), id.to_string().into());
-        m.insert("landing_s".into(), 30.0_f64.into());
-        m.insert("native_bpm".into(), bpm.into());
-        m.insert("bars".into(), bars.into());
-        m.insert("ratio".into(), (120.0 / bpm).into());
-        m.insert("pitch".into(), 2f64.powf(semis as f64 / 12.0).into());
-        rhai::Dynamic::from_map(m)
-    };
-    let hooks: rhai::Array = vec![hook("a", 100.0, 0, 4), hook("b", 120.0, -2, 6)];
-    let mut cfg = Map::new();
-    cfg.insert("bar_s".into(), 2.0_f64.into());
-    cfg.insert("region_bars".into(), 18_i64.into());
-    let out: rhai::Array = engine
-        .call_fn(&mut rhai::Scope::new(), &ast, "plan", (hooks, cfg))
-        .unwrap();
-    let layers: Vec<serde_json::Value> = out
+    out["layers"]
+        .clone()
+        .into_array()
+        .unwrap()
         .into_iter()
         .map(|d| rhai::serde::from_dynamic(&d).unwrap())
-        .collect();
+        .collect()
+}
+
+/// `arrange` with only `vocal_over` listed, over the two hooks the renderer's
+/// own layer tests pinned: `a` at 100 bpm landing at 30 s with 4 bars, `b` at
+/// 120 bpm two semitones down with 6 bars, 2 of them its vocal over `a`, in a
+/// 120 bpm chapter. Every number below is the one those tests pinned, read in
+/// source seconds.
+#[test]
+fn vocal_over_puts_each_stem_where_the_renderer_used_to() {
+    let layers = arranged(json!({ "name": "vocal_over" }));
     let row = |l: &serde_json::Value| {
         (
             l["name"].as_str().unwrap().to_string(),
@@ -693,6 +726,52 @@ fn vocal_over_puts_each_stem_where_the_renderer_used_to() {
     );
 }
 
+/// `arrange` with only `blend` listed, over the same two hooks: `a` has 8 s of
+/// its slot before the seam, so the crossfade takes 2 bars (half of it), 4 s,
+/// both full songs on equal-power curves at -15.2 dB, `b` arriving at full level
+/// as `a`'s fade ends on the seam at 8 s.
+#[test]
+fn blend_crossfades_the_full_songs_for_up_to_half_the_outgoing_slot() {
+    let layers = arranged(json!({ "name": "blend" }));
+    let row = |l: &serde_json::Value| {
+        (
+            l["name"].as_str().unwrap().to_string(),
+            l["stem"].as_str().unwrap().to_string(),
+            l["src_start_s"].as_f64().unwrap(),
+            l["out_start_s"].as_f64().unwrap(),
+            l["out_len_s"].as_f64().unwrap(),
+        )
+    };
+    let got: Vec<_> = layers.iter().map(row).collect();
+    let want = [
+        // a's body stops 10 ms into the fade's end window: 8 - 4 + 0.01.
+        ("hook 1 (a) vocals", "vocals", 30.0, 0.0, 4.01),
+        ("hook 1 (a) instrumental", "instrumental", 30.0, 0.0, 4.01),
+        // a as if still playing at 1.2x: 39.6 at the seam, 4 s earlier is 34.8.
+        ("hook 1 (a) fading out", "full", 34.8, 4.0, 4.0),
+        // b's 4 s before its landing at 30 s, at the chapter tempo.
+        ("hook 2 (b) fading in", "full", 26.0, 4.0, 4.01),
+        ("hook 2 (b) vocals", "vocals", 30.0, 8.0, 12.0),
+        ("hook 2 (b) instrumental", "instrumental", 30.0, 8.0, 12.0),
+    ];
+    assert_eq!(got.len(), want.len(), "{got:#?}");
+    for (g, w) in got.iter().zip(want) {
+        assert_eq!((g.0.as_str(), g.1.as_str()), (w.0, w.1));
+        for (x, y) in [(g.2, w.2), (g.3, w.3), (g.4, w.4)] {
+            assert!((x - y).abs() < 1e-9, "{g:?} vs {w:?}");
+        }
+    }
+    assert_eq!(layers[2]["level_db"], json!(-15.2));
+    assert_eq!(
+        layers[2]["fades"][1],
+        json!({"kind": "out", "start_s": 0.0, "len_s": 4.0, "curve": "equal_power"})
+    );
+    assert_eq!(
+        layers[3]["fades"][0],
+        json!({"kind": "in", "start_s": 0.0, "len_s": 4.0, "curve": "equal_power"})
+    );
+}
+
 /// `picture_runs`, called directly on hand-made layers in a 2-second bar: `a`
 /// plays instrumental at -20 dB for 16 s, `b` comes in at -10 dB from 4 s, and
 /// `c`'s vocal sings at -30 dB from 8 s to 12 s. With a 4-beat hold and a 3 dB
@@ -702,7 +781,9 @@ fn vocal_over_puts_each_stem_where_the_renderer_used_to() {
 fn the_picture_is_the_heard_vocal_else_the_loudest_song() {
     let mut engine = rhai::Engine::new();
     engine.set_max_expr_depths(128, 64);
-    let ast = engine.compile_file(plugin_path()).unwrap();
+    let ast = engine
+        .compile_file(plugin_path().with_file_name("megamix/picture.rhai"))
+        .unwrap();
     let layer = |src: &str, stem: &str, from: f64, len: f64, db: f64| {
         rhai::serde::to_dynamic(json!({
             "source": src, "stem": stem, "src_start_s": 100.0, "out_start_s": from,
@@ -752,14 +833,16 @@ fn the_picture_is_the_heard_vocal_else_the_loudest_song() {
     );
 }
 
-/// The same rule where the hold and the margin each keep `a` on screen: `b`
-/// arriving 10 dB louder at 1 s waits for the 4-beat hold to end at 2 s, and
-/// `b` arriving only 2 dB louder never takes the picture.
+/// The defaults, a one-bar hold and a 2 dB margin, each keeping `a` on screen:
+/// `b` arriving 10 dB louder at 1 s waits for the hold to end at 2 s, `b`
+/// exactly 2 dB louder never takes the picture, and 2.5 dB louder takes it.
 #[test]
 fn the_hold_and_the_margin_keep_the_song_on_screen() {
     let mut engine = rhai::Engine::new();
     engine.set_max_expr_depths(128, 64);
-    let ast = engine.compile_file(plugin_path()).unwrap();
+    let ast = engine
+        .compile_file(plugin_path().with_file_name("megamix/picture.rhai"))
+        .unwrap();
     let runs = |b_from: f64, b_db: f64| -> Vec<(String, i64, i64)> {
         let layer = |src: &str, from: f64, len: f64, db: f64| {
             rhai::serde::to_dynamic(json!({
@@ -772,15 +855,12 @@ fn the_hold_and_the_margin_keep_the_song_on_screen() {
             layer("a", 0.0, 16.0, -20.0),
             layer("b", b_from, 16.0 - b_from, b_db),
         ];
-        let mut cfg = Map::new();
-        cfg.insert("picture_hold_beats".into(), 4_i64.into());
-        cfg.insert("picture_margin_db".into(), 3.0_f64.into());
         let out: rhai::Array = engine
             .call_fn(
                 &mut rhai::Scope::new(),
                 &ast,
                 "picture_runs",
-                (layers, 16.0_f64, 2.0_f64, cfg),
+                (layers, 16.0_f64, 2.0_f64, Map::new()),
             )
             .unwrap();
         out.into_iter()
@@ -800,15 +880,84 @@ fn the_hold_and_the_margin_keep_the_song_on_screen() {
         [("a".to_string(), 0, 16), ("b".to_string(), 16, 128)]
     );
     assert_eq!(runs(4.0, -18.0), [("a".to_string(), 0, 128)]);
+    assert_eq!(
+        runs(4.0, -17.5),
+        [("a".to_string(), 0, 32), ("b".to_string(), 32, 128)]
+    );
 }
 
 #[test]
-fn a_fill_entry_without_a_blend_fails_naming_the_key() {
+fn a_fill_entry_without_strategies_fails_naming_the_key() {
     let f = Fixture::new();
     let mut input = f.input(600_000);
-    input.config.as_mut().unwrap()["blend"] = json!(null);
+    input.config.as_mut().unwrap()["strategies"] = json!(null);
     let err = build(&plugin_path(), &input).unwrap_err().to_string();
-    assert!(err.contains("config.blend"), "{err}");
+    assert!(err.contains("config.strategies"), "{err}");
+}
+
+#[test]
+fn an_unknown_strategy_fails_naming_it() {
+    let f = Fixture::new();
+    let mut input = f.input(600_000);
+    input.config.as_mut().unwrap()["strategies"] = json!([{ "name": "vocal_over" }, { "name": "scratch" }]);
+    let err = build(&plugin_path(), &input).unwrap_err().to_string();
+    assert!(err.contains("config.strategies[1]") && err.contains("scratch"), "{err}");
+}
+
+/// A chapter built with each strategy alone: every seam is that strategy where it
+/// fits the pair and `whole` where it does not, the renderer accepts the plan,
+/// the cuts tile it, and no song is on screen while its voice is not heard.
+#[test]
+fn every_strategy_builds_a_plan_whose_picture_shows_only_heard_songs() {
+    for name in ["vocal_over", "bass_swap", "echo_out", "drop_mix", "blend", "whole"] {
+        let f = Fixture::new();
+        let mut input = f.input(600_000);
+        input.config.as_mut().unwrap()["strategies"] = json!([{ "name": name }]);
+        build(&plugin_path(), &input).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (_, plan) = only_plan(&f);
+        let n = notes(&plan);
+        assert_eq!(n.seams.len(), n.hooks.len() - 1, "{name}");
+        for s in &n.seams {
+            let fits = s.facts["fits"][name] == json!(true);
+            let want = if fits { name } else { "whole" };
+            assert_eq!(s.strategy, want, "{name}: {s:?}");
+        }
+        assert!(
+            n.seams.iter().any(|s| s.strategy == name),
+            "{name} fits no seam of the fixture: {:?}",
+            n.seams
+        );
+        assert_cuts_tile(&plan);
+        assert_eq!(unheard_on_screen_s(&plan), 0.0, "{name}");
+    }
+}
+
+/// `when` reads the arriving song's facts: blend where it is 120 bpm or faster
+/// and fits, whole everywhere else.
+#[test]
+fn a_when_over_the_arriving_songs_tempo_picks_the_strategy_per_seam() {
+    let f = Fixture::new();
+    let mut input = f.input(600_000);
+    input.config.as_mut().unwrap()["strategies"] = json!([
+        { "name": "blend", "when": "b.audio.bpm >= 120.0" },
+        { "name": "whole", "when": "b.audio.bpm < 120.0" },
+    ]);
+    build(&plugin_path(), &input).unwrap();
+    let (_, plan) = only_plan(&f);
+    let n = notes(&plan);
+    let mut blended = 0;
+    for (i, s) in n.seams.iter().enumerate() {
+        let fast = n.hooks[i + 1].native_bpm >= 120.0;
+        let fits = s.facts["fits"]["blend"] == json!(true);
+        let want = if fast && fits { "blend" } else { "whole" };
+        assert_eq!(s.strategy, want, "seam {i} into {}: {s:?}", n.hooks[i + 1].entry_id);
+        blended += usize::from(want == "blend");
+    }
+    assert!(
+        blended > 0 && blended < n.seams.len(),
+        "the fixture has seams of both kinds: {:?}",
+        n.seams
+    );
 }
 
 #[test]

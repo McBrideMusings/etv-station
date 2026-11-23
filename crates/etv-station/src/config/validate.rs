@@ -1112,7 +1112,7 @@ fn validate_fill(
             )));
         }
         if let Some(when) = &entry.when {
-            cel::Program::compile(when)
+            crate::cel_expr::check(when)
                 .map_err(|e| bad(format!("{at}: `when` is not valid CEL: {e}")))?;
         }
         if let Some(script) = &entry.script {

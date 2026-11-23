@@ -10,6 +10,7 @@ pub mod bumper;
 pub mod calendar;
 pub mod cancel;
 pub mod catalog;
+pub mod cel_expr;
 pub mod channel_card;
 pub mod config;
 pub mod constrain;

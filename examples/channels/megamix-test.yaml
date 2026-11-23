@@ -41,6 +41,6 @@ rule:
           capabilities: [probe, catalog_read, exec, http]
           config:
             expr: 'item.library == "Music Videos"'
-            blend: vocal_over
+            strategies: [{ name: vocal_over }]
             card_script: ../overlays/hook_card.rhai
             dir: tmp/chapters

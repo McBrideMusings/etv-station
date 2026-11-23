@@ -695,7 +695,7 @@ Channels › Graphics plays those items through `etv-overlay watch --item`, one 
 
 ## Verifying the megamix (channel 103)
 
-A queued job, a `render.done` event and a chapter in state `rendered` or `aired` prove that the renderer ran. They say nothing about what the chapter plays. Before you call the megamix working, read the rendered chapters' plans and report two numbers for each one: how many seconds each song plays, and how many seconds the picture shows a song whose vocal is not in the mix. Then compare those numbers with what pierce asked for.
+A queued job, a `render.done` event and a chapter in state `rendered` or `aired` prove that the renderer ran. They say nothing about what the chapter plays. Before you call the megamix working, read the rendered chapters' plans and report two numbers for each one: how many seconds each song plays, and how many seconds the picture shows a song whose voice (a `vocals` or `full` layer) is not in the mix, and which strategy joined each seam. Then compare those numbers with what pierce asked for.
 
 ```sh
 tools/ui-get.sh /api/channels/103-megamix/chapters --prod > /private/tmp/claude/etv-station/chapters.json
@@ -707,17 +707,18 @@ for ch in json.load(open(sys.argv[1]))["chapters"]:
     if "notes" not in p: print(ch["name"][:22], ch["state"], "plan has no layers (older format, or none): render it again before judging"); continue
     bar = p["notes"]["bar_seconds"]
     per_song = [round(h["bars"] * bar, 1) for h in p["notes"]["hooks"]]
+    strategies = [s["strategy"] for s in p["notes"].get("seams", [])]
     bad, t = 0.0, 0.0
     while t < p["duration_s"]:
-        heard = {l["source"] for l in p["layers"] if l["stem"] == "vocals" and l["out_start_s"] <= t < l["out_start_s"] + l["out_len_s"]}
+        heard = {l["source"] for l in p["layers"] if l.get("stem", "full") in ("vocals", "full") and l["out_start_s"] <= t < l["out_start_s"] + l["out_len_s"]}
         shown = [k["source"] for k in p["cuts"] if k["out_start_s"] <= t < k["out_start_s"] + k["out_len_s"]]
         if shown and shown[0] not in heard: bad += 0.01
         t += 0.01
-    print(ch["name"][:22], ch["state"], "per-song s", per_song, "unheard song on screen %.1f of %.1f s" % (bad, p["duration_s"]))
+    print(ch["name"][:22], ch["state"], "per-song s", per_song, "seams", strategies, "unheard song on screen %.1f of %.1f s" % (bad, p["duration_s"]))
 EOF
 ```
 
-Each line names a chapter, its seconds per song and its seconds of picture showing a song you cannot hear. If any number contradicts what pierce asked for (song length, cut rate, the on-screen song's own audio being heard), the megamix is not working, however clean the queue looks. Say so, and give the numbers.
+Each line names a chapter, its seconds per song, its seams' strategies and its seconds of picture showing a song you cannot hear. If any number contradicts what pierce asked for (song length, cut rate, the on-screen song's own audio being heard), the megamix is not working, however clean the queue looks. Say so, and give the numbers.
 
 ## Verifying the block card and pool labels
 
@@ -1210,7 +1211,7 @@ Run it through the swarm lock in a worker (`swarm heavy -- tools/verify-reburst.
 
 ## Verifying the megamix plugin
 
-Run `cargo test -p etv-station --test megamix_plugin` (seven fixture songs; stub `ffmpeg`), `cargo test -p etv-station --lib chapters_list` and `cargo test -p etv-station --lib a_chapter_prints_the_seam_notes`. The first expects a plan of 3 to 5 hooks with every semitone shift within 3, every landing within Camelot distance 1 of the chapter key, every hook starting on an 8-bar boundary, `mv-unsteady` and `mv-weak` never chosen, and one pending segment named `chapter:<stem>|…` whose `plan` is the plan file written beside the render. `cargo test -p etv-render --test queue_sync` proves the sidecar queues a scheduled plan, supersedes a job the schedule replaced, leaves running and failed jobs, and skips an unreadable plan until it changes.
+Run `cargo test -p etv-station --test megamix_plugin --test whole_song_plugin` (fixture songs; stub `ffmpeg`) and `cargo test -p etv-station --lib cel_expr`, `cargo test -p etv-station --lib chapters_list` and `cargo test -p etv-station --lib a_chapter_prints_the_seam_notes`. The first expects a plan of 3 to 5 hooks with every semitone shift within 3, every landing within Camelot distance 1 of the chapter key, every hook starting on an 8-bar boundary, `mv-unsteady` and `mv-weak` never chosen, and one pending segment named `chapter:<stem>|…` whose `plan` is the plan file written beside the render; a chapter built with each strategy alone (`every_strategy_builds_a_plan_whose_picture_shows_only_heard_songs`) whose cuts tile the plan with 0 s of picture on a song whose voice is not heard; and a `when` over the arriving song's tempo choosing the strategy per seam. `cargo test -p etv-render --test queue_sync` proves the sidecar queues a scheduled plan, supersedes a job the schedule replaced, leaves running and failed jobs, and skips an unreadable plan until it changes.
 
 Against a dev stack whose plex-db-ex explorer (`PLEXDB_EX_URL`) holds audio facts for the music videos (`STATION_CONFIG=examples/station-megamix.yaml`, inside `swarm heavy`): `curl -s localhost:$ETV_PORT/api/channels/megamix-test/chapters | jq '.chapters[] | {name, state, notes}'` lists each chapter with its seam lines, and `etv-station --config examples/station-megamix.yaml --audit megamix-test --audit-out -` prints a `render:` line per hook. Two rendered chapters back to back with no gap is a listen at the TV; it needs Demucs, PyTorch and librubberband (`/api/health/renders` shows `detected`) and has not been run in a worktree.
 

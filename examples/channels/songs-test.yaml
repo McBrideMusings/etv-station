@@ -1,8 +1,8 @@
 number: 58
 name: songs-test
 # A music-video channel that fills every gap up to the next 12-minute line with a
-# set of whole songs (whole_song.rhai), each pair joined by a seam recipe chosen by
-# rule. `entry: landing` starts every song at its landing bar; `entry: start` plays
+# set of whole songs (whole_song.rhai), each pair joined by a mixing strategy drawn
+# from the plugin's default list (docs/schema.md § Mixing strategies). `entry: landing` starts every song at its landing bar; `entry: start` plays
 # it whole. A set airs its stand-in until the renderer's file lands.
 # Needs audio facts from the plex-db-ex explorer (`PLEXDB_EX_URL`,
 # harvested by plex-db-ex's `harvest-audio`) and the renderer named in

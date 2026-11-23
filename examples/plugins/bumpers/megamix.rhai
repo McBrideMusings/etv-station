@@ -21,14 +21,14 @@
 //   hooks_min/max:   hooks per chapter, default 3 and 5
 //   tempo_band_pct:  a cluster's tempo window around its seed, +/- percent, default 4
 //   max_shift:       most semitones a hook may move, default 3
-//   blend:           the arrangement module, plugins/megamix/<blend>.rhai, that lays
-//                    the chapter's audio layers (required); its own keys are in its file
+//   strategies:      how each seam joins two hooks (required): [{ name, weight, when }],
+//                    drawn per seam; names, keys and seam facts in megamix/strategies.rhai
 //   picture_margin_db:  dB another song must be louder than the one on screen to
-//                    take the picture, default 3
+//                    take the picture, default 2
 //   picture_hold_beats: fewest beats a song keeps the picture before a louder one
-//                    takes it, and the length of a b-roll window, default 16
-//   broll_share:     share of each song's picture windows given to Frame index shots
-//                    when `phrase` finds them, default 0.5
+//                    takes it, default 4
+//   broll_share:     share of each song's four-bar picture windows given to Frame
+//                    index shots when `phrase` finds them, default 0.5
 //   tail:           recent chapters whose hooks are not reused, default 12
 //   seeds:           most cluster seeds tried per build, default 60
 //   artist_field:    item field holding the artist for the card, default "show"; an
@@ -61,9 +61,10 @@
 // generation pass, before they reach the ledger.
 //
 // A hook is 16 bars, or 8 when 16 bars would pass 40 seconds. Hooks start on
-// 8-bar boundaries of the chapter. This script picks the songs; the `blend`
-// module lays their audio; this script then cuts the picture from that audio:
-// the song whose vocal is heard, else the loudest song heard.
+// 8-bar boundaries of the chapter. This script picks the songs and lays each
+// one's body (vocal and instrumental stems); the strategy drawn for each seam
+// (megamix/strategies.rhai) lays the join; megamix/picture.rhai cuts the
+// picture from the result.
 fn hooks() { ["bumper"] }
 fn capabilities() { ["probe", "catalog_read", "exec", "http"] }
 
@@ -480,114 +481,19 @@ fn song_records(chosen, chapter_bpm, chapter, shape, cfg) {
     songs
 }
 
-// The level layer `l` plays at chapter second `t` in dB, or () when it is silent
-// there. Every fade is read as a linear ramp, whatever its curve.
-fn layer_db(l, t) {
-    let at = t - num(l.out_start_s);
-    if at < 0.0 || at >= num(l.out_len_s) { return (); }
-    let g = 1.0;
-    for f in l.fades ?? [] {
-        let from = num(f.start_s);
-        let len = num(f.len_s);
-        if f.kind == "in" {
-            if at < from { return (); }
-            if len > 0.0 && at < from + len { g *= (at - from) / len; }
-        } else {
-            if at >= from + len { return (); }
-            if len > 0.0 && at > from { g *= 1.0 - (at - from) / len; }
-        }
-    }
-    if g <= 0.0 { return (); }
-    num(l.level_db ?? 0.0) + num(l.gain_db ?? 0.0) + 20.0 * g.log()
-}
+// Sixteenths in a b-roll window: four bars.
+fn broll_window() { 64 }
 
-// Every song audible at chapter second `t`: source -> #{ db, vocal, offset,
-// ratio }. `db` sums its layers' power; `vocal` is true when one of them is its
-// vocal stem; `offset` and `ratio` place its picture where its loudest layer
-// reads, source second = offset + t * ratio.
-fn heard_at(layers, t) {
-    let heard = #{};
-    for l in layers {
-        let db = layer_db(l, t);
-        if db == () { continue; }
-        let ratio = num(l.ratio ?? 1.0);
-        let offset = num(l.src_start_s) - num(l.out_start_s) * ratio;
-        let s = heard[l.source];
-        if s == () {
-            s = #{ power: 0.0, vocal: false, top_db: db, offset: offset, ratio: ratio };
-        } else if db > s.top_db {
-            s.top_db = db;
-            s.offset = offset;
-            s.ratio = ratio;
-        }
-        s.power += 10.0 ** (db / 10.0);
-        if l.stem == "vocals" { s.vocal = true; }
-        heard[l.source] = s;
-    }
-    for id in heard.keys() {
-        let s = heard[id];
-        s.db = 10.0 * s.power.log();
-        heard[id] = s;
-    }
-    heard
-}
-
-// The picture, derived from the audio in sixteenths of a bar: the song whose
-// vocal is heard, else the loudest song heard. The song on screen keeps the
-// picture until it stops being a candidate, or until another candidate is
-// `picture_margin_db` louder after `picture_hold_beats` beats on screen.
-// Returns runs #{ source, from, to, offset, ratio } in sixteenths, covering the
-// chapter end to end; a silent sixteenth keeps the song before it.
-fn picture_runs(layers, duration_s, bar_s, cfg) {
-    let margin = num(conf(cfg, "picture_margin_db", 3.0));
-    let hold = conf(cfg, "picture_hold_beats", 16) * 4;
-    let step = bar_s / 16.0;
-    let n = (duration_s / step).round().to_int();
-    let runs = [];
-    let cur = ();
-    let since = 0;
-    for k in 0..n {
-        let heard = heard_at(layers, (k + 0.5) * step);
-        let pool = #{};
-        for id in heard.keys() { if heard[id].vocal { pool[id] = heard[id]; } }
-        if pool.len() == 0 { pool = heard; }
-        let best = ();
-        for id in pool.keys() {
-            if best == () || pool[id].db > pool[best].db { best = id; }
-        }
-        if best != () {
-            if cur == () || !pool.contains(cur) {
-                cur = best;
-                since = k;
-            } else if best != cur && k - since >= hold && pool[best].db > pool[cur].db + margin {
-                cur = best;
-                since = k;
-            }
-        }
-        if cur == () { continue; }
-        let at = if pool.contains(cur) { pool[cur] } else { () };
-        let last = runs.len() - 1;
-        let same = last >= 0 && runs[last].source == cur
-            && (at == () || ((runs[last].offset - at.offset).abs() < 1e-6 && (runs[last].ratio - at.ratio).abs() < 1e-9));
-        if same {
-            runs[last].to = k + 1;
-        } else {
-            runs.push(#{ source: cur, from: if runs.len() == 0 { 0 } else { k }, to: k + 1, offset: at.offset, ratio: at.ratio });
-        }
-    }
-    runs
-}
-
-// The `picture_hold_beats`-long windows of each run that show a Frame index shot
-// instead, as [run index, window index] pairs: `broll_share` of each run's
-// whole windows, spread evenly, its first window always its own picture.
+// The four-bar windows of each run that show a Frame index shot instead, as
+// [run index, window index] pairs: `broll_share` of each run's whole windows,
+// spread evenly, its first window always its own picture.
 fn broll_windows(runs, cfg) {
     let share = num(conf(cfg, "broll_share", 0.5));
-    let hold = conf(cfg, "picture_hold_beats", 16) * 4;
+    let window = broll_window();
     let picked = [];
-    if share <= 0.0 || hold <= 0 { return picked; }
+    if share <= 0.0 { return picked; }
     for r in 0..runs.len() {
-        let windows = (runs[r].to - runs[r].from) / hold;
+        let windows = (runs[r].to - runs[r].from) / window;
         for j in 0..windows {
             if ((j + 1) * share).floor() > (j * share).floor() { picked.push([r, j]); }
         }
@@ -595,48 +501,9 @@ fn broll_windows(runs, cfg) {
     picked
 }
 
-// The picture cuts: each run is its song read where its audio plays, broken by a
-// Frame index shot in each b-roll window that drew one.
-fn picture_cuts(runs, windows, shots, bar_s, cfg) {
-    let step = bar_s / 16.0;
-    let hold = conf(cfg, "picture_hold_beats", 16) * 4;
-    let shot_at = #{};
-    for i in 0..windows.len() {
-        if i >= shots.len() { break; }
-        shot_at["" + windows[i][0] + "/" + windows[i][1]] = shots[i];
-    }
-    let cuts = [];
-    for r in 0..runs.len() {
-        let run = runs[r];
-        let whole = if hold > 0 { (run.to - run.from) / hold } else { 0 };
-        let own_from = run.from;
-        for j in 0..whole {
-            let shot = shot_at["" + r + "/" + j];
-            if shot == () { continue; }
-            let at = run.from + j * hold;
-            if at > own_from { cuts.push(own_cut(run, own_from, at, step)); }
-            cuts.push(#{ source: shot.entry_id, src_start_s: shot.in_s, out_start_s: at * step, out_len_s: hold * step });
-            own_from = at + hold;
-        }
-        if run.to > own_from { cuts.push(own_cut(run, own_from, run.to, step)); }
-    }
-    cuts
-}
-
-// Run `run`'s song from sixteenth `from` to `to`, read where its audio plays.
-fn own_cut(run, from, to, step) {
-    #{
-        source: run.source,
-        src_start_s: run.offset + from * step * run.ratio,
-        out_start_s: from * step,
-        out_len_s: (to - from) * step,
-        ratio: run.ratio,
-    }
-}
-
 // The plan the renderer reads (docs/schema.md § Render plan), and the card copy.
-// The chapter's tempo, key, blend and songs go in `notes`, for the audit.
-fn plan_for(ctx, cfg, chosen, songs, layers, cuts, shots, chapter_bpm, chapter, shape, stem) {
+// The chapter's tempo, key, songs and seams go in `notes`, for the audit.
+fn plan_for(ctx, cfg, chosen, songs, seams, layers, cuts, shots, chapter_bpm, chapter, shape, stem) {
     let bar_s = 240.0 / chapter_bpm;
     let dir = cfg.dir;
     let cards = [];
@@ -684,8 +551,8 @@ fn plan_for(ctx, cfg, chosen, songs, layers, cuts, shots, chapter_bpm, chapter, 
             key: chapter.audio.key + " " + chapter.audio.scale,
             camelot: chapter.audio.camelot,
             bar_seconds: bar_s,
-            blend: cfg.blend,
             hooks: songs,
+            seams: seams,
         },
     }
 }
@@ -705,7 +572,8 @@ fn seam_notes(plan, chosen, bars) {
         let item = chosen[i];
         let shift = if h.semitones > 0 { "+" + h.semitones } else { h.semitones.to_string() };
         text += "seam " + (i + 1) + " at bar " + (i * bars) + ": " + item.title + " (" + h.entry_id + ") lands source bar "
-            + item.audio.landing_bar + " at " + h.landing_s + "s, " + shift + " semitones, " + h.bars + " bars, blend " + plan.notes.blend + "\n";
+            + item.audio.landing_bar + " at " + h.landing_s + "s, " + shift + " semitones, " + h.bars + " bars, "
+            + (if i == 0 { "opens the chapter" } else { "joined by " + plan.notes.seams[i - 1].strategy }) + "\n";
     }
     let hooked = #{};
     for h in hooks { hooked[h.entry_id] = true; }
@@ -750,13 +618,135 @@ fn idle(ctx, why) {
     t
 }
 
+// The vocal and instrumental of song `h` from output second `from` to `until`,
+// at the chapter tempo and key, read where its hook places them.
+fn body_layers(label, h, slot_s, from, until, fade_in, fade_out, bar_s) {
+    import "megamix/strategies" as strategies;
+    let len = until - from;
+    if len <= 0.0 { return []; }
+    let native_bar = 240.0 / h.native_bpm;
+    let src = h.landing_s + (from - slot_s) / bar_s * native_bar;
+    let out = [];
+    for part in [["vocals", -20.0, 0.02], ["instrumental", -17.0, fade_in]] {
+        out.push(#{
+            name: label + part[0],
+            source: h.entry_id,
+            stem: part[0],
+            src_start_s: src,
+            out_start_s: from,
+            out_len_s: len,
+            ratio: h.ratio,
+            pitch: h.pitch,
+            level_db: part[1],
+            fades: strategies::edge_fades(len, part[2], fade_out),
+        });
+    }
+    out
+}
+
+// Whether every layer of `j`'s join reads inside its file, a stem inside the
+// song's separated span, and leaves A at least a bar of its own body.
+fn join_fits(joined, j, files, spans, frame_s) {
+    if joined == () { return false; }
+    if -num(joined.a_until_s) > num(j.a.before_s) - j.bar_s { return false; }
+    for l in joined.layers {
+        let src = num(l.src_start_s);
+        let end = src + num(l.out_len_s) * num(l.ratio ?? 1.0);
+        if src < 0.0 || end > files[l.source] { return false; }
+        if l.stem == "vocals" || l.stem == "instrumental" {
+            let span = spans[l.source];
+            if src < span.start_s - 1e-6 || end > span.start_s + span.len_s + 1e-6 { return false; }
+        }
+        if frame_s + num(l.out_start_s) < -1e-6 { return false; }
+    }
+    true
+}
+
+// The chapter's audio: each hook's body in its slot, and each seam laid by the
+// strategy `config.strategies` draws for it. Returns #{ layers, seams }, a seam
+// being #{ at_bar, strategy, facts }.
+fn arrange(ctx, cfg, drawn, songs, bar_s) {
+    import "megamix/strategies" as strategies;
+    let files = #{};
+    let spans = #{};
+    for i in 0..drawn.len() {
+        let item = drawn[i];
+        let a = item.audio;
+        let native_bar = 240.0 / num(a.bpm);
+        files[item.entry_id] = num(item.duration_ms) / 1000.0;
+        let start = num(a.landing_bar_s) - lead_bars() * native_bar;
+        if start < 0.0 { start = 0.0; }
+        spans[item.entry_id] = #{ start_s: start, len_s: num(a.landing_bar_s) + region_bars() * native_bar - start };
+    }
+    let slots = [0.0];
+    for h in songs { slots.push(slots[slots.len() - 1] + h.bars * bar_s); }
+    let joins = [()];
+    let seams = [];
+    let b_from = 0.0;
+    for i in 1..songs.len() {
+        let a = songs[i - 1];
+        let b = songs[i];
+        let frame_s = slots[i];
+        let song = |h, n, src, before| #{ label: "hook " + (n + 1) + " (" + h.entry_id + ")", id: h.entry_id,
+            src_s: src, ratio: h.ratio, pitch: h.pitch, before_s: before };
+        let j = #{
+            a: song.call(a, i - 1, a.landing_s + a.bars * 240.0 / a.native_bpm, a.bars * bar_s - b_from),
+            b: song.call(b, i, b.landing_s, b.bars * bar_s),
+            // -15.2 dB is the power sum of a body's -20 dB vocal and -17 dB instrumental.
+            bar_s: bar_s, full_db: -15.2, stems: true, cfg: cfg,
+        };
+        let facts = strategies::seam_facts(drawn[i - 1], drawn[i], drawn[i - 1].audio.landing_bar + a.bars,
+            drawn[i].audio.landing_bar, num(drawn[i - 1].audio.bpm));
+        let fits = #{};
+        let laid = #{};
+        for e in cfg.strategies {
+            if laid.contains(e.name) { continue; }
+            let j2 = j;
+            j2.seam = facts;
+            let got = strategies::join(e.name, j2);
+            laid[e.name] = got;
+            fits[e.name] = join_fits(got, j, files, spans, frame_s);
+        }
+        facts.fits = fits;
+        let pick = strategies::draw(ctx, cfg.strategies, #{ a: drawn[i - 1], b: drawn[i], seam: facts }, fits, "megamix");
+        let joined = if laid.contains(pick) && fits[pick] { laid[pick] } else { j.seam = facts; strategies::join(pick, j) };
+        joins.push(joined);
+        seams.push(#{ at_bar: (slots[i] / bar_s).round().to_int(), strategy: pick, facts: facts });
+        b_from = num(joined.b_from_s);
+    }
+    let layers = [];
+    for i in 0..songs.len() {
+        let h = songs[i];
+        let slot_s = slots[i];
+        let from = slot_s;
+        let fade_in = 1.0;
+        if i > 0 {
+            let joined = joins[i];
+            for l in joined.layers {
+                let placed = l;
+                placed.out_start_s = slot_s + num(l.out_start_s);
+                layers.push(placed);
+            }
+            from = slot_s + num(joined.b_from_s);
+            fade_in = if joined.b_fade_s > 0.0 { joined.b_fade_s } else { 0.02 };
+        }
+        let until = slot_s + h.bars * bar_s;
+        let fade_out = 0.02;
+        if i + 1 < songs.len() {
+            until += num(joins[i + 1].a_until_s);
+            fade_out = num(joins[i + 1].a_fade_s);
+        }
+        layers.append(body_layers("hook " + (i + 1) + " (" + h.entry_id + ") ", h, slot_s, from, until, fade_in, fade_out, bar_s));
+    }
+    #{ layers: layers, seams: seams }
+}
+
 fn build(ctx) {
     let cfg = ctx.config;
     if cfg.expr == () { throw "megamix: config.expr (the pool's CEL) is required"; }
     if cfg.dir == () { throw "megamix: config.dir (where plans and renders go) is required"; }
-    if type_of(cfg.blend) != "string" || cfg.blend == "" || cfg.blend.contains("/") || cfg.blend.contains(".") {
-        throw "megamix: config.blend must name a module in plugins/megamix/, e.g. \"vocal_over\"";
-    }
+    import "megamix/strategies" as strategies;
+    strategies::validate(cfg.strategies, strategies::names(), "megamix");
     let ranker = conf(cfg, "ranker", "rule");
     if ranker != "rule" && ranker != "model" {
         throw "megamix: config.ranker must be \"rule\" or \"model\", got " + ranker;
@@ -819,21 +809,19 @@ fn build(ctx) {
     for item in pool { if !hooked.contains(item.entry_id) { others.push(item); } }
 
     let songs = song_records(drawn, chapter_bpm, seed, fitted, cfg);
-    let arrange_cfg = cfg;
-    arrange_cfg.bar_s = bar_s;
-    arrange_cfg.region_bars = region_bars();
-    import "megamix/" + cfg.blend as arrangement;
-    let layers = arrangement::plan(songs, arrange_cfg);
-    let runs = picture_runs(layers, drawn.len() * fitted.bars * bar_s, bar_s, cfg);
+    let arranged = arrange(ctx, cfg, drawn, songs, bar_s);
+    let layers = arranged.layers;
+    let duration_s = drawn.len() * fitted.bars * bar_s;
+    import "megamix/picture" as picture;
+    let runs = picture::picture_runs(layers, duration_s, bar_s, cfg);
     let windows = broll_windows(runs, cfg);
-    let hold_s = conf(cfg, "picture_hold_beats", 16) * bar_s / 4.0;
-    let shots = broll_shots(ctx, cfg, others, windows.len(), hold_s);
-    let cuts = picture_cuts(runs, windows, shots, bar_s, cfg);
-    // The blend and the shots are part of the stem: a different mix or picture is a different render.
-    ids += cfg.blend + "|";
+    let shots = broll_shots(ctx, cfg, others, windows.len(), broll_window() * bar_s / 16.0);
+    let cuts = picture::picture_cuts(runs, windows, shots, bar_s, broll_window(), duration_s);
+    // The seams' strategies and the shots are part of the stem: a different mix or picture is a different render.
+    for s in arranged.seams { ids += s.strategy + "|"; }
     for s in shots { ids += s.entry_id + "@" + s.in_s + "|"; }
     let stem = "ch" + ctx.channel.number + "-" + hex(fnv(ids + chapter_bpm));
-    let plan = plan_for(ctx, cfg, drawn, songs, layers, cuts, shots, chapter_bpm, seed, fitted, stem);
+    let plan = plan_for(ctx, cfg, drawn, songs, arranged.seams, layers, cuts, shots, chapter_bpm, seed, fitted, stem);
     let plan_path = cfg.dir + "/" + stem + ".plan.json";
     write_file(ctx, plan_path, to_json(plan));
     let notes = seam_notes(plan, drawn, fitted.bars);
@@ -846,7 +834,8 @@ fn build(ctx) {
     log("megamix: chapter=" + names + " bpm=" + chapter_bpm + " key=" + plan.notes.key + " bars=" + (fitted.hooks * fitted.bars));
     for i in 0..plan.notes.hooks.len() {
         let h = plan.notes.hooks[i];
-        log("megamix: seam=" + i + " bar=" + (i * fitted.bars) + " entry=" + h.entry_id + " landing_s=" + h.landing_s + " semitones=" + h.semitones);
+        log("megamix: seam=" + i + " bar=" + (i * fitted.bars) + " entry=" + h.entry_id + " landing_s=" + h.landing_s + " semitones=" + h.semitones
+            + " strategy=" + (if i == 0 { "opens" } else { plan.notes.seams[i - 1].strategy }));
     }
 
     let t = timeline();

@@ -731,26 +731,18 @@ fn when_holds(
         m.and_then(|m| rhai::serde::from_dynamic(&Dynamic::from_map(m.clone())).ok())
             .unwrap_or(serde_json::Value::Null)
     };
-    let result = (|| -> Result<bool, String> {
-        let program = cel::Program::compile(src).map_err(|e| e.to_string())?;
-        let mut ctx = cel::Context::default();
-        let vars = [
-            ("next", json(next)),
-            ("prev", json(prev)),
-            ("gap_ms", json!(gap_ms)),
+    let result = crate::cel_expr::eval_bool(
+        src,
+        vec![
+            ("next".into(), json(next)),
+            ("prev".into(), json(prev)),
+            ("gap_ms".into(), json!(gap_ms)),
             (
-                "channel",
+                "channel".into(),
                 json!({"name": env.channel.name, "number": env.channel.number}),
             ),
-        ];
-        for (name, value) in vars {
-            ctx.add_variable(name, value).map_err(|e| e.to_string())?;
-        }
-        match program.execute(&ctx).map_err(|e| e.to_string())? {
-            cel::Value::Bool(b) => Ok(b),
-            other => Err(format!("yielded {other:?}, not a bool")),
-        }
-    })();
+        ],
+    );
     match result {
         Ok(b) => b,
         Err(e) => {
