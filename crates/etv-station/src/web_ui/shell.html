@@ -187,7 +187,9 @@
   .blk { cursor: pointer; }
   /* Schedule as an agenda: a heading per day with airings, one row per airing, the frontier as a labelled divider. */
   .layoutctl { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; }
-  .ag-now { border: 1px solid var(--line); border-left: 6px solid rgba(0, 0, 0, .35); background: var(--pc, var(--panel)); color: #111; padding: 8px 12px; margin: 0 0 10px; }
+  .ag-now { border: 1px solid var(--line); border-left: 6px solid rgba(0, 0, 0, .35); background: var(--pc, var(--panel)); color: #111; padding: 8px 12px; margin: 0 0 10px; cursor: pointer; }
+  .ag-now:focus-visible, .ag-now:hover { outline: 2px solid var(--fg); outline-offset: -2px; }
+  .ag-now.sel { outline: 3px solid var(--fg); outline-offset: -3px; }
   .ag-now .k { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #333; }
   .ag-now .t { font-size: 17px; font-weight: 700; margin: 2px 0 4px; }
   .ag-now .meta, .ag-now .nx { font-size: 12px; color: #333; font-variant-numeric: tabular-nums; }
@@ -1596,12 +1598,12 @@ function render(d) {
 
 // Re-render the Schedule under a new address, keeping the selected airing selected; with no new address (a rollover) the reader's scroll stays put too.
 function rerenderSchedule(hash) {
-  const open = document.querySelector('.blk.sel, .agrow.sel, .airrow.sel');
+  const open = document.querySelector('.blk.sel, .agrow.sel, .airrow.sel, .ag-now.sel');
   const index = open && open.dataset.index;
   const keep = hash ? null : { page: window.scrollY, wrap: $('gwrap') ? $('gwrap').scrollTop : 0 };
   if (hash) history.replaceState(null, '', hash);
   render(current);
-  const again = index != null && document.querySelector(`.agrow[data-index="${index}"], .blk[tabindex][data-index="${index}"]`);
+  const again = index != null && document.querySelector(`.agrow[data-index="${index}"], .blk[tabindex][data-index="${index}"], .ag-now[data-index="${index}"]`);
   if (again) selectAiring(again);
   if (keep) { if ($('gwrap')) $('gwrap').scrollTop = keep.wrap; window.scrollTo(0, keep.page); }
 }
@@ -1615,7 +1617,7 @@ function nowCard(d, colors, now) {
   const left = Math.round((end - now) / 60);
   const pct = Math.round(((now - onNow.start) / onNow.duration_secs) * 100);
   const next = d.airings.filter((a) => a.start >= end).sort((x, y) => x.start - y.start)[0];
-  return `<div class="ag-now" style="--pc:${colors[onNow.pool] || '#ccc'}"><div class="k">On now · ends ${esc(timeOf(end, tz))}</div>
+  return `<div class="ag-now" style="--pc:${colors[onNow.pool] || '#ccc'}" tabindex="0" role="button" data-index="${onNow.index}" aria-label="${esc(`On now · ${headline(onNow)} · ${onNow.pool}`)}"><div class="k">On now · ends ${esc(timeOf(end, tz))}</div>
     <div class="t">${esc(headline(onNow))}</div>
     <div class="meta">${esc(onNow.pool)} · ${left} min left</div>
     <div class="bar"><span style="width:${pct}%"></span></div>
@@ -2072,7 +2074,7 @@ function closePanel() {
   const p = $('insp');
   if (p && p.dataset.empty) { p.classList.add('idle'); p.innerHTML = INSP_EMPTY; $('rail').scrollTop = 0; }
   else if (p) { p.hidden = true; p.innerHTML = ''; }
-  document.querySelectorAll('.blk.sel, .pgm.sel, .airrow.sel, .agrow.sel').forEach((b) => b.classList.remove('sel'));
+  document.querySelectorAll('.blk.sel, .pgm.sel, .airrow.sel, .agrow.sel, .ag-now.sel').forEach((b) => b.classList.remove('sel'));
 }
 
 function showPanel(html) {
@@ -2089,7 +2091,7 @@ function showPanel(html) {
 // Narrow, the panel is a sheet over the bottom half: bring the selected block into the top half.
 function revealSelected() {
   if (!narrow.matches) return;
-  const sel = document.querySelector('.blk.sel, .airrow.sel, .pgm.sel, .agrow.sel');
+  const sel = document.querySelector('.blk.sel, .airrow.sel, .pgm.sel, .agrow.sel, .ag-now.sel');
   if (!sel) return;
   sel.scrollIntoView({ block: 'nearest' });
   const limit = window.innerHeight * 0.5 - 8;
@@ -2101,7 +2103,7 @@ function revealSelected() {
 document.addEventListener('click', (e) => {
   const sheet = $('insp');
   if (!narrow.matches || !sheet || sheet.hidden || sheet.classList.contains('idle') || !e.target.closest) return;
-  if (e.target.closest('#insp, .blk, .airrow, .agrow, .pgm, #tip')) return;
+  if (e.target.closest('#insp, .blk, .airrow, .agrow, .ag-now, .pgm, #tip')) return;
   closePanel();
 });
 // A swipe down on the sheet, from its top edge of scroll, closes it.
@@ -2124,14 +2126,14 @@ function selectAiring(el) {
   if (!current || !el || el.dataset.index == null) return;
   const a = current.airings[Number(el.dataset.index)];
   showPanel(airingPanel(current, a, poolColor(current)));
-  document.querySelectorAll(`.blk[data-index="${a.index}"], .airrow[data-index="${a.index}"], .agrow[data-index="${a.index}"]`).forEach((x) => x.classList.add('sel'));
+  document.querySelectorAll(`.blk[data-index="${a.index}"], .airrow[data-index="${a.index}"], .agrow[data-index="${a.index}"], .ag-now[data-index="${a.index}"]`).forEach((x) => x.classList.add('sel'));
   revealSelected();
   if (a.kind === 'movie' || a.kind === 'episode') loadArr(a.id);
   else $('arrbox').remove();
 }
-document.addEventListener('click', (e) => { const r = e.target.closest('.airrow, .agrow'); if (r) selectAiring(r); });
+document.addEventListener('click', (e) => { const r = e.target.closest('.airrow, .agrow, .ag-now'); if (r) selectAiring(r); });
 document.addEventListener('keydown', (e) => {
-  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.airrow, .agrow')) { e.preventDefault(); selectAiring(e.target.closest('.airrow, .agrow')); }
+  if ((e.key === 'Enter' || e.key === ' ') && e.target.closest && e.target.closest('.airrow, .agrow, .ag-now')) { e.preventDefault(); selectAiring(e.target.closest('.airrow, .agrow, .ag-now')); }
 });
 document.addEventListener('click', (e) => { const b = e.target.closest('.blk'); if (b) selectAiring(b); });
 document.addEventListener('keydown', (e) => {
