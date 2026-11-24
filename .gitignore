@@ -52,6 +52,9 @@ examples/overlays/scripts/
 # by nobody.
 deploy/appdata/*
 !deploy/appdata/README.md
+# Logo source art (variants, .acorn and .svg files) the guide logos in deploy/appdata
+# were picked from: personal and large, so it stays on this machine.
+deploy/logo-sources/
 # ...except the shared Rhai overlay scripts. Those are not personal the way a
 # channel's pools are — they are generic graphics code (the Now/Next snipe, the
 # title chyron) that happens to live where the deploy reads from, and leaving
