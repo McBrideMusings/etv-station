@@ -76,8 +76,10 @@ impl Explorer {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match result {
             Ok(resp) => {
-                let text = resp
-                    .into_string()
+                // Not `into_string`, which refuses a body over 10 MB: a page of 1000
+                // titles with audio facts is 14.8 MB on prod.
+                let mut text = Vec::new();
+                std::io::Read::read_to_end(&mut resp.into_reader(), &mut text)
                     .map_err(|e| format!("GET {path}: reading the body: {e}"))?;
                 tracing::debug!(
                     event = "plexdb_ex.get",
@@ -87,7 +89,7 @@ impl Explorer {
                     elapsed_ms,
                     "read the plex-db-ex explorer"
                 );
-                serde_json::from_str(&text)
+                serde_json::from_slice(&text)
                     .map(Some)
                     .map_err(|e| format!("GET {path}: not JSON: {e}"))
             }
@@ -367,6 +369,24 @@ mod tests {
         let facts = ex.audio_facts_for(&ids).unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts["fs:00001"], json!({"bpm": 120.0}));
+    }
+
+    #[test]
+    fn walk_reads_a_page_over_ten_megabytes() {
+        let mut store = fake::Store::default();
+        for i in 0..12 {
+            let id = format!("fs:{i:02}");
+            store.item(&id, "movie");
+            store.audio(&id, json!({ "beats": "x".repeat(1 << 20) }));
+        }
+        let server = fake::serve(store);
+        let ex = Explorer::new(&server.url);
+        let mut with = 0;
+        ex.items("audio_facts", |row| {
+            with += usize::from(!row["audio_facts"].is_null());
+        })
+        .unwrap();
+        assert_eq!(with, 12);
     }
 
     #[test]
