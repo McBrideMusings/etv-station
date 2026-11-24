@@ -146,6 +146,8 @@
 
   /* Guide first: a column per day, time running down, block height = running time. Side rail holds the numbers. */
   .layout { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 16px; }
+  .schedcol { display: flex; flex-direction: column; min-height: 0; }
+  .schedcol > .gwrap { flex: 1; }
   .gwrap { overflow: auto; min-height: 0; border: 1px solid var(--line); }
   /* max-content, so the sticky hour gutter's containing block spans every day column, not just the viewport. */
   .wk { display: grid; grid-template-columns: 44px repeat(var(--n), var(--col)); width: max-content; }
@@ -185,11 +187,12 @@
   .blk { cursor: pointer; }
   /* Schedule as an agenda: a heading per day with airings, one row per airing, the frontier as a labelled divider. */
   .layoutctl { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; }
-  .ag-now { border: 1px solid var(--line); border-left: 3px solid var(--fg); background: var(--panel); padding: 8px 12px; margin: 0 0 10px; }
-  .ag-now .k { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+  .ag-now { border: 1px solid var(--line); border-left: 6px solid rgba(0, 0, 0, .35); background: var(--pc, var(--panel)); color: #111; padding: 8px 12px; margin: 0 0 10px; }
+  .ag-now .k { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: #333; }
   .ag-now .t { font-size: 17px; font-weight: 700; margin: 2px 0 4px; }
-  .ag-now .bar { height: 4px; background: var(--track); margin: 6px 0; }
-  .ag-now .bar span { display: block; height: 100%; background: var(--fg); }
+  .ag-now .meta, .ag-now .nx { font-size: 12px; color: #333; font-variant-numeric: tabular-nums; }
+  .ag-now .bar { height: 4px; background: rgba(0, 0, 0, .15); margin: 6px 0; }
+  .ag-now .bar span { display: block; height: 100%; background: #111; }
   .ag-day { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; border-bottom: 2px solid var(--fg); font-weight: 700; padding: 12px 4px 4px; }
   .ag-day .n { font-weight: 400; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .agrow { display: grid; grid-template-columns: 78px minmax(0, 1fr) auto; gap: 2px 12px; align-items: baseline; padding: 8px 4px; border-bottom: 1px solid var(--line); cursor: pointer;
@@ -492,7 +495,7 @@ let current = null;   // the last channel review payload
 let lineup = null;    // GET /api/lineup's channels, once loaded
 let loadSeq = 0;  // a newer load() supersedes an older one still polling
 
-// The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|blocks|bumpers|preview|graphics}?project=Nd`,
+// The view lives in the hash, using the API's own nouns: `#/channels/{key}/{schedule|blocks|bumpers|preview|graphics}?project=Nd&layout=grid&history=1`,
 // `#/channels/{key}/pools?draft=ID`, `#/edit/{key}`, `#/guide`, `#/health`. A key holding a `/` (an examples/ channel) is percent-encoded.
 function parseRoute() {
   const [path, qs] = location.hash.replace(/^#/, '').split('?');
@@ -506,6 +509,7 @@ function parseRoute() {
     project: ['1d', '3d', '7d', '14d'].includes(q.get('project')) ? q.get('project') : null,
     draft: q.get('draft'),
     layout: q.get('layout') === 'grid' ? 'grid' : 'agenda',
+    history: q.get('history') === '1',
   };
 }
 // With a draft open the Schedule projects 3 days unless the address names a length: a draft re-simulation is slow.
@@ -514,9 +518,10 @@ function routeWithDraftWindow(r) {
   return r;
 }
 function editHash(channel) { return channel ? `#/edit/${encodeURIComponent(channel)}` : '#/edit'; }
-function channelHash(channel, view, project, draft, layout) {
+function channelHash(channel, view, project, draft, layout, history) {
   const q = [];
   if (layout === 'grid' && (!view || view === 'schedule')) q.push('layout=grid');
+  if (history && (!view || view === 'schedule')) q.push('history=1');
   if (project && view !== 'pools') q.push(`project=${project}`);
   if (draft && !['blocks', 'bumpers', 'preview'].includes(view)) q.push(`draft=${encodeURIComponent(draft)}`);
   return `#/channels/${encodeURIComponent(channel)}/${view || 'schedule'}${q.length ? `?${q.join('&')}` : ''}`;
@@ -705,7 +710,7 @@ function drawSwitcher(r) {
   const q = $('chSearch').value.trim().toLowerCase();
   const rows = lineup.filter((c) => !q || `${c.number ?? ''} ${c.display_name || ''} ${c.channel}`.toLowerCase().includes(q));
   $('chCount').textContent = q ? `${rows.length} of ${lineup.length} channels` : `${lineup.length} channels, in station.yaml order`;
-  $('chList').innerHTML = rows.map((c) => `<a data-key="${esc(c.channel)}" class="${c.error ? 'broken' : ''}" href="${channelHash(c.channel, r.view, r.project, null, r.layout)}"${c.channel === r.channel ? ' aria-current="page"' : ''}><span class="n">${esc(c.number ?? '—')}</span><span class="nm">${esc(c.display_name || c.channel)}</span></a>`).join('');
+  $('chList').innerHTML = rows.map((c) => `<a data-key="${esc(c.channel)}" class="${c.error ? 'broken' : ''}" href="${channelHash(c.channel, r.view, r.project, null, r.layout, r.history)}"${c.channel === r.channel ? ' aria-current="page"' : ''}><span class="n">${esc(c.number ?? '—')}</span><span class="nm">${esc(c.display_name || c.channel)}</span></a>`).join('');
 }
 function openSwitcher() {
   if (!lineup) return;
@@ -756,7 +761,7 @@ function markRoute(r) {
   const project = r.project;
   $('projCtl').hidden = r.view !== 'schedule';
   for (const a of $('lineup').querySelectorAll('a')) {
-    a.href = r.tab === 'edit' ? editHash(a.dataset.key) : channelHash(a.dataset.key, r.view, project, null, r.layout);   // a draft belongs to one channel, so the rail drops it
+    a.href = r.tab === 'edit' ? editHash(a.dataset.key) : channelHash(a.dataset.key, r.view, project, null, r.layout, r.history);   // a draft belongs to one channel, so the rail drops it
     if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
   $('lineupSelect').value = r.channel;
@@ -768,7 +773,7 @@ function markRoute(r) {
     return;
   }
   for (const [id, view] of [['subSchedule', 'schedule'], ['subBlocks', 'blocks'], ['subBumpers', 'bumpers'], ['subPreview', 'preview'], ['subPools', 'pools'], ['subGraphics', 'graphics']]) {
-    $(id).href = channelHash(r.channel, view, project, r.draft, r.layout);
+    $(id).href = channelHash(r.channel, view, project, r.draft, r.layout, r.history);
     if (r.view === view) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
   const cur = lineup.find((c) => c.channel === r.channel);
@@ -1532,27 +1537,38 @@ function render(d) {
     <span><span class="pin">1</span>tune-in sample (Preview)</span></div>`);
 
   // 2. Guide, with the rail beside it
-  const grid = parseRoute().layout === 'grid';
+  const route = parseRoute();
+  const grid = route.layout === 'grid';
+  const hist = route.history;
+  const now = Math.floor(Date.now() / 1000);
+  // From now: the list and grid open on the next airing, with what is on now in the card above; History: the whole span, aired airings included.
+  const shown = hist ? d : { ...d, airings: d.airings.filter((a) => a.start > now) };
   html.push(`<div class="layoutctl"><span class="seg" role="group" aria-label="Schedule layout" id="layoutBtns">
     <button type="button" data-layout="agenda" aria-pressed="${!grid}">Agenda</button>
-    <button type="button" data-layout="grid" aria-pressed="${grid}">Grid</button></span></div>`);
-  html.push(`<div class="layout"><div class="gwrap${grid ? '' : ' agendawrap'}" id="gwrap">${grid ? '<div class="wk" id="guide"></div>' : '<div class="agenda" id="agenda"></div>'}</div><aside class="rail" id="rail"><section class="insp idle" id="insp" data-empty="1">${INSP_EMPTY}</section>`);
+    <button type="button" data-layout="grid" aria-pressed="${grid}">Grid</button></span>
+    <span class="seg" role="group" aria-label="Schedule span" id="historyBtns">
+    <button type="button" data-history="0" aria-pressed="${!hist}">From now</button>
+    <button type="button" data-history="1" aria-pressed="${hist}">History</button></span></div>`);
+  html.push(`<div class="layout"><div class="schedcol">${nowCard(d, colors, now)}<div class="gwrap${grid ? '' : ' agendawrap'}" id="gwrap">${grid ? '<div class="wk" id="guide"></div>' : '<div class="agenda" id="agenda"></div>'}</div></div><aside class="rail" id="rail"><section class="insp idle" id="insp" data-empty="1">${INSP_EMPTY}</section>`);
 
   html.push('</aside></div>');
 
   $('report').innerHTML = html.join('');
-  if (grid) renderGuide(d, colors); else renderAgenda(d, colors);
+  if (!shown.airings.length && d.airings.length) $('gwrap').innerHTML = '<div class="muted" style="padding:12px">Nothing left to air in this span. History shows what aired.</div>';
+  else if (grid) renderGuide(shown, colors); else renderAgenda(shown, colors);
   for (const b of $('layoutBtns').querySelectorAll('button')) {
     b.addEventListener('click', () => {
       const r = parseRoute();
-      const open = document.querySelector('.blk.sel, .agrow.sel, .airrow.sel');
-      const index = open && open.dataset.index;
-      history.replaceState(null, '', channelHash(r.channel, 'schedule', r.project, r.draft, b.dataset.layout));
-      render(current);
-      const again = index != null && document.querySelector(`.agrow[data-index="${index}"], .blk[tabindex][data-index="${index}"]`);
-      if (again) selectAiring(again);
+      rerenderSchedule(channelHash(r.channel, 'schedule', r.project, r.draft, b.dataset.layout, r.history));
     });
   }
+  for (const b of $('historyBtns').querySelectorAll('button')) {
+    b.addEventListener('click', () => {
+      const r = parseRoute();
+      rerenderSchedule(channelHash(r.channel, 'schedule', r.project, r.draft, r.layout, b.dataset.history === '1'));
+    });
+  }
+  scheduleRollover(d, now);
   const mast = document.querySelector('.mast');
   const tg = $('mastToggle');
   const setDetails = (open) => {
@@ -1569,12 +1585,58 @@ function render(d) {
   $('patternBtn').addEventListener('click', () => { location.hash = channelHash(d.channel, 'blocks', parseRoute().project); });
   const ppm = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ppm'));
   // The hour label is centred on its line, so land 10px above the line: the whole label clears the sticky day header.
-  if (grid) {
+  if (grid && $('guide')) {
     const g = $('guide');
     const h0 = Number(g.dataset.h0 || 0);
+    const first = !hist && shown.airings.length && g.querySelector(`.blk[data-index="${shown.airings.reduce((x, y) => (y.start < x.start ? y : x)).index}"]`);
     const open = Math.min(Math.max(GUIDE_OPEN_HOUR, h0), h0 + Number(g.style.getPropertyValue('--gmin') || 1440) / 60 - 1);
-    $('gwrap').scrollTop = open > h0 ? (open - h0) * 60 * ppm - 10 : 0;
+    $('gwrap').scrollTop = first ? Math.max(0, first.offsetTop - 10) : open > h0 ? (open - h0) * 60 * ppm - 10 : 0;
   }
+}
+
+// Re-render the Schedule under a new address, keeping the selected airing selected; with no new address (a rollover) the reader's scroll stays put too.
+function rerenderSchedule(hash) {
+  const open = document.querySelector('.blk.sel, .agrow.sel, .airrow.sel');
+  const index = open && open.dataset.index;
+  const keep = hash ? null : { page: window.scrollY, wrap: $('gwrap') ? $('gwrap').scrollTop : 0 };
+  if (hash) history.replaceState(null, '', hash);
+  render(current);
+  const again = index != null && document.querySelector(`.agrow[data-index="${index}"], .blk[tabindex][data-index="${index}"]`);
+  if (again) selectAiring(again);
+  if (keep) { if ($('gwrap')) $('gwrap').scrollTop = keep.wrap; window.scrollTo(0, keep.page); }
+}
+
+// The card above the Schedule: the airing on now, in its pool's colour, with what follows it.
+function nowCard(d, colors, now) {
+  const onNow = d.airings.find((a) => a.start <= now && now < a.start + a.duration_secs);
+  if (!onNow) return '';
+  const tz = d.tz;
+  const end = onNow.start + onNow.duration_secs;
+  const left = Math.round((end - now) / 60);
+  const pct = Math.round(((now - onNow.start) / onNow.duration_secs) * 100);
+  const next = d.airings.filter((a) => a.start >= end).sort((x, y) => x.start - y.start)[0];
+  return `<div class="ag-now" style="--pc:${colors[onNow.pool] || '#ccc'}"><div class="k">On now · ends ${esc(timeOf(end, tz))}</div>
+    <div class="t">${esc(headline(onNow))}</div>
+    <div class="meta">${esc(onNow.pool)} · ${left} min left</div>
+    <div class="bar"><span style="width:${pct}%"></span></div>
+    ${next ? `<div class="nx">Up next · ${esc(timeOf(next.start, tz))} · <b>${esc(headline(next))}</b> · ${esc(next.pool)}</div>` : ''}</div>`;
+}
+
+// When the airing on now ends (or the next one starts), the Schedule re-renders so the card and the first row move on with the clock.
+let rolloverTimer = null;
+function scheduleRollover(d, now) {
+  clearTimeout(rolloverTimer);
+  let at = Infinity;
+  for (const a of d.airings) {
+    const end = a.start + a.duration_secs;
+    if (a.start > now) at = Math.min(at, a.start);
+    else if (end > now) at = Math.min(at, end);
+  }
+  if (at === Infinity) return;
+  rolloverTimer = setTimeout(() => {
+    const r = parseRoute();
+    if (current === d && r.tab === 'channels' && r.view === 'schedule' && r.channel === d.channel) rerenderSchedule(null);
+  }, (at - now) * 1000 + 500);
 }
 
 // The channel's blocks in one line: what the masthead stub shows, in full on hover.
@@ -2165,18 +2227,6 @@ function renderAgenda(d, colors) {
   const changedAt = new Set(d.diff ? d.diff.changed_airings.map((c) => c.index) : []);
   const out = [];
   if (!d.airings.length) return;   // the masthead's notice says "No published playout for this channel yet."
-  const now = Math.floor(Date.now() / 1000);
-  const onNow = d.airings.find((a) => a.start <= now && now < a.start + a.duration_secs);
-  if (onNow) {
-    const left = Math.round((onNow.start + onNow.duration_secs - now) / 60);
-    const pct = Math.round(((now - onNow.start) / onNow.duration_secs) * 100);
-    const next = d.airings.filter((a) => a.start >= onNow.start + onNow.duration_secs).sort((x, y) => x.start - y.start)[0];
-    out.push(`<div class="ag-now"><div class="k">On now · ends ${esc(timeOf(onNow.start + onNow.duration_secs, tz))}</div>
-      <div class="t">${esc(headline(onNow))}</div>
-      <div class="meta"><span class="swatch" style="background:${colors[onNow.pool] || '#ccc'}"></span> ${esc(onNow.pool)} · ${left} min left</div>
-      <div class="bar"><span style="width:${pct}%"></span></div>
-      ${next ? `<div class="muted">Up next · ${esc(timeOf(next.start, tz))} · <b>${esc(headline(next))}</b> · ${esc(next.pool)}</div>` : ''}</div>`);
-  }
   const dur = (secs) => { const m = Math.round(secs / 60); return m >= 60 ? `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m` : `${m} min`; };
   let frontierDrawn = d.frontier == null;
   const frontierRow = () => `<div class="ag-frontier"><span class="swatch fl"></span>Published playout ends · ${esc(dayOf(d.frontier, tz))} ${esc(timeOf(d.frontier, tz))}</div>`;
