@@ -732,6 +732,30 @@ fn no_exploration_slot_ever_gets_an_ineligible_title() {
     }
 }
 
+/// Over 50 candidates the script walks `/items` rather than asking per title,
+/// and the walk asks only for the `keywords` namespace it reads: a walk with
+/// every namespace moved the whole store's enrichment on each pick.
+#[test]
+fn a_walk_over_many_candidates_reads_only_the_keywords_namespace() {
+    let scorer = large_scorer(60, 0);
+    assert!(!scorer.pick("movies", 7, 5, None).is_empty());
+    let hits = scorer.server.hits.lock().unwrap().clone();
+    let walks: Vec<&String> = hits
+        .iter()
+        .filter(|h| h.starts_with("/items?") && h.contains("include=enrichment"))
+        .collect();
+    assert!(
+        !walks.is_empty(),
+        "60 candidates must walk /items: {hits:?}"
+    );
+    assert!(
+        walks
+            .iter()
+            .all(|h| h.contains("include=enrichment&namespace=keywords")),
+        "every walk page must ask only for keywords: {walks:?}"
+    );
+}
+
 /// Acceptance criterion: with `exploration_fraction: 0.2`, roughly one slot
 /// in five comes from the seeded random pick rather than from rank. Counted
 /// directly off `metadata.source` rather than by diffing against a
