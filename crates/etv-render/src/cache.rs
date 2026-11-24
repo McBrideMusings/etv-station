@@ -5,7 +5,9 @@
 //! renders in air-time order, oldest first. Only a render that has finished
 //! airing is removed: one that has not aired yet is needed, and one with no air
 //! time is never removed, since nothing says it is safe. A render is also
-//! protected from thirty minutes before it airs until it has finished.
+//! protected from thirty minutes before it airs until it has finished, and for
+//! as long after as the schedule still airs its file: a segment can loop it, or
+//! air it again.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -14,7 +16,7 @@ use std::time::Duration;
 
 use time::OffsetDateTime;
 
-use crate::queue::{JobState, Queue, Status};
+use crate::queue::{AirsUntil, JobState, Queue, Status};
 use crate::settings::Settings;
 
 /// How long before air a render is off limits to eviction.
@@ -61,23 +63,25 @@ fn stem_dirs(settings: &Settings) -> Vec<String> {
     out
 }
 
-/// Whether `job` may not be removed at `now`.
-pub fn protected(job: &JobState, now: OffsetDateTime) -> bool {
+/// Whether `job` may not be removed at `now`. `last_airing` is when the
+/// schedule last stops airing the job's file, if it airs it at all.
+pub fn protected(job: &JobState, last_airing: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
     match job.air_at {
         None => true,
         Some(air) => {
             let from = air - time::Duration::try_from(PROTECT_BEFORE_AIR).expect("30 minutes fits");
-            let until = air + time::Duration::seconds_f64(job.duration_s);
+            let first = air + time::Duration::seconds_f64(job.duration_s);
+            let until = last_airing.map_or(first, |last| last.max(first));
             now >= from && now < until
         }
     }
 }
 
 /// Whether `job`'s render has finished airing at `now`. A job with no air time has not.
-fn has_aired(job: &JobState, now: OffsetDateTime) -> bool {
+fn has_aired(job: &JobState, last_airing: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
     match job.air_at {
         None => false,
-        Some(air) => !protected(job, now) && now >= air,
+        Some(air) => !protected(job, last_airing, now) && now >= air,
     }
 }
 
@@ -100,10 +104,14 @@ fn output_size(job: &JobState) -> u64 {
 }
 
 /// Bring the cache under `cap_bytes`, returning the ids of the renders removed.
+/// `airs_until` is the schedule's last airing of each file; `None` when the
+/// schedule has not been read, and then no render is removed, since any of
+/// them may still be on air.
 pub fn enforce_cap(
     queue: &Queue,
     settings: &Settings,
     cap_bytes: u64,
+    airs_until: Option<&AirsUntil>,
     now: OffsetDateTime,
 ) -> Vec<String> {
     let jobs = queue.list();
@@ -151,9 +159,20 @@ pub fn enforce_cap(
 
     let mut jobs = jobs;
     let mut evicted = Vec::new();
-    let mut candidates: Vec<usize> = (0..jobs.len())
-        .filter(|&i| jobs[i].status == Status::Done && has_aired(&jobs[i], now))
-        .collect();
+    let mut candidates: Vec<usize> = match airs_until {
+        None => Vec::new(),
+        Some(airs) => (0..jobs.len())
+            .filter(|&i| jobs[i].status == Status::Done)
+            .filter(|&i| {
+                let last = airs.get(&jobs[i].output).copied();
+                let aired = has_aired(&jobs[i], last, now);
+                if !aired && has_aired(&jobs[i], None, now) {
+                    tracing::info!(event = "render.evict_held", id = %jobs[i].id, output = %jobs[i].output.display(), airs_until = ?last, "kept a render past its first airing: the schedule still airs its file");
+                }
+                aired
+            })
+            .collect(),
+    };
     candidates.sort_by_key(|&i| jobs[i].air_at);
     for i in candidates {
         if total <= cap_bytes {
@@ -175,7 +194,7 @@ pub fn enforce_cap(
             event = "render.over_cap",
             total_bytes = total,
             cap_bytes,
-            "cache is over its cap and nothing more can be evicted: the rest is queued, running, within 30 minutes of air, or has no air time"
+            "cache is over its cap and nothing more can be evicted: the rest is queued, running, within 30 minutes of air, still airing in the schedule, or has no air time; or the schedule has not been read yet"
         );
     }
     evicted

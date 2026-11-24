@@ -3450,7 +3450,7 @@ The queue follows the schedule. A plugin airs a chapter as a `pending(<render>, 
 
 A failed job is not retried by this pass. The sidecar renders queued plans one at a time, the one airing soonest first; ties go to the plan queued first. A queued plan whose air time comes before the sidecar reaches it is marked `missed` and never rendered, since the station swaps a chapter in only before it airs. Each job has a state file, `<id>.state.json`, with `status` (`queued`, `running`, `done`, `failed`, `evicted`, `missed`, `superseded`), the failing layer and last error, and timings. Each pass that queues or supersedes anything logs `render.sync` with its counts. The sidecar exits 78 when it has no `--config`, or no queue or cache is configured, and the entrypoint then leaves it off.
 
-The cache is capped. When rendered chapters and stems pass the cap, chapters whose air time has passed are removed oldest first; a chapter within 30 minutes of air, or with no air time, is never removed.
+The cache is capped. When rendered chapters and stems pass the cap, chapters whose air time has passed are removed oldest first; a chapter within 30 minutes of air, or with no air time, is never removed. Neither is one any published playout item still airs, as its played file or its pending file, until that item finishes: a looping segment replays the file, and a later item can air it again. Nothing is removed until the sidecar has read the schedule once. A render kept past its first airing logs `render.evict_held` with the item's finish as `airs_until`.
 
 ### Station config
 

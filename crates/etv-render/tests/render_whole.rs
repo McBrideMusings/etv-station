@@ -174,7 +174,7 @@ fn a_queued_plan_renders_through_the_sidecar_path() {
         .enqueue(&plan, None, OffsetDateTime::now_utc())
         .unwrap();
     assert!((job.duration_s - 30.0).abs() < 1e-9);
-    let done = process_next(&queue, &settings, u64::MAX, OffsetDateTime::now_utc).unwrap();
+    let done = process_next(&queue, &settings, u64::MAX, None, OffsetDateTime::now_utc).unwrap();
     assert_eq!(done.status, Status::Done, "{:?}", done.last_error);
     assert!(plan.output.exists());
 }

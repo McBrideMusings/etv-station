@@ -249,18 +249,30 @@ pub mod cli {
         let output_base = station.output_base.clone();
         let lead = paths.lead;
         let scan = std::cell::RefCell::new(crate::reconcile::PendingScan::default());
+        let airings = std::cell::RefCell::new(crate::reconcile::AiringScan::default());
         let schedule = move |now: OffsetDateTime| {
-            let mut scan = scan.borrow_mut();
-            crate::reconcile::pending_files(&output_base, now, now + lead, &mut scan).map(|files| {
-                files
-                    .into_iter()
-                    .map(|f| etv_render::queue::Wanted {
-                        output: f.path,
-                        plan: f.plan,
-                        air_at: f.airs_at,
-                    })
-                    .collect()
+            let wanted = crate::reconcile::pending_files(
+                &output_base,
+                now,
+                now + lead,
+                &mut scan.borrow_mut(),
+            )?
+            .into_iter()
+            .map(|f| etv_render::queue::Wanted {
+                output: f.path,
+                plan: f.plan,
+                air_at: f.airs_at,
             })
+            .collect();
+            // Reaching past the lead, this scan can fail on a chunk rendering
+            // never needs; that must not stop the queue from following the schedule.
+            let airs_until =
+                crate::reconcile::airs_until(&output_base, now, &mut airings.borrow_mut())
+                    .inspect_err(|error| {
+                        tracing::warn!(event = "render.airings_unreadable", error = %error, "cannot read when the schedule last airs each file; eviction keeps the last reading");
+                    })
+                    .ok();
+            Ok(etv_render::queue::Scheduled { wanted, airs_until })
         };
         let stop = AtomicBool::new(false);
         etv_render::queue::run_sidecar(

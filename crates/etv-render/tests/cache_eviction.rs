@@ -4,7 +4,7 @@ mod common;
 
 use common::*;
 use etv_render::cache::enforce_cap;
-use etv_render::queue::{JobState, Queue, Status};
+use etv_render::queue::{AirsUntil, JobState, Queue, Status};
 use time::{Duration, OffsetDateTime};
 
 const KB: usize = 1024;
@@ -77,7 +77,13 @@ fn over_the_cap_the_oldest_aired_chapter_goes_and_one_near_air_stays() {
     let tonight = done_job(&queue, &dir, "tonight", Some(now + Duration::hours(6)), now);
 
     // Five 10 KB chapters against a 45 KB cap: one must go.
-    let evicted = enforce_cap(&queue, &settings, 45 * KB as u64, now);
+    let evicted = enforce_cap(
+        &queue,
+        &settings,
+        45 * KB as u64,
+        Some(&AirsUntil::new()),
+        now,
+    );
     assert_eq!(evicted, vec!["aired-long-ago".to_string()]);
     assert!(!aired_long_ago.output.exists());
     assert_eq!(
@@ -87,7 +93,13 @@ fn over_the_cap_the_oldest_aired_chapter_goes_and_one_near_air_stays() {
 
     // A cap that needs three gone takes the next aired chapter, and never one
     // that is airing now, within 30 minutes of air, or has not aired yet.
-    let evicted = enforce_cap(&queue, &settings, 20 * KB as u64, now);
+    let evicted = enforce_cap(
+        &queue,
+        &settings,
+        20 * KB as u64,
+        Some(&AirsUntil::new()),
+        now,
+    );
     assert_eq!(evicted, vec!["aired-recently".to_string()]);
     assert!(!aired_recently.output.exists());
     assert!(
@@ -114,7 +126,7 @@ fn a_cap_nothing_can_satisfy_removes_only_what_is_allowed() {
     let soon = done_job(&queue, &dir, "soon", Some(now + Duration::minutes(5)), now);
     let unknown = done_job(&queue, &dir, "no-air-time", None, now);
 
-    let evicted = enforce_cap(&queue, &settings, 1, now);
+    let evicted = enforce_cap(&queue, &settings, 1, Some(&AirsUntil::new()), now);
 
     assert!(evicted.is_empty());
     assert!(soon.output.exists() && unknown.output.exists());
@@ -133,7 +145,13 @@ fn stems_no_live_job_refers_to_go_before_any_chapter() {
     std::fs::write(orphan.join("vocals.wav"), vec![0u8; 8 * KB]).unwrap();
 
     // 18 KB total against a 12 KB cap: dropping the 8 KB orphan is enough.
-    let evicted = enforce_cap(&queue, &settings, 12 * KB as u64, now);
+    let evicted = enforce_cap(
+        &queue,
+        &settings,
+        12 * KB as u64,
+        Some(&AirsUntil::new()),
+        now,
+    );
 
     assert!(evicted.is_empty());
     assert!(!orphan.exists());
@@ -159,4 +177,35 @@ fn enqueue_returns_at_once_and_the_same_plan_is_one_job() {
         queue.read(&first.id).unwrap().air_at,
         Some(now + Duration::hours(1))
     );
+}
+
+/// A segment that loops a chapter, or airs it again, keeps it on disk past its
+/// first play until the schedule's last item naming it has finished
+/// (etv-station-1w69: a looped chapter evicted after one play aired as error
+/// cards). An unread schedule removes nothing.
+#[test]
+fn a_chapter_the_schedule_still_airs_stays_until_its_last_airing() {
+    let (_guard, dir) = temp();
+    let settings = settings(&dir);
+    let queue = Queue::new(dir.join("queue"));
+    std::fs::create_dir_all(&queue.dir).unwrap();
+    let now = OffsetDateTime::now_utc();
+    // Aired 200 s ago; one 100 s play is over, the loop runs 300 s more.
+    let looped = done_job(
+        &queue,
+        &dir,
+        "looped",
+        Some(now - Duration::seconds(200)),
+        now,
+    );
+    let airs: AirsUntil = [(looped.output.clone(), now + Duration::seconds(300))].into();
+
+    assert!(enforce_cap(&queue, &settings, 1, None, now).is_empty());
+    assert!(enforce_cap(&queue, &settings, 1, Some(&airs), now).is_empty());
+    assert!(looped.output.exists(), "the loop still airs it");
+
+    let after = now + Duration::seconds(301);
+    let evicted = enforce_cap(&queue, &settings, 1, Some(&airs), after);
+    assert_eq!(evicted, vec!["looped".to_string()]);
+    assert!(!looped.output.exists());
 }

@@ -534,6 +534,46 @@ pub fn pending_files(
     Ok(out)
 }
 
+/// Every file an item names, with the item's finish: the local file it plays,
+/// and the real file its `metadata.pending` waits on.
+fn item_files(playout: &Playout) -> Vec<(PathBuf, OffsetDateTime)> {
+    let mut out = Vec::new();
+    for item in &playout.items {
+        if let Some(PlayoutItemSource::Local { path, .. }) = &item.source {
+            out.push((PathBuf::from(path), item.finish));
+        }
+        if let Some((path, _)) = pending_of(item) {
+            out.push((PathBuf::from(path), item.finish));
+        }
+    }
+    out
+}
+
+pub type AiringScan = ChunkScan<(PathBuf, OffsetDateTime)>;
+
+/// When the schedule last stops airing each file: the latest finish of every
+/// item that names it, as its played file or its pending file, among items
+/// still airing after `from` in every published playout file. A swapped-in
+/// render is counted through its played file. All or nothing, as
+/// [`scan_chunks`] is.
+pub fn airs_until(
+    output_base: &Path,
+    from: OffsetDateTime,
+    scan: &mut AiringScan,
+) -> Result<HashMap<PathBuf, OffsetDateTime>, String> {
+    let end = time::Date::MAX.midnight().assume_utc();
+    let mut last: HashMap<PathBuf, OffsetDateTime> = HashMap::new();
+    for (path, finish) in scan_chunks(output_base, from, end, scan, item_files)? {
+        if finish <= from {
+            continue;
+        }
+        last.entry(path)
+            .and_modify(|f| *f = (*f).max(finish))
+            .or_insert(finish);
+    }
+    Ok(last)
+}
+
 /// A pending item's `(real file, loop)`, from its `metadata.pending`.
 fn pending_of(item: &PlayoutItem) -> Option<(String, bool)> {
     let pending = item.metadata.as_ref()?.get(PENDING_KEY)?;
@@ -1440,6 +1480,45 @@ mod tests {
         );
         corrupt("20260816T120000.000000000Z_20260816T180000.000000000Z.json");
         assert!(pending_files(base.path(), from, until, &mut scan).is_err());
+    }
+
+    /// A render's last airing is the latest finish of any item naming it, as
+    /// its pending file before the swap or its played file after; an item
+    /// that finished by `from` does not count.
+    #[tokio::test]
+    async fn airs_until_is_the_last_finish_of_any_item_naming_the_file() {
+        let base = TempDir::new().unwrap();
+        let channel = TempDir::new_in(base.path()).unwrap();
+        let t = |h: u8, m: u8| {
+            datetime!(2026-08-16 00:00 UTC)
+                + time::Duration::hours(h.into())
+                + time::Duration::minutes(m.into())
+        };
+        write_playout(
+            &channel,
+            vec![
+                item("done", "/r/x.mp4", t(11, 0), t(11, 30)),
+                item("swapped#0", "/r/x.mp4", t(12, 50), t(12, 52)),
+                item("swapped#1", "/r/x.mp4", t(12, 52), t(12, 54)),
+                pending_item("p", "/r/x.mp4", true, t(13, 0), 600),
+                item("aired", "/r/old.mp4", t(11, 0), t(11, 59)),
+            ],
+        )
+        .await;
+        let mut scan = AiringScan::default();
+        let last = airs_until(base.path(), t(12, 0), &mut scan).unwrap();
+        assert_eq!(last.get(Path::new("/r/x.mp4")), Some(&t(13, 10)));
+        assert_eq!(last.get(Path::new("/r/old.mp4")), None);
+
+        // A replay in a later chunk, however far past the renderer's lead,
+        // still holds the file.
+        write_playout(
+            &channel,
+            vec![item("replay", "/r/x.mp4", t(30, 0), t(30, 2))],
+        )
+        .await;
+        let last = airs_until(base.path(), t(12, 0), &mut scan).unwrap();
+        assert_eq!(last.get(Path::new("/r/x.mp4")), Some(&t(30, 2)));
     }
 
     /// A playout file deleted between the listing and the read is no longer in

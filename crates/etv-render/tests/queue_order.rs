@@ -65,7 +65,7 @@ fn the_sidecar_takes_the_soonest_airing_job_and_never_one_already_aired() {
         now + Duration::milliseconds(tick.get())
     };
     let mut order = Vec::new();
-    while let Some(job) = process_next(&queue, &settings, u64::MAX, clock) {
+    while let Some(job) = process_next(&queue, &settings, u64::MAX, None, clock) {
         order.push(job.id);
     }
 

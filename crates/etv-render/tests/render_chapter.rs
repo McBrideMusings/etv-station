@@ -89,7 +89,7 @@ fn a_plan_naming_a_missing_file_fails_with_that_path_in_the_job_state() {
         .enqueue(&plan, None, OffsetDateTime::now_utc())
         .unwrap();
 
-    let job = process_next(&queue, &settings, u64::MAX, OffsetDateTime::now_utc).unwrap();
+    let job = process_next(&queue, &settings, u64::MAX, None, OffsetDateTime::now_utc).unwrap();
 
     let missing = dir.join("gone/song-b.mp4").display().to_string();
     assert_eq!(job.status, Status::Failed);

@@ -289,6 +289,18 @@ pub struct Wanted {
     pub air_at: OffsetDateTime,
 }
 
+/// When the schedule last stops airing each file it names, played or pending.
+pub type AirsUntil = std::collections::HashMap<PathBuf, OffsetDateTime>;
+
+/// One read of the schedule: the pending files to render within the lead, and
+/// the last airing of every file it names; `None` when that part could not be
+/// read, so eviction keeps the last one that was.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Scheduled {
+    pub wanted: Vec<Wanted>,
+    pub airs_until: Option<AirsUntil>,
+}
+
 /// What one [`Queue::sync`] did.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SyncCounts {
@@ -458,10 +470,12 @@ pub fn job_id(plan: &Plan) -> String {
 
 /// Render the queued job airing soonest, after marking any whose air time has
 /// come as missed. Returns its final state, or `None` when nothing was waiting.
+/// `airs_until` goes to [`cache::enforce_cap`] after the render.
 pub fn process_next(
     queue: &Queue,
     settings: &Settings,
     cap_bytes: u64,
+    airs_until: Option<&AirsUntil>,
     now: impl Fn() -> OffsetDateTime,
 ) -> Option<JobState> {
     let mut jobs = queue.list();
@@ -505,16 +519,26 @@ pub fn process_next(
         }
     }
     let _ = queue.write(&job);
-    let evicted = cache::enforce_cap(queue, settings, cap_bytes, now());
+    evict(queue, settings, cap_bytes, airs_until, now());
+    Some(job)
+}
+
+fn evict(
+    queue: &Queue,
+    settings: &Settings,
+    cap_bytes: u64,
+    airs_until: Option<&AirsUntil>,
+    now: OffsetDateTime,
+) {
+    let evicted = cache::enforce_cap(queue, settings, cap_bytes, airs_until, now);
     if !evicted.is_empty() {
         tracing::info!(event = "render.evicted", ids = ?evicted, "evicted renders over the cache cap");
     }
-    Some(job)
 }
 
 /// What the schedule airs from a given instant through the sidecar's lead,
 /// or why it could not be read.
-pub type Schedule<'a> = dyn Fn(OffsetDateTime) -> Result<Vec<Wanted>, String> + 'a;
+pub type Schedule<'a> = dyn Fn(OffsetDateTime) -> Result<Scheduled, String> + 'a;
 
 /// Drain the queue until `stop` is set, one job at a time, bringing the queue
 /// in line with `schedule` at most once every `sync_every`.
@@ -530,7 +554,8 @@ pub fn run_sidecar(
     let recovered = queue.recover_interrupted();
     tracing::info!(event = "render.sidecar_start", queue = %queue.dir.display(), cache = %settings.cache_dir.display(), cap_bytes, recovered, "renderer watching its queue");
     let now = OffsetDateTime::now_utc;
-    cache::enforce_cap(queue, settings, cap_bytes, now());
+    // The last schedule read that succeeded: eviction keeps what it still airs.
+    let mut airs_until: Option<AirsUntil> = None;
     let mut unreadable = UnreadablePlans::new();
     let mut synced: Option<std::time::Instant> = None;
     while !stop.load(Ordering::Relaxed) {
@@ -538,8 +563,8 @@ pub fn run_sidecar(
             synced = Some(std::time::Instant::now());
             let at = now();
             match schedule(at) {
-                Ok(wanted) => {
-                    let c = queue.sync(&wanted, at, &mut unreadable);
+                Ok(scheduled) => {
+                    let c = queue.sync(&scheduled.wanted, at, &mut unreadable);
                     if c.enqueued + c.superseded + c.removed + c.unreadable_plans > 0 {
                         tracing::info!(
                             event = "render.sync",
@@ -551,13 +576,19 @@ pub fn run_sidecar(
                             "brought the queue in line with the schedule"
                         );
                     }
+                    if scheduled.airs_until.is_some() {
+                        airs_until = scheduled.airs_until;
+                    }
+                    // Air time moves on between renders, so a file the schedule
+                    // stopped airing can go even while nothing is queued.
+                    evict(queue, settings, cap_bytes, airs_until.as_ref(), at);
                 }
                 Err(error) => {
                     tracing::warn!(event = "render.schedule_unreadable", error = %error, "cannot read the schedule; the queue is left as it is until the next pass");
                 }
             }
         }
-        if process_next(queue, settings, cap_bytes, now).is_none() {
+        if process_next(queue, settings, cap_bytes, airs_until.as_ref(), now).is_none() {
             std::thread::sleep(poll);
         }
     }
