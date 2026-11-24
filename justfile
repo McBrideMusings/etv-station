@@ -1,12 +1,11 @@
 # etv-station tasks. Bare `just` lists them, each with the comment above it.
 # Values (hosts, paths, tokens) come from .env, which `set dotenv-load` reads; see .env.example.
-# Cargo builds and tests run in the buildbox container on Tower through bb-run, never on this Mac.
+# Cargo builds and tests run on this Mac (cargo is Turnstile's shim); image builds run on Tower's capped builder.
 
 set dotenv-load
 set positional-arguments
 set quiet
 
-bb := env("BUILDBOX_RUN", home_directory() / "Projects/buildbox/bin/bb-run")
 remote := "${UNRAID_USER:-root}@${UNRAID_HOST:?UNRAID_HOST is not set (.env)}"
 exec := "docker exec etv-station etv-station --config ${ETV_STATION_CONFIG:-/config/station.yaml}"
 
@@ -34,17 +33,17 @@ dev what="full" *args:
 deploy target="image" *flags:
     tools/deploy.sh "$@"
 
-# --- checks: test and lint run on the buildbox ---
+# --- checks ---
 
-# Tests in both cargo workspaces, on the buildbox
+# Tests in both cargo workspaces
 test:
-    {{bb}} ./tools/verify-all.sh test
+    ./tools/verify-all.sh test
 
-# Clippy (deny warnings) and rustfmt --check in both workspaces, on the buildbox
+# Clippy (deny warnings) and rustfmt --check in both workspaces
 vet:
-    {{bb}} ./tools/verify-all.sh lint
+    ./tools/verify-all.sh lint
 
-# Format both workspaces here; it rewrites files, and bb-run copies files to Tower and never back
+# Format both workspaces; it rewrites files
 fmt:
     ./tools/verify-all.sh fmt
 

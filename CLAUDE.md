@@ -36,13 +36,13 @@ etv-station reads plex-db-ex's facts (audio facts, enrichment, keywords, taste v
 
 This is a Cargo workspace with three application crates — `crates/etv-station` (daemon), `crates/etv-query-test` (Phase A CEL harness), and `crates/etv-overlay` (Phase B Vello+Rhai overlay renderer). `vendor/etv-next` is its own workspace, excluded from this one and consumed as a path dependency — so a bare `cargo test/clippy --workspace` at the root never checks it. Use `./tools/verify-all.sh`, which runs each tree with its own documented commands and fails if either fails.
 
-Tasks live in the committed `justfile` at the repo root; bare `just` lists them. It reads `.env` (`.env.example` has every key), so no host, path or token is written in a tracked file. `just test` and `just vet` run `tools/verify-all.sh` in the buildbox container on Tower through `~/Projects/buildbox/bin/bb-run`. `just build` and `just deploy` run `tools/deploy.sh`, which builds the image on Tower's capped `buildbox-bk` builder and pipes `tools/deploy-container.sh` to the host to recreate the container from the host's own env file (`ETV_REMOTE_ENV_FILE`).
+Tasks live in the committed `justfile` at the repo root; bare `just` lists them. It reads `.env` (`.env.example` has every key), so no host, path or token is written in a tracked file. `just test` and `just vet` run `tools/verify-all.sh` on this Mac. `just build` and `just deploy` run `tools/deploy.sh`, which builds the image on Tower's capped `buildbox-bk` builder and pipes `tools/deploy-container.sh` to the host to recreate the container from the host's own env file (`ETV_REMOTE_ENV_FILE`).
 
 The common operations:
 
 ```sh
-just test                                # both workspaces' tests, on the buildbox
-just vet                                 # clippy + fmt --check, on the buildbox
+just test                                # both workspaces' tests
+just vet                                 # clippy + fmt --check
 just deploy [image|files|all] [--dry-run] [--force]  # back up, build on Tower, preflight, recreate, health-check
 ./tools/dev-run.sh                       # run station daemon + ETV-next together (integration test)
 ./tools/dev-station.sh                   # run ONLY the station daemon (.env sourced, no ETV-next build)
