@@ -48,7 +48,7 @@
 //
 // Beside each render it writes <stem>.plan.json (the renderer's plan: audio
 // layers and picture cuts, with the chapter's tempo, key and hooks in its
-// `notes`) and <stem>.audit.txt (one seam line per hook, which `admin audit` and
+// `notes`) and <stem>.audit.txt (one seam line per hook, which `just audit` and
 // `GET /api/channels/<n>/chapters` show).
 //
 // The segment is pending on <stem>.mp4 and names <stem>.plan.json as the plan
@@ -563,7 +563,7 @@ fn cfg_dir_of(path) {
     if at == 0 { "." } else { path.sub_string(0, at) }
 }
 
-// One line per hook for `admin audit`, written beside the render as <stem>.audit.txt.
+// One line per hook for `just audit`, written beside the render as <stem>.audit.txt.
 fn seam_notes(plan, chosen, bars) {
     let text = "";
     let hooks = plan.notes.hooks;

@@ -31,8 +31,8 @@ node tools/ui-page-check.js crates/etv-station/src/web_ui/shell.html
 # expect: dashboard page script loads without error
 ```
 
-The script is the only place the command list lives — `CLAUDE.md` and `admin.toml`
-(`admin test` / `admin vet` / `admin fmt`) call it rather than repeating it. Each
+The script is the only place the command list lives — `CLAUDE.md` and the `justfile`
+(`just test` / `just vet` / `just fmt`) call it rather than repeating it. Each
 tree gets its own documented commands: the vendored one adds `--locked`, taken
 from `vendor/etv-next/CLAUDE.md`. Every selected check runs in both trees even
 after one fails, then the summary names which failed and the exit status is 1.
@@ -109,11 +109,11 @@ daemon and watching it actually do its job.
 
 ```bash
 cargo build                        # ~21s cold, debug profile
-admin dev-station                  # daemon only, .env sourced (no ETV-next build)
-admin dev                          # daemon + ETV-next together
+just dev station                 # daemon only, .env sourced (no ETV-next build)
+just dev                          # daemon + ETV-next together
 ```
 
-`admin dev-station` sources `.env` for you. If you run the binary directly you must
+`just dev station` sources `.env` for you. If you run the binary directly you must
 source it yourself or every `${…}` in the example configs fails validation:
 
 ```bash
@@ -173,7 +173,7 @@ The dry run is the check — it reports what is missing and writes nothing:
 Drop `--dry-run` to repair. It inserts only what is missing, so a second run must report
 `inserted 0` — that idempotence is the thing to assert, not the first run's count.
 
-Against prod it is `admin backfill-history [--dry-run]`, which runs it inside the container.
+Against prod it is `just repair history [--dry-run]`, which runs it inside the container.
 It recovers only what is still on disk; `retention_days` prunes elapsed chunks, so a hole
 older than that window is unrecoverable and the count will not add up to the damage.
 
@@ -194,7 +194,7 @@ overlay — against the channel as it now stands, and on a mismatch throws the
 schedule away from the next item boundary forward.
 
 ```bash
-admin deploy files && admin reload
+just deploy files && just reload
 # expect, per edited channel:
 #   event="resume.refresh" reason="config" from=… truncated_from=… removed=…
 # and for every channel you did NOT edit: no refresh event at all
@@ -208,7 +208,7 @@ taste-scored channel's future.
 **This recipe only proves a content edit to an already-serving channel reaches
 the screen.** It does not prove a channel starting to load (or stopping) is
 now visible in the *lineup* — check that separately, always, after any
-`admin deploy files` that touches `channel.yaml` or a plugin a channel's
+`just deploy files` that touches `channel.yaml` or a plugin a channel's
 `channel.yaml` references:
 
 ```bash
@@ -218,7 +218,7 @@ ssh "$UNRAID_USER@$UNRAID_HOST" \
 ```
 
 The daemon re-renders `lineup.json` on every `SIGHUP`-triggered generation
-(`rerender_etv_next` in `daemon.rs`), so `admin reload` now covers this too —
+(`rerender_etv_next` in `daemon.rs`), so `just reload` now covers this too —
 but reading the daemon's own logs (`chunk.write`, `resume.load`,
 `channel.load_failed`'s *absence*) is not the same check and does not catch a
 regression in that render path. The lineup file itself, or the actual channel
@@ -233,13 +233,13 @@ served.
 To force one without a config change:
 
 ```bash
-admin refresh channel 002-for-pierce  # by directory name — prefer this
-admin refresh channel all             # every channel
+just refresh channel 002-for-pierce  # by directory name — prefer this
+just refresh channel all             # every channel
 # expect: reason="forced" within one roll_interval, not instantly
 ```
 
 A bare number resolves by lineup position, not the declared `number:`
-(etv-station-421): with 62 channels, `admin refresh channel 85` fails with "no
+(etv-station-421): with 62 channels, `just refresh channel 85` fails with "no
 channel number 85". Use the directory name until that is fixed.
 
 The CLI writes a `.refresh-request` marker in the channel's playout folder and
@@ -265,7 +265,7 @@ Look for: `sent SIGHUP to the daemon (pid …)`, `event="signal.reload"` then
 stops. Observed 2026-10-18: 480 `chunk.write` lines before, reload and refresh 52ms apart.
 `cargo test -p etv-station --lib a_forced_refresh_rebuilds_the_same_schedule` is the
 same-seed identity proof. On prod the YAML edit lands inside the container only; copy the
-seed into `deploy/appdata/channels/<ch>/channel.yaml` or the next `admin deploy files`
+seed into `deploy/appdata/channels/<ch>/channel.yaml` or the next `just deploy files`
 reverts it.
 
 ## Verifying a partial wipe re-airs nothing (#378)
@@ -485,14 +485,14 @@ the deployed container re-ingests the catalog and sweeps its own playout JSON
 every `catalog_refresh_secs`, forever, with no command, no signal, and no
 restart. This section is only how to *watch it happen locally* before shipping a
 change to it — the same reason the rest of this skill boots a debug binary
-against `examples/`. In prod you read the logs (`admin logs`), you do not
+against `examples/`. In prod you read the logs (`just logs`), you do not
 trigger anything.
 
 The refresh is a `select!` arm on `catalog_refresh_secs`, so a default station
 (900s) shows nothing for fifteen minutes. There is no env override for it —
 `load.rs` reads only `ETV_STATION_TZ`/`OUTPUT_BASE`/`CATALOG`/`SOURCE_ROOTS`/
 `IDENTITY_ROOTS`/`ARTWORK_CACHE` — so set it low in `examples/station.yaml`
-itself, then `admin dev-station` and watch for a second ingest line:
+itself, then `just dev station` and watch for a second ingest line:
 
 ```
 INFO … event="catalog.ingest.fs" sources_marked_missing=0 entries_marked_missing=0
@@ -525,7 +525,7 @@ and the slot becomes a black card that still carries the title in the guide.
 On the deployed container the same three lines are the whole story, and the
 counters are the thing to read: a `reconcile.swept` with `paths_patched` above
 zero means the station just repaired chunks that would otherwise have aired
-black. `admin logs | grep reconcile` is the check after a big Radarr rename
+black. `just logs | grep reconcile` is the check after a big Radarr rename
 batch — not because anything needs doing, but to confirm nothing did.
 
 ## Verifying no two Plex items share one catalog entry (#340)
@@ -654,7 +654,7 @@ channel worker opens the fifo and waits for a writer; if `etv-overlay` died ther
 is no writer, and ffmpeg blocks. The cause is in the container log:
 
 ```sh
-admin logs | grep -iE "overlay\.(spawn|exit)|unsupported PNG"
+just logs | grep -iE "overlay\.(spawn|exit)|unsupported PNG"
 ```
 
 `etv-overlay` accepts **8-bit RGBA PNGs only**. A GrayscaleAlpha or Palette PNG
@@ -779,8 +779,8 @@ startup ingest (`catalog.ingest.fs` → `catalog.ingest.plex_start mode="full"`)
 completion before any channel task rolls. With `PLEX_URL`/`PLEX_TOKEN` set, that means a
 real library read taking minutes, and the daemon never reaches the resume path most local
 verification actually wants to watch. Unset them with `env -u` as shown below rather than
-relying on `.env` not having them — `admin dev-station` sources `.env`, which may set them,
-so use the raw binary invocation for this, not the admin task.
+relying on `.env` not having them — `just dev station` sources `.env`, which may set them,
+so use the raw binary invocation for this, not the just recipe.
 
 Use the committed `examples/station-test.yaml` — it registers only `channels/lavfi-test.yaml`,
 no `samples/*.yaml` glob:
@@ -800,11 +800,11 @@ pays the full ingest regardless of that setting. `env -u` is what actually avoid
 
 ## The HTTP surface is not the daemon
 
-`admin.toml` lists `http://127.0.0.1:8409/channels.m3u`, `/xmltv.xml`, `/channel/1.m3u8`.
+`tools/verify-integration.sh` probes `http://127.0.0.1:8409/channels.m3u`, `/xmltv.xml`, `/channel/1.m3u8`.
 **The station daemon alone does not bind 8409** — I polled it for 150s while the daemon was
 happily rolling channels and nothing ever listened. Those URLs are the container's, served
-with ETV-next. For the HTTP surface locally use `admin dev` (daemon + ETV-next), not
-`admin dev-station`.
+with ETV-next. For the HTTP surface locally use `just dev` (daemon + ETV-next), not
+`just dev station`.
 
 ## Verifying channel failure accounting (etv-station-323)
 
@@ -813,7 +813,7 @@ and the run either stalled (exit 75) or lasted under 180s. Three in a row and
 `/channel/{n}.m3u8` answers 503 with `Retry-After: 30`. Every step is logged,
 and `GET /health/channels.json` returns the state.
 
-Locally, under `admin dev` against `examples/station-test.yaml`, keep a viewer
+Locally, under `just dev` against `examples/station-test.yaml`, keep a viewer
 polling `/session/1/live.m3u8` every 2s and force the failures:
 
 - **A real stall:** SIGSTOP every ffmpeg child of the channel-1 worker, once a
@@ -873,7 +873,7 @@ Locally, start `tools/station-ui.sh` with `ETV_DIAG_DIR=<diag-dir>`, `ETV_ACCEL`
 
 ## Verifying no sub-segment transcodes (#339)
 
-`admin verify-no-slivers` — read-only, over ssh, touches no container.
+`just verify-no-slivers` — read-only, over ssh, touches no container.
 
 A **sliver** is an ffmpeg invocation whose `-t` is shorter than its own
 `-hls_time`: a full process spawn, deep seek, hwaccel decode init and overlay
@@ -906,7 +906,7 @@ invocation's own `-hls_time`, because it is a compile-time constant
 (`SEGMENT_SECONDS` in `vendor/etv-next/crates/ffpipeline/src/pipeline.rs:36`) and
 not a `station.yaml` key.
 
-Locally, against a `admin dev` run: `tools/verify-no-slivers.sh --local <diag-dir>`.
+Locally, against a `just dev` run: `tools/verify-no-slivers.sh --local <diag-dir>`.
 
 **A pass on a freshly restarted container proves little.** Rebursts need an item
 to have been playing long enough to build and then drain a lead, so a short run
@@ -915,9 +915,9 @@ up for hours with channels being watched.
 
 ## Backups — what rollback actually protects
 
-`admin backup` snapshots the host state that has no second copy, into
-`$ETV_STATION_BACKUP_DIR/<UTC-stamp>/`, keeping the newest 10. Every `admin
-deploy` runs it first.
+`just backup` snapshots the host state that has no second copy, into
+`$ETV_STATION_BACKUP_DIR/<UTC-stamp>/`, keeping the newest 10. Every `just
+deploy image` runs it first.
 
 What matters and why, so nobody "optimises" the list later:
 
@@ -941,12 +941,12 @@ Two safety properties worth not breaking:
   leaves its partial directory as evidence.
 
 The pre-deploy run is stale-gated (`ETV_STATION_BACKUP_IF_STALE=1`), so a
-`--dry-run` cannot churn the retention window; `admin backup` always snapshots.
+`--dry-run` cannot churn the retention window; `just backup` always snapshots.
 
 ## Verifying audio and subtitle track selection (#261)
 
 ```bash
-admin verify-tracks        # or ./tools/verify-tracks.sh
+./tools/verify-tracks.sh
 ```
 
 It builds one Matroska file with a default-flagged commentary track listed first,
@@ -1036,10 +1036,10 @@ Stop it after ~30s. Look for: `event="bumper.fill"` lines (channel, script, gap_
 - The first Plex ingest reads the whole library and genuinely takes minutes
   (`catalog.ingest.plex_start mode="full"`). It hits the live Plex server — read-only, but
   it is real network traffic to the real box.
-- `admin deploy files` vs `admin deploy image`: a new channel or edited block is `files`;
+- `just deploy files` vs `just deploy image`: a new channel or edited block is `files`;
   a code change is `image`. `files` is the cheap one and is also the one that historically
-  broke ownership on arrival — see the `post_sync` chown comment in `admin.toml`.
-- Remote log tailing is `admin diag` (access log + stream events over ssh).
+  broke ownership on arrival — see the chown comment in `files()` in `tools/deploy.sh`.
+- Remote log tailing is `just diag` (access log + stream events over ssh).
 
 ## Diagnosing a frozen channel (the overlay fifo)
 
@@ -1101,7 +1101,7 @@ catalog, plugins dir, bind, port, tunable-channel count, revision; 503 when the
 station config does not load. Every request logs `event="ui.request"` with status
 and ms; a review logs `ui.review` with its generation count and ms.
 
-Locally: `./tools/station-ui.sh` (`admin tools ui`), then
+Locally: `./tools/station-ui.sh` (`just ui`), then
 `tools/ui-get.sh /api/health`. In the image, with no media and no Plex,
 copy `examples/` to a scratch `config/`, mount `crates/etv-overlay/fixtures` at
 `/crates/etv-overlay/fixtures` (the lavfi channel's overlay names it by a `../../`

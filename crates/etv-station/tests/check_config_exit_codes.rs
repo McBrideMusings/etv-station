@@ -1,4 +1,4 @@
-//! `etv-station --check-config` is what `admin deploy`'s preflight trusts to
+//! `etv-station --check-config` is what `just deploy`'s preflight trusts to
 //! refuse a broken config, so its exit code and the paths it names on stderr
 //! are the contract. These tests run the real binary against a tempdir station.
 

@@ -192,7 +192,7 @@ fn run(server: &tiny_http::Server, state: &mut AppState) {
 }
 
 /// `GET /api/health`: what this process serves from, and whether the station
-/// config still loads — the state query `admin status` and the gate read.
+/// config still loads — the state query the gate reads.
 /// 503 when the station config does not load, so a status check that reads
 /// only the code sees a broken config as down.
 fn api_health(state: &AppState) -> (u16, Value) {
@@ -617,7 +617,7 @@ mod tests {
         assert_eq!(status, 404, "{body}");
     }
 
-    /// `GET /api/audio/{id}` is what `admin facts` prints, and `/api/health/audio`
+    /// `GET /api/audio/{id}` is what `just facts` prints, and `/api/health/audio`
     /// is the Health tab's coverage line: entries the store knows, with and
     /// without facts, counted off the request thread.
     #[test]

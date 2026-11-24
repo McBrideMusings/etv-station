@@ -4262,7 +4262,7 @@ take = 2
 /// play-history `records` loop right after this call relies on.
 /// Capitalize a string's first character, leaving the rest untouched. Used
 /// once, to turn a `pool`-stage `verdict` (written for an operator reading
-/// `admin audit`, lowercase and mid-sentence like "ranked highest") into the
+/// `just audit`, lowercase and mid-sentence like "ranked highest") into the
 /// start of a guide sentence.
 fn capitalize_first(s: &str) -> String {
     let mut chars = s.chars();
@@ -4279,9 +4279,9 @@ fn capitalize_first(s: &str) -> String {
 /// Prefers the first `guide` any stage record carries — a plugin's own
 /// viewer-facing sentence, written for this purpose — over a built-in
 /// fallback: the first `pool`-stage record's `verdict`, capitalized. A
-/// `verdict` is written for `admin audit`'s operator reader, not a viewer,
+/// `verdict` is written for `just audit`'s operator reader, not a viewer,
 /// but it is the only thing every picked item has. `detail` is never read
-/// here or anywhere outside `admin audit` — it is opaque per ADR 0002.
+/// here or anywhere outside `just audit` — it is opaque per ADR 0002.
 fn explain_line_for(metadata: Option<&serde_json::Value>) -> Option<String> {
     let audit = metadata?.get("audit")?.as_array()?;
     if let Some(guide) = audit

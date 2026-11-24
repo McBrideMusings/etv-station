@@ -38,7 +38,7 @@ struct Cli {
     list_folders: bool,
 
     /// Print every configured event hook (station and channel `hooks:`), one
-    /// per line, and exit instead of running the daemon. Backs `admin hooks`.
+    /// per line, and exit instead of running the daemon. Backs `just hooks`.
     #[arg(long)]
     list_hooks: bool,
 
@@ -59,7 +59,7 @@ struct Cli {
     ///
     /// `--render-etv-next` deliberately serves the channels that load and
     /// drops the rest, which is right for a running station and wrong for a
-    /// deploy: `admin deploy`'s preflight runs this from the new image,
+    /// deploy: `just deploy`'s preflight runs this from the new image,
     /// before the running container is replaced, so a config the new image
     /// cannot read refuses the deploy instead of taking channels off the air.
     #[arg(long)]
@@ -206,7 +206,7 @@ struct Cli {
     /// `pool_provider` with no `audit()` whose sole reference was inside a
     /// YAML comment (#396). Point it at the plugin directory a host actually
     /// loads, before shipping a binary that requires a new contract function:
-    /// `admin plugin-check` does exactly that, over ssh, in this image.
+    /// `just plugin-check` does exactly that, over ssh, in this image.
     #[arg(long, value_name = "DIR")]
     check_plugins: Option<PathBuf>,
 
@@ -589,7 +589,7 @@ fn list_hooks(config_path: &Path) -> ExitCode {
 ///
 /// The output is one `OK`/`FAIL` line per script plus a count, on stdout, with
 /// no tracing subscriber in the way — this runs over ssh inside the container
-/// image (`admin plugin-check`), where the whole answer needs to survive being
+/// image (`just plugin-check`), where the whole answer needs to survive being
 /// piped through two shells.
 ///
 /// An empty directory is a pass with a count of zero, not an error: a station

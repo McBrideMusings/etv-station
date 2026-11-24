@@ -45,7 +45,7 @@ and the comment rule. `audit-channel` owns bug-hunting on prod.
    baseline as `--previous` for the grades, depth and overlap that moved. Check `projection.error` in the JSON — a bad profile keyword shows
    up only there, with `notices` empty.
 6. **Approve → deploy.** Copy the scratch files into `deploy/`. A deploy needs
-   pierce's go: `admin deploy files`, then POST
+   pierce's go: `just deploy files`, then POST
    `$PLEX_URL/livetv/dvrs/25/reloadGuide` with the `X-Plex-Token` header.
 7. **Show.** Open `http://127.0.0.1:4748/#/edit/<folder>` and
    `#/channels/<folder>/blocks` in a pane, so pierce sees the result.

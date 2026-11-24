@@ -259,7 +259,7 @@ COPY --chmod=755 tools/stream-access-log.py tools/stream-watch.py tools/client-s
 COPY --chmod=755 tools/probe-checks.sh tools/soak-probe.sh /usr/local/bin/
 COPY --chmod=755 tools/two-clock-capture.sh /usr/local/bin/
 # The ffmpeg probe ships IN THE IMAGE, not scp'd onto the host. It used to be
-# host-only state that every `admin deploy files` destroyed, so the one thing
+# host-only state that every `just deploy files` destroyed, so the one thing
 # that can tell "ffmpeg stopped encoding" from "ffmpeg is encoding and the
 # output is not landing" — and the only proof a channel is on the GPU rather
 # than silently on the CPU (#258) — kept disappearing and had to be re-applied
@@ -293,7 +293,7 @@ ENV XDG_CACHE_HOME=/data/cache \
 
 # Which etv-station commit this image was built from. The base image's own
 # revision/source labels describe the ErsatzTV-ffmpeg image, so these replace
-# them. The values come from `tools/build-image.sh` (--build-arg); an image
+# them. The values come from `tools/deploy.sh build` (--build-arg); an image
 # built without them reads `unknown` and `tools/image-age.sh` reports it
 # unstamped. The ENV copies are what ersatztv serves at /build.json.
 ARG ETV_STATION_REVISION=unknown

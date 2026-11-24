@@ -235,7 +235,7 @@ is [ADR 0002](./adr/0002-scorer-plugin-replaces-a-pool-expr.md).
 ## Before you deploy a script
 
 - Run `etv-station --check-determinism <channel>` against a channel that uses it.
-- Run `admin plugin-check` before `admin deploy image` whenever the contract changed: it
+- Run `just plugin-check` before `just deploy image` whenever the contract changed: it
   walks the plugin folder that is on the host right now and reports every script that
   would refuse to load. A script the station refuses to load fails config load, which
   takes every channel off air, not one. See

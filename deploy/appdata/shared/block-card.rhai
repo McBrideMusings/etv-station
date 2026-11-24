@@ -8,7 +8,7 @@
 //   metadata.pool_label       "The Zombies Block"
 //   metadata.pool_advisory    "Contains graphic violence"     (optional)
 //
-// Nothing here parses the audit trail — that is for `admin audit`, not for
+// Nothing here parses the audit trail — that is for `just audit`, not for
 // display. An item from a pool with no label carries neither key and this
 // graphic draws nothing for it.
 //

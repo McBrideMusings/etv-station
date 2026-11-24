@@ -17,7 +17,7 @@
 # carries scripts with no counterpart in this checkout at all — it held
 # `taste-engine.rhai`, a `pool_provider` with no `audit()` that exists nowhere in
 # this repo, armed and invisible because its only reference sat inside a YAML
-# comment. `admin deploy files` will never remove it either: `delete = false` is
+# comment. `just deploy files` will never remove it either: `delete = false` is
 # correct there, since the same directory holds catalog.db, history.db and the
 # HLS working set. An orphan is the case that bites, and no check that compares
 # local files to their counterparts can express it. So this pulls the host's

@@ -7,7 +7,7 @@
 #     parent — a `cargo <anything> --workspace` at the root never touches it.
 #
 # Every check lives here exactly once. CLAUDE.md, .claude/skills/project/verify.md,
-# and admin.toml all call this script rather than repeating the command list;
+# and the justfile all call this script rather than repeating the command list;
 # a check duplicated across files is the seam that let a clippy error sit on
 # main for three rounds (issue #305).
 #

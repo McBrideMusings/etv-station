@@ -72,7 +72,7 @@ tmp-*.log
 
 # Unraid GUI container template — carries this host's appdata/media paths and
 # port, so it is machine config, not project config. Synced to the host on every
-# `deploy image`; recreate it from admin.toml and the host env file.
+# `just deploy image`; recreate it from the host env file.
 deploy/unraid-template.xml
 
 # Beads / Dolt files (added by bd init)

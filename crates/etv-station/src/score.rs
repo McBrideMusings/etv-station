@@ -542,7 +542,7 @@ pub struct RequiredFn {
 /// - `examples/plugins/*.rhai` — what the repo's own tests load.
 /// - `deploy/appdata/plugins/*.rhai` — gitignored, and what a deploy ships.
 /// - Whatever else is already on the host, including scripts with no copy
-///   here at all. `admin plugin-check` walks that directory and is the only
+///   here at all. `just plugin-check` walks that directory and is the only
 ///   thing that can see them; run it before deploying a change to this list.
 ///
 /// See `docs/schema.md` § "Changing the plugin contract".

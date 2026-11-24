@@ -36,7 +36,7 @@
 // per seam). The segment is pending on <stem>.mp4 with <stem>.plan.json
 // as its plan, which the render sidecar queues as the set's air time nears. It is
 // named `chapter:<stem>|<entry>|...` so `GET
-// /api/channels/<n>/chapters`, `admin audit` and the `tail` check read it the
+// /api/channels/<n>/chapters`, `just audit` and the `tail` check read it the
 // way they read a megamix chapter.
 fn hooks() { ["bumper"] }
 fn capabilities() { ["probe", "catalog_read", "exec"] }

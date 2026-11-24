@@ -2069,7 +2069,7 @@ fn audit(ctx, picks, workspace) {
             #{
                 score: r.score,
                 // The cosine before the recency factor, and the factor
-                // itself, so `admin audit` can show why a pick ranks where
+                // itself, so `just audit` can show why a pick ranks where
                 // it does rather than only that it does. `aired_rank` is
                 // unit for a title outside the channel's remembered tail,
                 // which is the common case and the one where the factor is

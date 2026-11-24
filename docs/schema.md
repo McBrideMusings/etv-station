@@ -873,7 +873,7 @@ of executions, so a script that starts outside work owns its own deduplication.
 Each run logs one `hook.run` line with `hook` (`station#0`, `channel:<name>#1`),
 `trigger`, `duration_ms` and `exit` (the exit code; `0` for a script that
 finished; `-1` when no code exists). `etv-station --config <station.yaml>
---list-hooks` (or `admin hooks`) prints every configured hook.
+--list-hooks` (or `just hooks`) prints every configured hook.
 
 ### Channel numbers
 
@@ -1980,7 +1980,7 @@ in 43. On a pooled channel the taste vector already is the house vector, so a
 nonzero value there fails the generation with an error instead of doing nothing.
 
 Every pick's audit detail carries `house_score`, `unusual_weight` and `seen`,
-and the verdict names the half the pick came from — so `admin audit` says
+and the verdict names the half the pick came from — so `just audit` says
 which of two sibling pools aired something without the reader holding the
 config.
 
@@ -2314,10 +2314,10 @@ A change to the list therefore has to reach three sets of scripts:
 |---|---|
 | `examples/plugins/*.rhai` | `cargo test` — `crates/etv-station/tests/plugin_dirs_satisfy_contract.rs` |
 | `deploy/appdata/plugins/*.rhai` | the same test, which skips when the directory is absent (it is gitignored, so a worktree and a fresh clone have no copy) |
-| whatever else is already on the host | `admin plugin-check` — nothing else can see these |
+| whatever else is already on the host | `just plugin-check` — nothing else can see these |
 
 That third row is the one that matters. A host can carry scripts with no
-counterpart here at all. `admin deploy files` removes them now — `[deploy]`
+counterpart here at all. `just deploy files` removes them now — `[deploy]`
 declares `owns = ["channels", "plugins", "shared", ...]` with `delete = true`,
 so the sync prunes orphans inside those paths and leaves everything else on the
 volume (`catalog.db`, `history.db`, the HLS working set) untouched. It did not
@@ -2325,14 +2325,14 @@ always: the station's plugin directory held `taste-engine.rhai` — a
 `pool_provider` with no `audit()`, existing nowhere in this repo, and harmless
 only because its single reference sat inside a YAML comment.
 
-Pruning does not make `admin plugin-check` redundant. A deploy reconciles the
+Pruning does not make `just plugin-check` redundant. A deploy reconciles the
 host to this checkout; the check answers what is on the host *right now*,
 before a deploy, which is the state a running station is actually loading. No check that compares local files to their counterparts can express
-that case, so `admin plugin-check` copies the host's whole plugin directory
+that case, so `just plugin-check` copies the host's whole plugin directory
 down and walks it with `etv-station --check-plugins`, using the binary on your
 branch rather than the one already deployed.
 
-Run `admin plugin-check` before `admin deploy image` whenever the contract
+Run `just plugin-check` before `just deploy image` whenever the contract
 changed — a new required function, a renamed hook, a new required capability.
 
 #### `capabilities()` — which host inputs a script needs (#167)
@@ -2785,7 +2785,7 @@ viewing while looking perfectly healthy. See `ctx.account_id` above.
 
 With `explain: true`, each item the channel schedules gets a "why" line
 appended to its guide description, built from that item's own
-`metadata.audit` trail (ADR 0011) — the same trail `admin audit` already
+`metadata.audit` trail (ADR 0011) — the same trail `just audit` already
 reads:
 
 ```
@@ -2811,7 +2811,7 @@ existing synopsis is never replaced, only appended to. `detail` is never read
 to build this line; it stays opaque per ADR 0002.
 
 `explain` is opt-in — a `verdict` is
-written for `admin audit`'s operator reader, not a viewer, so surfacing it
+written for `just audit`'s operator reader, not a viewer, so surfacing it
 (or a plugin's `guide`) to everyone watching the channel is a call made per
 channel, in writing, not derived automatically.
 
@@ -3416,7 +3416,7 @@ An example with two sources, a vocal-over seam at 8 s, and a title card per song
 }
 ```
 
-**`notes` belongs to the plugin.** The megamix plugin writes the chapter's tempo, key and songs there so `admin audit` can explain the seams:
+**`notes` belongs to the plugin.** The megamix plugin writes the chapter's tempo, key and songs there so `just audit` can explain the seams:
 
 ```json
 "notes": {
@@ -3433,7 +3433,7 @@ The renderer reads none of these. Tempo, key, bars, hooks and seams are the plug
 
 ### Naming a chapter
 
-A plugin that lays a chapter airs it in a bumper segment named `chapter:<stem>|<entry>|<entry>...`, where `<stem>` is the file stem of the render the segment is pending on. `GET /api/channels/{ch}/chapters` and `admin audit` find the queue job whose output has that stem, and its plan and state; a chapter with no job yet, airing beyond the sidecar's lead, is `waiting`. Lines left in `<render stem>.audit.txt` beside the render are shown as the chapter's notes.
+A plugin that lays a chapter airs it in a bumper segment named `chapter:<stem>|<entry>|<entry>...`, where `<stem>` is the file stem of the render the segment is pending on. `GET /api/channels/{ch}/chapters` and `just audit` find the queue job whose output has that stem, and its plan and state; a chapter with no job yet, airing beyond the sidecar's lead, is `waiting`. Lines left in `<render stem>.audit.txt` beside the render are shown as the chapter's notes.
 
 ### Rendering
 
@@ -3484,11 +3484,11 @@ Config keys: `expr` and `dir` (required); `floor` (default 2.5), `steady_beats` 
 
 **The `model` ranker** replaces steps 2 and 3's pick. The script offers the `model_clusters` largest distinct clusters (each with up to `model_songs` songs, drawn with the channel's seeded rng) and POSTs `brief` with each song's entry id, title, artist, year, tempo, Camelot code and hook energy to `model_url`, an OpenAI-compatible `chat/completions` endpoint, through `ctx.http` (`model_headers` carries an `Authorization` header; the 10-second `ctx.http` limit applies). It reads the first JSON object in the reply's text, `{"cluster": "c0", "hooks": ["<entry id>", ...]}`, and takes the hooks in that order. The pick is held to the rule's limits: an offered cluster, distinct songs from its list, and between `hooks_min` and as many hooks as the gap fits. A pick that breaks one, an HTTP error, a timeout or a reply with no JSON logs `megamix: model_rejected` with the reason and the rule picks the chapter instead; a good pick logs `megamix: model_ranked`. The chapter tempo, key, plan, queue and timeline are the rule path's.
 
-`GET /api/channels/{ch}/chapters` lists the channel's chapter segments on the airings ledger from an hour ago on, in air order: `name`, `start`, `job`, `hooks`, `state` (`airing`, `aired`, `queued`, `running`, `rendered`, `failed`, `unqueued` or `unknown`), the renderer's `render` record for the job, the `plan`, and the `notes` from `<stem>.audit.txt`. A ledger row is there from the generation that laid it, so a chapter appears within one tick of its build. `admin audit <channel>` prints the same notes under each chapter, as `render:` lines.
+`GET /api/channels/{ch}/chapters` lists the channel's chapter segments on the airings ledger from an hour ago on, in air order: `name`, `start`, `job`, `hooks`, `state` (`airing`, `aired`, `queued`, `running`, `rendered`, `failed`, `unqueued` or `unknown`), the renderer's `render` record for the job, the `plan`, and the `notes` from `<stem>.audit.txt`. A ledger row is there from the generation that laid it, so a chapter appears within one tick of its build. `just audit <channel>` prints the same notes under each chapter, as `render:` lines.
 
 ### Whole-song plugin
 
-`examples/plugins/bumpers/whole_song.rhai` fills a gap with music videos played whole, joined by mixing strategies (§ Mixing strategies), and writes a render plan (§ Render plan) that the render sidecar queues near air. It needs `probe`, `catalog_read` and `exec`, and names its segment `chapter:<stem>|<entry>|...` so the chapters endpoint, `admin audit` and the recent-songs check treat it as they treat a megamix chapter. Candidates are the pool's entries with audio facts at or above `floor`, a steady run of `steady_beats` beats, and a phrase boundary to leave the song by; songs of the last `tail` sets are skipped. The first song is drawn at random; each next one is drawn from the three nearest in tempo to the running tempo. The strategy per seam is drawn from `config.strategies` among `bass_swap`, `echo_out`, `drop_mix`, `blend` and `whole` (`vocal_over` needs stems and is refused). Unset, the list is the autodj spike's rule written as `when`s: `echo_out` when `seam.tempo_gap_pct > 8.0` or either beat confidence is under 1.5, or when a bass swap does not fit; `drop_mix` when `seam.energy_step_db > 3.0`; otherwise `bass_swap`. A song leaves at the latest 8-bar phrase boundary with room for its strategy, or, joined by `whole`, at the end of its file. After a bass swap or a blend the incoming song plays at the outgoing song's tempo and rides back to its own over `ride_bars` bars (a layer's `ride`, § Render plan); a song with no room for the ride before its seam or the end of the set keeps the entry tempo. A song entering at its file start has no lead-in for a bass swap, so the default list makes that seam a `drop_mix` on a step up and an `echo_out` otherwise. The picture is `megamix/picture.rhai`'s, one bar being the first song's. The last song plays until the gap ends or its file does; a set that ends early leaves the rest of the gap black.
+`examples/plugins/bumpers/whole_song.rhai` fills a gap with music videos played whole, joined by mixing strategies (§ Mixing strategies), and writes a render plan (§ Render plan) that the render sidecar queues near air. It needs `probe`, `catalog_read` and `exec`, and names its segment `chapter:<stem>|<entry>|...` so the chapters endpoint, `just audit` and the recent-songs check treat it as they treat a megamix chapter. Candidates are the pool's entries with audio facts at or above `floor`, a steady run of `steady_beats` beats, and a phrase boundary to leave the song by; songs of the last `tail` sets are skipped. The first song is drawn at random; each next one is drawn from the three nearest in tempo to the running tempo. The strategy per seam is drawn from `config.strategies` among `bass_swap`, `echo_out`, `drop_mix`, `blend` and `whole` (`vocal_over` needs stems and is refused). Unset, the list is the autodj spike's rule written as `when`s: `echo_out` when `seam.tempo_gap_pct > 8.0` or either beat confidence is under 1.5, or when a bass swap does not fit; `drop_mix` when `seam.energy_step_db > 3.0`; otherwise `bass_swap`. A song leaves at the latest 8-bar phrase boundary with room for its strategy, or, joined by `whole`, at the end of its file. After a bass swap or a blend the incoming song plays at the outgoing song's tempo and rides back to its own over `ride_bars` bars (a layer's `ride`, § Render plan); a song with no room for the ride before its seam or the end of the set keeps the entry tempo. A song entering at its file start has no lead-in for a bass swap, so the default list makes that seam a `drop_mix` on a step up and an `echo_out` otherwise. The picture is `megamix/picture.rhai`'s, one bar being the first song's. The last song plays until the gap ends or its file does; a set that ends early leaves the rest of the gap black.
 
 Config keys: `expr` and `dir` (required); `entry` (`landing`, the song's landing bar, or `start`, the whole song), `floor` (2.5), `steady_beats` (32), `tail` (12), `strategies` (the rule above), `blend_bars` (8), `picture_margin_db` (2), `picture_hold_beats` (4), `ride_bars` (16; 0 keeps a swapped song at the outgoing tempo for its whole play), `artist_field` (`show`), `card_script`, `ffmpeg`. `<stem>.audit.txt` gets one line per seam with the strategy, both songs, the tempo gap and the energy step.
 

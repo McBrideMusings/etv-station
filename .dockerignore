@@ -15,8 +15,6 @@ node_modules/
 # Local environment and personal task-runner config (gitignored already, but
 # keep them out of the build context regardless).
 .env
-admin.toml
-admin
 
 # Ephemeral / scratch and example fixtures. The build compiles only crates/ +
 # vendor/etv-next; examples/ (sample configs, assets, a nested etv-next output

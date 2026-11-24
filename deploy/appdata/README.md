@@ -33,7 +33,7 @@ to the file that names it, not to any fixed directory. That is what makes the
 per-channel layout possible: a channel's own overlay and logo sit right next
 to it, and only the handful of marks two channels share had to move to
 `shared/`. Adding a channel is one new `channels/<name>/` directory plus
-`admin deploy files` — `station.yaml`'s `channels:` glob (`channels/*/channel.yaml`)
+`just deploy files` — `station.yaml`'s `channels:` glob (`channels/*/channel.yaml`)
 picks it up with no edit there.
 
 A channel's lineup/guide display name is its own `display_name:` in

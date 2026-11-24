@@ -2,7 +2,7 @@
 # How far behind origin/main is the deployed container? (#362)
 #
 # Reads the commit the running container was built from off its /build.json
-# (stamped by tools/build-image.sh) and counts the commits on origin/main that
+# (stamped by tools/deploy.sh) and counts the commits on origin/main that
 # it lacks. A merged fix that is not running reads "N commits behind" instead
 # of looking like a fix that did not work.
 #
@@ -28,7 +28,7 @@ git -C "$repo_root" fetch -q origin main || { echo "fatal: git fetch origin main
 tip=$(git -C "$repo_root" rev-parse origin/main)
 
 if [ "$revision" = "unknown" ]; then
-  echo "UNSTAMPED: the container was built without tools/build-image.sh (created $created)"
+  echo "UNSTAMPED: the container was built without tools/deploy.sh (created $created)"
   exit 1
 fi
 sha=${revision%-dirty}

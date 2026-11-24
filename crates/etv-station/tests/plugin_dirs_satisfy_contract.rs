@@ -23,7 +23,7 @@
 //! that exists nowhere in this repo, armed and invisible because its one reference
 //! sat inside a YAML comment. Nothing readable from a checkout can see that file.
 //! `etv-station --check-plugins <DIR>` walks a directory instead of comparing
-//! copies, and `admin plugin-check` runs it against the host — that is the half of
+//! copies, and `just plugin-check` runs it against the host — that is the half of
 //! the guard that catches an orphan, and it belongs to the deploy, not to a test.
 
 use std::path::{Path, PathBuf};

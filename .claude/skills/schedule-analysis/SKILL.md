@@ -27,7 +27,7 @@ tools/ui-get.sh '/api/channels/<folder>/review?project=14d' [--prod] > <scratch>
 
 A local dashboard is `./tools/station-ui.sh` (`programming` §"The channel
 review" says which lineup it serves). A 14-day projection takes minutes;
-`tools/ui-get.sh` asks again until it lands. `admin playout <folder>` opens a
+`tools/ui-get.sh` asks again until it lands. `just playout <folder>` opens a
 trimmed copy of the same answer in a Wheel pane when a person wants to look at
 it.
 

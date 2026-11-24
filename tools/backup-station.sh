@@ -2,7 +2,7 @@
 # Snapshot the station's irreplaceable state on the Unraid host.
 #
 # WHAT ROLLBACK ACTUALLY NEEDS TO PROTECT. The container is the easy thing to
-# restore — `admin deploy` rebuilds it from the image in a minute. The hard
+# restore — `just deploy` rebuilds it from the image in a minute. The hard
 # things live on the data volume and have no other copy anywhere:
 #
 #   playout/history.db  the only record of what each channel has aired
@@ -36,7 +36,7 @@
 # a checkpoint. `.backup` uses SQLite's online backup API and yields one
 # consistent file with no need to stop the container.
 #
-# Env (all required; supplied by admin from .env):
+# Env (all required; supplied from .env by `just backup` and tools/deploy.sh):
 #   ETV_STATION_APPDATA  ETV_STATION_DATA  ETV_STATION_BACKUP_DIR
 #   ETV_STATION_BACKUP_KEEP  (optional, default 10)
 set -uo pipefail
@@ -53,9 +53,9 @@ command -v sqlite3 >/dev/null 2>&1 || {
 
 # The pre-deploy snapshot sets ETV_STATION_BACKUP_IF_STALE=1, which makes this a
 # no-op when a snapshot already exists from the last few minutes. Without it,
-# every `admin deploy --dry-run` took a real 198 MB snapshot and consumed a
+# every `just deploy --dry-run` took a real 198 MB snapshot and consumed a
 # retention slot, so ten dry runs would have evicted every genuine snapshot —
-# a safety mechanism destroying the thing it protects. `admin backup` does not
+# a safety mechanism destroying the thing it protects. `just backup` does not
 # set it, so an explicit backup is always taken.
 if [ "${ETV_STATION_BACKUP_IF_STALE:-0}" = "1" ]; then
     min_interval="${ETV_STATION_BACKUP_MIN_INTERVAL:-600}"

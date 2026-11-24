@@ -23,7 +23,7 @@ effect, and a code bug becomes a bead.
 ## Step 0 — what is prod running
 
 ```sh
-admin image-age                 # prod's commit against main
+just image-age                 # prod's commit against main
 ```
 
 The review pass simulates **this checkout's** code against prod's catalog,
@@ -48,7 +48,7 @@ The script finds symptoms. Each pass below explains them.
 ## Step 2 — schedule pass
 
 1. **Why each flagged item is there.** `tools/audit-report.sh <folder> --next 40`
-   (what `admin audit` runs) gives every upcoming item's audit
+   (what `just audit` runs) gives every upcoming item's audit
    trail: pool, `rank`, `score`, `recency_factor`, `near_misses`, `guide`
    line. A repeat with `recency_factor 1.0` was ranked as if its earlier
    airing did not exist.
@@ -78,7 +78,7 @@ Done when every `schedule`, `log` and error-card finding has a cause line.
 | Overlay graphics | every card renders, reads, and fits; assets exist | Render it (below) and look at every image |
 | Logo | on-screen bug present and legible; guide logo sent | the stills; `logo` findings (`tvg-logo`, XMLTV `<icon>`; set by the channel's `logo:`) |
 | Bumpers | each `fill:` script fills a gap without error | a block with `fill:` only: `./target/debug/etv-station bumper-preview --gap 45s <script>` per script; `POST /api/channels/<ch>/graphics/render {"kind":"bumper","script":…,"gap":"45s"}` (or Channels › Graphics) renders one to an mp4 |
-| Stream | not failing, not stalling, encoding on the GPU | `health` fact; `tools/attribute-stalls.sh --channel <N>`; `admin verify accel` |
+| Stream | not failing, not stalling, encoding on the GPU | `health` fact; `tools/attribute-stalls.sh --channel <N>`; `just verify accel` |
 
 **Render the overlay** with an item that really airs:
 

@@ -29,7 +29,7 @@
 # and container recreates.
 #
 # It used to be host-only state — scp'd to the appdata volume and referenced
-# from normalization.default.json — which meant every `admin deploy files` wiped
+# from normalization.default.json — which meant every `just deploy files` wiped
 # it and it had to be re-applied by hand. That is why the argv logs went stale
 # between 2026-08-15 and 2026-08-21 with nobody noticing. Do not reintroduce a
 # host-side copy: the image copy is the only one.

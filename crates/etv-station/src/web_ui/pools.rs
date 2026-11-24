@@ -1123,7 +1123,7 @@ fn snapshot_facts(
 }
 
 /// `GET /api/audio/{entry_id}`: the entry's audio facts from the explorer, the
-/// same JSON `admin facts <entry>` prints. 404 when the entry is unknown; 503
+/// same JSON `just facts <entry>` prints. 404 when the entry is unknown; 503
 /// with an `error` string when the explorer is unset or unreachable, so a
 /// broken explorer never reads as "not analyzed".
 pub(super) fn api_audio_fact(state: &AppState, entry_id: &str) -> Result<(u16, Value), String> {

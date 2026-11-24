@@ -2,12 +2,12 @@
 # Run the station's `--audit` mode against the deployed container and print the
 # report it wrote (#390, #394).
 #
-# WHY THIS IS A SCRIPT AND NOT A ONE-LINE admin.toml ENTRY. `admin
-# refresh-channel` and `admin backfill-history` are single `ssh … docker exec`
+# WHY THIS IS A SCRIPT AND NOT A ONE-LINE justfile RECIPE. `just refresh
+# channel` and `just repair history` are single `ssh … docker exec`
 # lines because the station's own stdout is the whole answer. `--audit` still
-# needs a wrapper for one reason: bare `admin audit`, with no channel, has to
+# needs a wrapper for one reason: bare `just audit`, with no channel, has to
 # answer "which channels have one" and exit 0 rather than a usage error, which
-# takes a branch admin.toml's `run` string cannot express.
+# takes a branch a one-line recipe cannot express.
 #
 # WHAT IT DELIBERATELY DOES NOT NEED. A tool that re-scores pools locally is the
 # counterexample this exists to avoid: it needs a local copy of catalog.db and
@@ -23,7 +23,7 @@
 #
 # Usage:
 #   tools/audit-report.sh                             # list channels, exit 0
-#   tools/audit-report.sh --list                      # name<TAB>chunk-count list (admin.toml picker)
+#   tools/audit-report.sh --list                      # name<TAB>chunk-count list (machine form)
 #   tools/audit-report.sh for-pierce                  # report for one channel
 #   tools/audit-report.sh for-pierce --next 25        # extra flags reach the binary
 #
@@ -51,8 +51,8 @@ target="$user@$UNRAID_HOST"
 # history.db there, with its -wal and -shm siblings beside it. A plain `ls`
 # listed all three as if they were channels you could audit.
 #
-# `--list` is the machine form: one `name<TAB>label` line per channel, which is
-# what admin.toml's picker parses. Bare is the human form.
+# `--list` is the machine form: one `name<TAB>label` line per channel, for
+# scripts. Bare is the human form.
 #
 # A folder the station config no longer names is labelled "unconfigured" in
 # the second column; `--audit <name>` only resolves configured channels.
@@ -70,7 +70,7 @@ if [[ $# -eq 0 || ${1:-} == "--list" ]]; then
   # holding a single file, and it costs no extra round trip.
   if [[ ${1:-} == "--list" ]]; then
     # A folder with chunks in it is listed whether or not the station config
-    # still names it, but `admin audit <name>` resolves names against the
+    # still names it, but `just audit <name>` resolves names against the
     # config only. So the label says which folders the config no longer has —
     # the roster `etv-station --audit --list` prints — and a retired folder
     # still consuming the data volume stays visible.
@@ -81,13 +81,13 @@ if [[ $# -eq 0 || ${1:-} == "--list" ]]; then
     folders=$(ssh "$target" "find '$ETV_STATION_DATA/playout' -mindepth 1 -maxdepth 1 -type d -exec sh -c 'printf \"%s\t%s chunk(s)\n\" \"\$(basename \"\$1\")\" \"\$(ls -1 \"\$1\"/*.json 2>/dev/null | wc -l | tr -d \" \")\"' _ {} \; 2>/dev/null | sort") || exit 2
     printf '%s\n' "$folders" | CONFIGURED="$configured" awk -F'\t' '
       BEGIN { n = split(ENVIRON["CONFIGURED"], names, "\n"); for (i = 1; i <= n; i++) known[names[i]] = 1 }
-      { print ($1 in known) ? $0 : $0 ", unconfigured (admin audit refuses it)" }'
+      { print ($1 in known) ? $0 : $0 ", unconfigured (just audit refuses it)" }'
     exit 0
   fi
   echo "Channels with a schedule to audit:"
   echo "$channels" | sed 's/^/  /'
   echo
-  echo "Run: admin audit <channel> [--next N]"
+  echo "Run: just audit <channel> [--next N]"
   exit 0
 fi
 

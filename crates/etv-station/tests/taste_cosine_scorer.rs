@@ -1213,7 +1213,7 @@ fn no_exploration_slot_ever_draws_a_title_from_the_airing_tail() {
     }
 }
 
-/// What `admin audit` actually prints. The two halves this change touches
+/// What `just audit` actually prints. The two halves this change touches
 /// are written by `pick()` and rendered by `audit_report::render`, and the
 /// tests above only check the first half — so this feeds real plugin output
 /// straight into the real renderer and asserts the damping is legible on the

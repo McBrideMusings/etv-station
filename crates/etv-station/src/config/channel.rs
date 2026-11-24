@@ -348,7 +348,7 @@ pub struct ScoringConfig {
     ///
     /// Off by default and opt-in: a
     /// plugin's `guide` sentence or a built-in stage's `verdict` is written
-    /// for a different reader (an operator running `admin audit`, or the
+    /// for a different reader (an operator running `just audit`, or the
     /// plugin author), so surfacing it to every viewer is a call the person
     /// running the server makes per channel, in writing.
     #[serde(default)]
