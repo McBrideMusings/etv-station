@@ -99,6 +99,18 @@ fn run_full(
     seed: u64,
     config: Option<serde_json::Value>,
 ) -> Vec<PickedItem> {
+    run_logged(cat, db, recent, target_count, seed, config).0
+}
+
+/// [`run_full`], plus every request the fake explorer answered, path and query.
+fn run_logged(
+    cat: &Catalog,
+    db: &Path,
+    recent: Vec<String>,
+    target_count: usize,
+    seed: u64,
+    config: Option<serde_json::Value>,
+) -> (Vec<PickedItem>, Vec<String>) {
     let script = plugin_path();
     let mut cache = ScoreCache::default();
     cache.prepare_unprofiled(cat, &script, None).unwrap();
@@ -114,7 +126,7 @@ fn run_full(
         ..Default::default()
     };
 
-    pick(
+    let picks = pick(
         &cache,
         &script,
         None,
@@ -124,7 +136,9 @@ fn run_full(
         Some(&config),
         granted,
     )
-    .expect("pick() must succeed against a fixture with at least one keyworded candidate")
+    .expect("pick() must succeed against a fixture with at least one keyworded candidate");
+    let hits = server.hits.lock().unwrap().clone();
+    (picks, hits)
 }
 
 /// Runs the plugin once and returns `(entry_id, distance-from-previous)` in
@@ -452,5 +466,48 @@ fn a_picks_near_misses_name_the_steps_runners_up() {
     assert!(
         saw_non_empty,
         "expected at least one pick to name a runner-up: {picked:?}"
+    );
+}
+
+/// Over 50 candidates the script walks `/items` rather than asking per title,
+/// and the walk asks only for the `keywords` namespace it reads: a walk with
+/// every namespace moved the whole store's enrichment on each pick.
+#[test]
+fn a_walk_over_many_candidates_reads_only_the_keywords_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("taste.db");
+    let ids: Vec<String> = (0..60).map(|i| format!("m{i:02}")).collect();
+    let kws: Vec<[String; 2]> = (0..60)
+        .map(|i| [format!("k{}", i % 7), format!("k{}", i % 11)])
+        .collect();
+    let kw_refs: Vec<[&str; 2]> = kws.iter().map(|[a, b]| [a.as_str(), b.as_str()]).collect();
+    let movies: Vec<(&str, &[&str])> = ids
+        .iter()
+        .zip(&kw_refs)
+        .map(|(id, k)| (id.as_str(), &k[..]))
+        .collect();
+    write_fixture(&db, &movies);
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let cat = catalog(&id_refs, None);
+
+    let (picks, hits) = run_logged(&cat, &db, Vec::new(), 5, 1, None);
+
+    assert!(!picks.is_empty());
+    let walks: Vec<&String> = hits.iter().filter(|h| h.starts_with("/items?")).collect();
+    assert!(
+        !walks.is_empty(),
+        "60 candidates must walk /items: {hits:?}"
+    );
+    assert!(
+        walks
+            .iter()
+            .all(|h| h.contains("include=enrichment&namespace=keywords")),
+        "every walk page must ask only for keywords: {walks:?}"
+    );
+    assert!(
+        !hits
+            .iter()
+            .any(|h| h.contains("/enrichment") && !h.contains("namespace=keywords")),
+        "no per-title read may ask for every namespace: {hits:?}"
     );
 }

@@ -460,34 +460,37 @@ fn px_list(path) {
     }
 }
 
-// Fetch every enrichment fact, in every namespace, of each of `ids` not
-// already held. Up to 50 titles are one `GET /items/{id}/enrichment` each;
-// more walk `GET /items?type=show|movie&include=enrichment` (the API has no
+// Fetch each of `ids`' enrichment facts in namespace `ns`, for every id not
+// already held under `ns`. Up to 50 titles are one
+// `GET /items/{id}/enrichment?namespace=` each; more walk
+// `GET /items?type=show|movie&include=enrichment&namespace=` (the API has no
 // read by a set of ids), keeping only the titles asked for and stopping once
-// all are found. One walk serves every namespace a pick() reads.
-fn px_load_facts(ids) {
+// all are found. Facts are held per `ns + "\x01" + id`, so a pick() that reads
+// a second namespace walks again for that namespace's facts alone.
+fn px_load_facts(ids, ns) {
     let want = #{};
     for id in ids {
-        if this.facts[id] == () { want[id] = true; }
+        if this.facts[ns + "\x01" + id] == () { want[id] = true; }
     }
     if want.len() == 0 { return; }
+    let ns_q = "namespace=" + px_encode(ns);
     if want.len() <= 50 {
         for id in want.keys() {
-            let facts = this.px_get("/items/" + px_encode(id) + "/enrichment");
-            this.facts[id] = if facts == () { [] } else { facts };
+            let facts = this.px_get("/items/" + px_encode(id) + "/enrichment?" + ns_q);
+            this.facts[ns + "\x01" + id] = if facts == () { [] } else { facts };
         }
         return;
     }
     for kind in ["show", "movie"] {
         let after = ();
         while want.len() > 0 {
-            let path = "/items?type=" + kind + "&include=enrichment&limit=1000";
+            let path = "/items?type=" + kind + "&include=enrichment&" + ns_q + "&limit=1000";
             if after != () { path += "&after=" + px_encode(after); }
             let page = this.px_get(path);
             if page == () { throw "plex-db-ex explorer: GET " + path + " answered 404"; }
             for item in page.data {
                 if want[item.item_id] != () {
-                    this.facts[item.item_id] = item.enrichment;
+                    this.facts[ns + "\x01" + item.item_id] = item.enrichment;
                     want.remove(item.item_id);
                 }
             }
@@ -495,19 +498,16 @@ fn px_load_facts(ids) {
             after = page.next;
         }
     }
-    for id in want.keys() { this.facts[id] = []; }
+    for id in want.keys() { this.facts[ns + "\x01" + id] = []; }
 }
 
 // Each of `ids` with its facts in namespace `ns`, as `#{ id: [#{ namespace,
 // key, value, fetched_at }] }`; a title with none in `ns` is absent.
 fn enrichment_for_many(ids, ns) {
-    this.px_load_facts(ids);
+    this.px_load_facts(ids, ns);
     let out = #{};
     for id in ids {
-        let kept = [];
-        for f in this.facts[id] {
-            if f.namespace == ns { kept.push(f); }
-        }
+        let kept = this.facts[ns + "\x01" + id];
         if kept.len > 0 { out[id] = kept; }
     }
     out

@@ -295,7 +295,7 @@ impl Store {
 /// left parked on its socket, which the test process reaps).
 pub struct Server {
     pub url: String,
-    /// Requests answered, by path without the query.
+    /// Requests answered, path and query as sent.
     pub hits: Arc<Mutex<Vec<String>>>,
     pub store: Arc<Mutex<Store>>,
 }
@@ -341,7 +341,7 @@ pub fn serve(store: Store) -> Server {
                     let mut body = vec![0u8; length];
                     let _ = reader.read_exact(&mut body);
                     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
-                    h.lock().unwrap().push(path.to_string());
+                    h.lock().unwrap().push(target.clone());
                     let (status, reply) = if method == "GET" {
                         answer(&s.lock().unwrap(), path, query)
                     } else {
