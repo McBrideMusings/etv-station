@@ -618,11 +618,11 @@ fn idle(ctx, why) {
     t
 }
 
-// The vocal and instrumental of song `h` from output second `from` to `until`,
+// The vocal and instrumental of song `h` from output second `from` to `until_s`,
 // at the chapter tempo and key, read where its hook places them.
-fn body_layers(label, h, slot_s, from, until, fade_in, fade_out, bar_s) {
+fn body_layers(label, h, slot_s, from, until_s, fade_in, fade_out, bar_s) {
     import "megamix/strategies" as strategies;
-    let len = until - from;
+    let len = until_s - from;
     if len <= 0.0 { return []; }
     let native_bar = 240.0 / h.native_bpm;
     let src = h.landing_s + (from - slot_s) / bar_s * native_bar;
@@ -730,13 +730,13 @@ fn arrange(ctx, cfg, drawn, songs, bar_s) {
             from = slot_s + num(joined.b_from_s);
             fade_in = if joined.b_fade_s > 0.0 { joined.b_fade_s } else { 0.02 };
         }
-        let until = slot_s + h.bars * bar_s;
+        let until_s = slot_s + h.bars * bar_s;
         let fade_out = 0.02;
         if i + 1 < songs.len() {
-            until += num(joins[i + 1].a_until_s);
+            until_s += num(joins[i + 1].a_until_s);
             fade_out = num(joins[i + 1].a_fade_s);
         }
-        layers.append(body_layers("hook " + (i + 1) + " (" + h.entry_id + ") ", h, slot_s, from, until, fade_in, fade_out, bar_s));
+        layers.append(body_layers("hook " + (i + 1) + " (" + h.entry_id + ") ", h, slot_s, from, until_s, fade_in, fade_out, bar_s));
     }
     #{ layers: layers, seams: seams }
 }
