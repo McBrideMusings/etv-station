@@ -1133,7 +1133,7 @@ the previous build.
 `GET /api/channels/{ch}/pools?draft=ID`. Drive it with `tools/ui-get.sh` (it takes `-X` and `-d`):
 
 ```bash
-tools/ui-get.sh /api/channels/034-syfy/pools | jq '.pools|keys'        # non-scored channel: every pool, sources and config, no ranking
+tools/ui-get.sh /api/channels/034-syfy/pools | jq '.pools|map_values({member_count, member_runtime_ms})'  # non-scored pools: sources, config and resolved members, no ranking
 tools/ui-get.sh /api/channels/001-for-you/pools | jq '.pools.movies.ranking[:3]'
 D=$(tools/ui-get.sh -X POST -d '{}' /api/channels/001-for-you/drafts | jq -r .draft)
 tools/ui-get.sh -X POST -d '{"op":"add","pool":"movies","entry":{"keyword":"<kw>","weight":3}}' /api/channels/001-for-you/drafts/$D/edits | jq '.pools.movies.ranking[:3]'

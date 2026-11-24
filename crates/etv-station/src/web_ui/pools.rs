@@ -424,6 +424,72 @@ fn ranking_json(
         .collect()
 }
 
+/// An `expr` or `groups` pool's members, from the catalog query generation
+/// runs, with a field `order:` applied: the first [`RANKING_SHOWN`] items,
+/// the total count and runtime, and each show's count and runtime.
+/// `order: random` is left in catalog order (`order_random`), since its
+/// shuffle is reseeded every period.
+fn members(
+    catalog: &Catalog,
+    pool: &Pool,
+    groups: &[config::ShowGroup],
+) -> Result<serde_json::Map<String, Value>, String> {
+    let mut ids = crate::pattern::unscored_pool_ids(catalog, pool, groups)?;
+    let random = matches!(pool.order, Some(config::Order::Random));
+    if let Some(order) = pool.order.as_ref().filter(|_| !random) {
+        ids = catalog
+            .resolve_order(&ids, order, 0)
+            .map_err(|e| e.to_string())?;
+    }
+    let entries = catalog.entries_for(&ids).map_err(|e| e.to_string())?;
+    let mut total_ms: i64 = 0;
+    // (show, episodes, ms), in the order each show first appears.
+    let mut shows: Vec<(String, usize, i64)> = Vec::new();
+    for e in ids.iter().filter_map(|id| entries.get(id)) {
+        let ms = e.duration_ms.unwrap_or(0);
+        total_ms += ms;
+        if let Some(show) = &e.show {
+            match shows.iter_mut().find(|(s, _, _)| s == show) {
+                Some(row) => {
+                    row.1 += 1;
+                    row.2 += ms;
+                }
+                None => shows.push((show.clone(), 1, ms)),
+            }
+        }
+    }
+    let listed: Vec<Value> = ids
+        .iter()
+        .take(RANKING_SHOWN)
+        .map(|id| {
+            let entry = entries.get(id);
+            let mut v = picked_item_json(catalog, id, None, entry);
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "duration_ms".to_string(),
+                    json!(entry.and_then(|e| e.duration_ms)),
+                );
+            }
+            v
+        })
+        .collect();
+    let mut out = serde_json::Map::new();
+    out.insert("members".to_string(), json!(listed));
+    out.insert("member_count".to_string(), json!(ids.len()));
+    out.insert("member_runtime_ms".to_string(), json!(total_ms));
+    out.insert(
+        "member_shows".to_string(),
+        json!(
+            shows
+                .into_iter()
+                .map(|(show, count, ms)| json!({ "show": show, "count": count, "runtime_ms": ms }))
+                .collect::<Vec<_>>()
+        ),
+    );
+    out.insert("order_random".to_string(), json!(random));
+    Ok(out)
+}
+
 fn mtime(path: &Path) -> SystemTime {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
@@ -540,6 +606,12 @@ fn pool_body(
             (None, true) => Value::Null,
         };
         obj.insert("sources".to_string(), sources);
+        match members(&state.catalog, pool, &loc.channel.groups) {
+            Ok(m) => obj.extend(m),
+            Err(e) => {
+                obj.insert("error".to_string(), json!(e));
+            }
+        }
         return body;
     }
 
@@ -1447,6 +1519,17 @@ mod tests {
             plain["pools"]["films"]["sources"],
             json!({"expr": "item.type == \"movie\""})
         );
+        let films = &plain["pools"]["films"];
+        assert_eq!(films["member_count"], 4, "{films}");
+        let ids: Vec<&str> = films["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["mov-a", "mov-b", "mov-c", "mov-d"]);
+        assert_eq!(films["member_shows"], json!([]));
+        assert_eq!(films["order_random"], false);
     }
 
     #[test]

@@ -2271,24 +2271,35 @@ pub(crate) fn fingerprint_pool_sources(
 ) -> Result<Vec<Vec<String>>, String> {
     let mut out = Vec::with_capacity(pools.len());
     for cfg in pools {
-        let ids = match (&cfg.expr, &cfg.plugin, !cfg.groups.is_empty()) {
-            (Some(expr), None, false) => catalog.resolve_query(expr).map_err(|e| e.to_string())?,
-            (None, Some(plugin), false) => {
+        let ids = match &cfg.plugin {
+            Some(plugin) if cfg.expr.is_none() && cfg.groups.is_empty() => {
                 let path = crate::score::resolve_plugin_path(base_dir, plugin);
                 crate::score::resolve_source_ids(catalog, &path, cfg.sources.as_ref())
                     .map_err(|m| format!("pool {:?}: {m}", cfg.name))?
             }
-            (None, None, true) => resolve_group_pool(catalog, cfg, groups)?,
-            _ => {
-                return Err(format!(
-                    "pool {:?} must set exactly one of `expr`, `plugin`, or `groups`",
-                    cfg.name
-                ));
-            }
+            _ => unscored_pool_ids(catalog, cfg, groups)?,
         };
         out.push(ids);
     }
     Ok(out)
+}
+
+/// An `expr` or `groups` pool's member ids, before any `order`: the catalog
+/// query generation runs for it. Errs on a plugin pool, or one setting more
+/// or fewer than one source.
+pub(crate) fn unscored_pool_ids(
+    catalog: &Catalog,
+    cfg: &Pool,
+    groups: &[ShowGroup],
+) -> Result<Vec<String>, String> {
+    match (&cfg.expr, &cfg.plugin, !cfg.groups.is_empty()) {
+        (Some(expr), None, false) => catalog.resolve_query(expr).map_err(|e| e.to_string()),
+        (None, None, true) => resolve_group_pool(catalog, cfg, groups),
+        _ => Err(format!(
+            "pool {:?} must set exactly one of `expr`, `plugin`, or `groups`",
+            cfg.name
+        )),
+    }
 }
 
 /// Resolve a `groups`-sourced pool's item list (#165): the union of every

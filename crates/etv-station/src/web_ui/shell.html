@@ -2376,12 +2376,31 @@ function movementHtml(item) {
   return '<span class="mv same" title="same place">—</span>';
 }
 
+const hours = (ms) => `${((ms || 0) / 3600000).toFixed(1)}h`;
+const sxe = (c) => c.season != null && c.episode != null
+  ? ` S${String(c.season).padStart(2, '0')}E${String(c.episode).padStart(2, '0')}` : '';
+
+// An expr or groups pool's members, as the catalog query generation runs resolves them.
+function membersHtml(p) {
+  if (!p.members) return '';
+  const shows = p.member_shows.length > 1 ? `<div class="pfield wide"><h4>shows <span class="muted">— ${p.member_shows.length} shows</span></h4>
+    <div class="rank-scroll"><table class="rtable"><thead><tr><th>show</th><th class="num">episodes</th><th class="num">runtime</th></tr></thead>
+      <tbody>${p.member_shows.map((s) => `<tr><td>${esc(s.show)}</td><td class="num">${s.count}</td><td class="num">${hours(s.runtime_ms)}</td></tr>`).join('')}</tbody></table></div></div>` : '';
+  const rows = p.members.map((c, i) => `<tr><td class="num">${i + 1}</td><td>${esc(poolTitle(c))}${sxe(c)}</td>
+      <td class="num">${c.duration_ms ? Math.round(c.duration_ms / 60000) + 'm' : ''}</td></tr>`).join('');
+  return `${shows}<div class="pfield wide"><h4>members <span class="muted">— what the sources match${p.order_random ? '; order: random reshuffles each period, so this is catalog order' : ''}</span></h4>
+    <div class="rank-scroll"><table class="rtable"><thead><tr><th class="num">#</th><th>title</th><th class="num">runtime</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="3" class="muted">(matches nothing)</td></tr>'}</tbody></table></div>
+    <div class="muted">showing ${p.members.length} of ${p.member_count}</div></div>`;
+}
+
 function poolHtml(name, p, draft, openIt) {
   const head = `<summary><b>${esc(name)}</b> <span class="chip">${p.scored ? 'scored by plugin' : 'not scored'}</span>
-    ${p.scored ? `<span class="muted">${p.ranking_count} ranked${p.edited ? ' · edited in this draft' : ''}</span>` : ''}</summary>`;
+    ${p.scored ? `<span class="muted">${p.ranking_count} ranked${p.edited ? ' · edited in this draft' : ''}</span>`
+      : 'member_count' in p ? `<span class="muted num">${p.member_count} items · ${hours(p.member_runtime_ms)}</span>` : ''}</summary>`;
   const sources = `<div class="pfield"><h4>sources${p.scored && !p.sources_authored ? ' <span class="muted">(the plugin\'s own default)</span>' : ''}</h4>${kvHtml(p.sources)}</div>`;
   const config = `<div class="pfield"><h4>config${p.config_authored ? '' : ' <span class="muted">(none written)</span>'}</h4>${kvHtml(p.config)}</div>`;
-  if (!p.scored) return `<details class="poolsec"${openIt ? " open" : ""} data-pool="${esc(name)}">${head}<div class="pgrid">${sources}${config}</div></details>`;
+  if (!p.scored) return `<details class="poolsec"${openIt ? " open" : ""} data-pool="${esc(name)}">${head}<div class="pgrid">${sources}${config}${membersHtml(p)}</div>${p.error ? `<div class="error">${esc(p.error)}</div>` : ''}</details>`;
   if (p.error) return `<details class="poolsec"${openIt ? " open" : ""} data-pool="${esc(name)}">${head}<div class="pgrid">${sources}${config}</div>
     <div class="error">${esc(p.error)}</div></details>`;
 
