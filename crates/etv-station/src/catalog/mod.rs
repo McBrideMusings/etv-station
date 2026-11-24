@@ -652,6 +652,73 @@ impl Catalog {
         Ok(())
     }
 
+    /// Every `fs:` entry whose id is the hash of one of its own files' full,
+    /// unstripped path, paired with the id that path derives under `roots`.
+    ///
+    /// An `fs:` id follows `identity_roots` (ADR 0009): it carries no external
+    /// identity, so a catalog ingested before `roots` was set holds ids that no
+    /// other store derives from the same file. An entry whose id came from
+    /// anywhere else (a GUID, a fold onto a sibling) is left out. Empty when
+    /// `roots` is empty or every id already matches.
+    pub fn fs_rekeys(&self, roots: &[&str]) -> Result<Vec<(String, String)>, CatalogError> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut pairs = std::collections::BTreeMap::new();
+        for source in self.all_sources()? {
+            let id = &source.entry_id;
+            if !id.starts_with("fs:")
+                || *id != derive_entry_id(&[], &canonical_path(&source.playback_path, &[]))
+            {
+                continue;
+            }
+            let rooted = derive_entry_id(&[], &canonical_path(&source.playback_path, roots));
+            if rooted != *id {
+                pairs.insert(id.clone(), rooted);
+            }
+        }
+        Ok(pairs.into_iter().collect())
+    }
+
+    /// Move each `(old, new)` entry id in `pairs` onto its new id, in one
+    /// transaction: a rename when `new` is not an entry yet, else a
+    /// [`Self::merge_entry`] onto it. `entries.show_id` follows too.
+    pub fn rekey_entries(
+        &self,
+        pairs: &[(String, String)],
+        stamp: &str,
+    ) -> Result<(), CatalogError> {
+        self.in_transaction(|cat| {
+            // The parent row is renamed before its children; the check waits for commit.
+            cat.conn.pragma_update(None, "defer_foreign_keys", "ON")?;
+            for (old, new) in pairs {
+                let exists: bool = cat.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM entries WHERE entry_id = ?1)",
+                    [new],
+                    |r| r.get(0),
+                )?;
+                if exists {
+                    cat.merge_entry(old, new, stamp)?;
+                } else {
+                    for sql in [
+                        "UPDATE entries SET entry_id = ?2 WHERE entry_id = ?1",
+                        "UPDATE entry_sources SET entry_id = ?2 WHERE entry_id = ?1",
+                        "UPDATE entry_external_ids SET entry_id = ?2 WHERE entry_id = ?1",
+                        "UPDATE tags SET entry_id = ?2 WHERE entry_id = ?1",
+                        "UPDATE collection_items SET entry_id = ?2 WHERE entry_id = ?1",
+                    ] {
+                        cat.conn.execute(sql, params![old, new])?;
+                    }
+                }
+                cat.conn.execute(
+                    "UPDATE entries SET show_id = ?2 WHERE show_id = ?1",
+                    params![old, new],
+                )?;
+            }
+            Ok::<_, CatalogError>(())
+        })
+    }
+
     /// Add a tag. Idempotent on `(entry_id, namespace, value)`.
     pub fn add_tag(
         &self,

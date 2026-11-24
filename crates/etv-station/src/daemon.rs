@@ -80,7 +80,16 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     // takes the connection as an argument, so a test supplies `None` rather than
     // deleting the variables out of the process (#132).
     let plex = PlexEnv::from_env();
-    let catalog = open_and_ingest_catalog(&station, plex.as_ref(), &signals.cancel).await?;
+    // The station-wide play-history database (#111): one file under
+    // `output_base`, shared by every channel and distinguished by a `channel`
+    // column, opened once for the same reason the catalog is — every channel
+    // task below gets a reference to this one handle rather than each
+    // managing its own. Opened before the catalog so a re-key moves its rows.
+    let history_db = Arc::new(HistoryDb::open(
+        station.station.output_base.join(HISTORY_DB_NAME),
+    )?);
+    let catalog =
+        open_and_ingest_catalog(&station, &history_db, plex.as_ref(), &signals.cancel).await?;
     if signals.cancel.is_cancelled() {
         tracing::info!(
             event = "daemon.shutdown_during_startup_ingest",
@@ -93,14 +102,6 @@ pub async fn run(station: Station) -> Result<(), StationError> {
     let opened_catalog_path = station.station.catalog_path.clone();
     let opened_source_roots = station.station.source_roots.clone();
     let opened_identity_roots = station.station.identity_roots.clone();
-    // The station-wide play-history database (#111): one file under
-    // `output_base`, shared by every channel and distinguished by a `channel`
-    // column, opened once for the same reason the catalog is — every channel
-    // task below gets a reference to this one handle rather than each
-    // managing its own.
-    let history_db = Arc::new(HistoryDb::open(
-        station.station.output_base.join(HISTORY_DB_NAME),
-    )?);
     // The last config that prepared cleanly. A `prepare_generation` failure on a
     // reload reverts to this instead of killing a daemon that's streaming fine.
     // See #90 and docs/adr/0001-reload-generation-revert.md.
@@ -603,6 +604,7 @@ fn plex_ingest_plan(
 /// Plex configured — which skips the Plex pass entirely and contacts nothing.
 async fn open_and_ingest_catalog(
     station: &Station,
+    history: &HistoryDb,
     plex: Option<&PlexEnv>,
     cancel: &Arc<Cancel>,
 ) -> Result<Option<Arc<CatalogInfo>>, StationError> {
@@ -615,14 +617,10 @@ async fn open_and_ingest_catalog(
         return Ok(None);
     };
 
-    let Some(catalog) = ingest_catalog(
-        station,
-        plex,
-        Catalog::open(path)?,
-        RefreshKind::Scheduled,
-        cancel,
-    )
-    .await?
+    let catalog = Catalog::open(path)?;
+    rekey_fs_entries(&catalog, history, &station.station.identity_roots)?;
+    let Some(catalog) =
+        ingest_catalog(station, plex, catalog, RefreshKind::Scheduled, cancel).await?
     else {
         // Shutdown abandoned the ingest and the handle went with it. The caller
         // checks `cancel` and exits, so no path index is built.
@@ -642,6 +640,34 @@ async fn open_and_ingest_catalog(
         path: PathBuf::from(path),
         path_index,
     })))
+}
+
+/// Move every `fs:` entry minted before `identity_roots` was set onto the id
+/// its path derives now (`Catalog::fs_rekeys`), history first: a crash between
+/// the two commits leaves the catalog's old ids in place, so the next start
+/// computes the same pairs and finishes the move.
+fn rekey_fs_entries(
+    catalog: &Catalog,
+    history: &HistoryDb,
+    identity_roots: &[String],
+) -> Result<(), StationError> {
+    let roots: Vec<&str> = identity_roots.iter().map(String::as_str).collect();
+    let pairs = catalog.fs_rekeys(&roots)?;
+    if pairs.is_empty() {
+        return Ok(());
+    }
+    let airings = history.rekey_entries(&pairs)?;
+    let stamp = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    catalog.rekey_entries(&pairs, &stamp)?;
+    tracing::info!(
+        event = "catalog.fs_rekeyed",
+        entries = pairs.len(),
+        airings,
+        "moved fs: entries onto the ids their paths derive under identity_roots",
+    );
+    Ok(())
 }
 
 /// Re-run [`ingest_catalog`] against the already-open catalog file — the
@@ -5369,10 +5395,15 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         let (_dir, path) = write_station("UTC");
         let station = crate::config::load(&path).unwrap();
         assert!(
-            open_and_ingest_catalog(&station, None, &Arc::new(Cancel::default()))
-                .await
-                .unwrap()
-                .is_none()
+            open_and_ingest_catalog(
+                &station,
+                &HistoryDb::open_in_memory().unwrap(),
+                None,
+                &Arc::new(Cancel::default())
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -5420,7 +5451,12 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         let started = std::time::Instant::now();
         let catalog = tokio::time::timeout(
             Duration::from_secs(10),
-            open_and_ingest_catalog(&station, Some(&plex), &cancel),
+            open_and_ingest_catalog(
+                &station,
+                &HistoryDb::open_in_memory().unwrap(),
+                Some(&plex),
+                &cancel,
+            ),
         )
         .await
         .expect("shutdown must not wait for the stalled plex response")
@@ -5459,9 +5495,14 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         // an ingest that read them itself would hit a live server. Nothing here
         // touches the process environment, so nothing races another test thread
         // reading it (#132).
-        let catalog = open_and_ingest_catalog(&station, None, &Arc::new(Cancel::default()))
-            .await
-            .unwrap();
+        let catalog = open_and_ingest_catalog(
+            &station,
+            &HistoryDb::open_in_memory().unwrap(),
+            None,
+            &Arc::new(Cancel::default()),
+        )
+        .await
+        .unwrap();
         assert!(catalog.is_some());
         assert!(db.exists());
     }
@@ -5499,5 +5540,75 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
             .expect("rerender_etv_next must write lineup.json into out_dir");
         let lineup: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(lineup["channels"].as_array().unwrap().len(), 1);
+    }
+
+    /// An `fs:` id hashed from the full path moves to plex-db-ex's id (the path
+    /// below `/media`), its plays and tags with it; a GUID entry and an id
+    /// already rooted stay; a second run finds nothing (etv-station-ki8x).
+    #[test]
+    fn rekey_moves_unrooted_fs_ids_and_their_plays() {
+        use crate::catalog::{Entry as CatEntry, EntrySource, Source, TagNs};
+        use crate::history::{AiringFilter, PlayRecord};
+        let gambino = "/media/concerts/Coachella/2019/Childish Gambino - Coachella 2019.mp4";
+        let (old, new) = ("fs:5912aa3d2afe249a", "fs:11080447b65872f8");
+        let rooted = crate::catalog::derive_entry_id(&[], "concerts/other.mp4");
+        let cat = Catalog::open_in_memory().unwrap();
+        for (id, path) in [
+            (old, gambino),
+            ("imdb:tt1", "/media/movies/a.mkv"),
+            (rooted.as_str(), "/media/concerts/other.mp4"),
+        ] {
+            cat.upsert_entry(&CatEntry::new(id, "video", id, Source::Plex))
+                .unwrap();
+            cat.add_source(&EntrySource {
+                source: Source::Plex,
+                source_id: format!("rk-{id}"),
+                entry_id: id.into(),
+                playback_path: path.into(),
+                last_seen: None,
+                missing_since: None,
+                unairable_reason: None,
+            })
+            .unwrap();
+        }
+        cat.add_tag(old, TagNs::Genre, "Concert").unwrap();
+        let history = HistoryDb::open_in_memory().unwrap();
+        let play = |id: &str| PlayRecord {
+            entry_id: id.into(),
+            start: time::OffsetDateTime::UNIX_EPOCH,
+            played_at: time::OffsetDateTime::UNIX_EPOCH,
+            ..Default::default()
+        };
+        history
+            .record("ch", &[play(old), play("imdb:tt1")])
+            .unwrap();
+        let roots = vec!["/media".to_string()];
+
+        rekey_fs_entries(&cat, &history, &roots).unwrap();
+
+        assert!(cat.entry(old).unwrap().is_none());
+        assert!(cat.entry(new).unwrap().is_some());
+        assert_eq!(
+            cat.entry_id_for_source(Source::Plex, &format!("rk-{old}"))
+                .unwrap()
+                .as_deref(),
+            Some(new),
+            "the rating key's pin follows the new id",
+        );
+        assert_eq!(cat.tags_for(new, TagNs::Genre).unwrap(), vec!["Concert"]);
+        assert!(cat.entry("imdb:tt1").unwrap().is_some());
+        assert!(cat.entry(&rooted).unwrap().is_some());
+        let ids: Vec<String> = history
+            .airings(&AiringFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|r| r.record.entry_id)
+            .collect();
+        assert_eq!(ids, vec![new.to_string(), "imdb:tt1".to_string()]);
+        let r: Vec<&str> = roots.iter().map(String::as_str).collect();
+        assert!(cat.fs_rekeys(&r).unwrap().is_empty());
     }
 }

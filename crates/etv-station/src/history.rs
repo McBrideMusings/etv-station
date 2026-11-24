@@ -704,6 +704,27 @@ impl HistoryDb {
         Ok(())
     }
 
+    /// Rewrite every `entry_id` and `show_id` equal to a pair's old id to its
+    /// new one, in one transaction, so the plays of a re-keyed entry stay its
+    /// plays (see `Catalog::fs_rekeys`). Returns how many rows changed.
+    pub fn rekey_entries(&self, pairs: &[(String, String)]) -> Result<usize, HistoryError> {
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction()?;
+        let mut rows = 0;
+        for (old, new) in pairs {
+            rows += tx.execute(
+                "UPDATE airings SET entry_id = ?2 WHERE entry_id = ?1",
+                params![old, new],
+            )?;
+            rows += tx.execute(
+                "UPDATE airings SET show_id = ?2 WHERE show_id = ?1",
+                params![old, new],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rows)
+    }
+
     /// Point the bumper row for `entry_id` starting at `start` (within a
     /// second, for the frame rounding of an emitted item's start) at `source`.
     /// Used when a pending segment's real file replaces its stand-in before

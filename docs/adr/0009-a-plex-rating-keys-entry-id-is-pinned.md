@@ -1,3 +1,5 @@
 # A Plex rating key's entry_id is pinned for life
 
 Once `resolve_existing` has resolved a Plex item's `ratingKey` to an `entry_id` and written the `entry_sources` row recording that pairing, every later ingest pass for the same `ratingKey` resolves onto that same `entry_id` first, before any GUID or path match is consulted. Every GUID Plex currently reports for the item is still recorded against the pinned id, so it stays reachable by any of them — only the `entry_id` itself stops moving. This mirrors plex-db-ex's ADR-0008, which pins the same way on that project's side of the same catalog.
+
+An `fs:` id is the exception: it carries no external identity, only a hash of the file's path under the station's `identity_roots`, and it follows those roots. When an entry's id is the hash of one of its own files' full, unstripped path and `identity_roots` derives a different one, the daemon moves the entry and its `history.db` airings onto the new id at startup, before the first ingest, and the rating key stays pinned to the new id. That keeps an `fs:` entry's id equal to plex-db-ex's `item_id` for the same file once both strip the same root.
