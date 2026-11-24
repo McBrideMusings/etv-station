@@ -555,7 +555,8 @@ mod tests {
     /// The router over the repo's example station and an empty catalog: no
     /// socket, no simulation worker.
     fn example_state() -> AppState {
-        let station = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/station.yaml");
+        let station =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/station-samples.yaml");
         AppState {
             catalog: Catalog::open_in_memory().expect("in-memory catalog"),
             pools: PoolState::default(),

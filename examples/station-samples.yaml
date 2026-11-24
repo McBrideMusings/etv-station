@@ -1,0 +1,36 @@
+# The tracked lineup the dashboard's tests load (web_ui `example_state`).
+# Every file it names is tracked: examples/samples/ holds no personal channels,
+# while examples/station.yaml also globs the gitignored examples/channels/*.yaml,
+# so a test on it would see a different lineup in each checkout.
+tz: "America/Chicago"
+
+output_base: examples/output
+
+channels:
+  - samples/*.yaml
+
+chronologies:
+  - chronologies/*.yaml
+
+arcs:
+  - arcs/*.yaml
+
+catalog_path: tmp/catalog.db
+
+normalization:
+  audio:
+    format: aac
+    bitrate_kbps: 192
+    buffer_kbps: 384
+    channels: 2
+    sample_rate_hz: 48000
+    normalize_loudness: false
+  video:
+    format: h264
+    bit_depth: 8
+    width: 1920
+    height: 1080
+    bitrate_kbps: 6000
+    buffer_kbps: 12000
+  subtitle:
+    mode: convert
