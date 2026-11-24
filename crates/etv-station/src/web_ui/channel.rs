@@ -1099,7 +1099,11 @@ fn offer_still(
 /// for an id no review offered.
 pub(super) fn still_reply(state: &AppState, id: &str) -> Reply {
     match state.review.stills.get(id) {
-        Some(still) => Reply::Still(id.to_string(), Box::new(still.clone())),
+        Some(still) => Reply::Still(
+            state.review.still_dir.clone(),
+            id.to_string(),
+            Box::new(still.clone()),
+        ),
         None => Reply::Json(404, json!({ "error": "no such still; reload the review" })),
     }
 }

@@ -44,6 +44,7 @@ mod arr;
 mod channel;
 mod chapters;
 mod edit;
+mod entry_file;
 mod graphics;
 mod health;
 mod lineup;
@@ -116,6 +117,9 @@ struct AppState {
     keywords: KeywordCache,
     /// The Health tab's audio coverage count (`pools::api_health_audio`).
     coverage: Arc<Mutex<pools::Coverage>>,
+    /// The station's `artwork_cache_dir`, read once at start: where the item
+    /// inspector finds an entry's cached Plex artwork (`entry_file`).
+    artwork_dir: Option<PathBuf>,
 }
 
 /// Every stored keyword with its spellings.
@@ -169,6 +173,10 @@ pub fn serve(options: Options) -> Result<(), String> {
         plexdb.clone(),
     );
     review.sims.spawn();
+    let artwork_dir = crate::config::load_for_inspection(&options.station)
+        .ok()
+        .and_then(|s| s.station.artwork_cache_dir)
+        .map(PathBuf::from);
     let mut state = AppState {
         catalog,
         pools: PoolState::default(),
@@ -179,6 +187,7 @@ pub fn serve(options: Options) -> Result<(), String> {
         plexdb,
         keywords: Default::default(),
         coverage: Default::default(),
+        artwork_dir,
     };
     run(&server, &mut state);
     Ok(())
@@ -232,9 +241,13 @@ enum Reply {
     Yaml(String),
     /// A script the page loads from this server, so playback needs no CDN.
     Script(&'static str),
-    /// A tune-in still a review offered under this id, rendered on its own
-    /// thread by [`channel::respond_still`].
-    Still(String, Box<TuneInStill>),
+    /// A still rendered (or read back) under this id in this directory, on its
+    /// own thread by [`channel::respond_still`]: a review's tune-in still or an
+    /// inspector thumbnail.
+    Still(PathBuf, String, Box<TuneInStill>),
+    /// A JSON answer that may block (a probe of a file on a network mount),
+    /// computed on its own thread so the router keeps serving.
+    OffThread(Box<dyn FnOnce() -> (u16, Value) + Send>),
     /// A finished Graphics render's PNG or mp4.
     RenderFile(PathBuf, &'static str),
 }
@@ -294,8 +307,22 @@ fn handle(state: &mut AppState, mut request: tiny_http::Request) {
         Reply::Html(html) => respond_html(request, html),
         Reply::Yaml(text) => respond_yaml(request, text),
         Reply::Script(js) => respond_script(request, js),
-        Reply::Still(id, still) => {
-            channel::respond_still(state.review.still_dir.clone(), id, *still, request)
+        Reply::Still(dir, id, still) => channel::respond_still(dir, id, *still, request),
+        Reply::OffThread(answer) => {
+            std::thread::spawn(move || {
+                let (status, body) = answer();
+                let error = body.get("error").and_then(|e| e.as_str());
+                tracing::info!(
+                    event = "ui.request",
+                    method = %method,
+                    path = %path,
+                    status,
+                    error,
+                    ms = began.elapsed().as_millis() as u64,
+                    "request served"
+                );
+                respond_json(request, status, &body);
+            });
         }
         Reply::RenderFile(path, content_type) => {
             respond_render_file(request, &path, content_type, range.as_deref())
@@ -351,27 +378,37 @@ fn dispatch(state: &mut AppState, method: &Method, path: &str, query: &str, body
         return json_reply(api_airing_audit(state, &percent_decode(airing)));
     }
     if *method == Method::Get
-        && let Some(id) = path
+        && let Some((id, facet)) = path
             .strip_prefix("/api/entries/")
-            .and_then(|rest| rest.strip_suffix("/arr"))
+            .and_then(|rest| rest.rsplit_once('/'))
+        && matches!(facet, "arr" | "file" | "thumb")
     {
-        return match state.catalog.entry(&percent_decode(id)) {
-            Ok(Some(entry)) => {
+        let id = percent_decode(id);
+        let entry = match state.catalog.entry(&id) {
+            Ok(Some(entry)) => entry,
+            Ok(None) => {
+                return Reply::Json(404, json!({ "error": format!("no catalog entry {id:?}") }));
+            }
+            Err(e) => return Reply::Json(500, json!({ "error": e.to_string() })),
+        };
+        let sources = || {
+            state
+                .catalog
+                .sources_for(&entry.entry_id)
+                .map_err(|e| e.to_string())
+        };
+        return match facet {
+            "file" => entry_file::file(&entry, sources()),
+            "thumb" => entry_file::thumb(state, &entry, sources()),
+            _ => {
                 let tmdb = state
                     .catalog
                     .external_id_of(&entry.entry_id, crate::catalog::ExternalNs::Tmdb)
                     .ok()
                     .flatten();
-                {
-                    let (status, body) = arr::inspect(&state.arr, &entry, tmdb.as_deref());
-                    Reply::Json(status, body)
-                }
+                let (status, body) = arr::inspect(&state.arr, &entry, tmdb.as_deref());
+                Reply::Json(status, body)
             }
-            Ok(None) => Reply::Json(
-                404,
-                json!({ "error": format!("no catalog entry {:?}", percent_decode(id)) }),
-            ),
-            Err(e) => Reply::Json(500, json!({ "error": e.to_string() })),
         };
     }
     if let Some(rest) = path.strip_prefix("/api/channels/") {
@@ -570,6 +607,7 @@ mod tests {
             plexdb: None,
             keywords: Default::default(),
             coverage: Default::default(),
+            artwork_dir: None,
             options: Options {
                 station,
                 catalog: PathBuf::from("/nonexistent/catalog.db"),
@@ -612,10 +650,12 @@ mod tests {
 
     /// An id the catalog lacks is a 404.
     #[test]
-    fn entry_arr_404s_for_an_unknown_entry() {
+    fn every_entry_facet_404s_for_an_unknown_entry() {
         let mut state = example_state();
-        let (status, body) = get_json(&mut state, "/api/entries/nope/arr");
-        assert_eq!(status, 404, "{body}");
+        for facet in ["arr", "file", "thumb"] {
+            let (status, body) = get_json(&mut state, &format!("/api/entries/nope/{facet}"));
+            assert_eq!(status, 404, "{facet}: {body}");
+        }
     }
 
     /// `GET /api/audio/{id}` is what `just facts` prints, and `/api/health/audio`
@@ -946,6 +986,7 @@ mod tests {
             plexdb: None,
             keywords: Default::default(),
             coverage: Default::default(),
+            artwork_dir: None,
             options: Options {
                 station,
                 catalog: catalog_path,

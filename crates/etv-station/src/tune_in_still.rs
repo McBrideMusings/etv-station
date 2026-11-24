@@ -44,6 +44,39 @@ impl MediaRemap {
     }
 }
 
+/// The file an entry plays from, as this machine sees it, or why there is none:
+/// its playback source with the `MEDIA_PATH_FROM`/`MEDIA_PATH_TO` remap applied,
+/// checked to exist. `sources` is what the catalog returned for the entry.
+pub fn media_path<E: std::fmt::Display>(
+    sources: Result<Vec<EntrySource>, E>,
+    remap: &MediaRemap,
+) -> Result<PathBuf, Unavailable> {
+    let unavailable = |why: &str, path: Option<PathBuf>| Unavailable {
+        why: why.to_string(),
+        path,
+    };
+    let sources = sources.map_err(|e| unavailable(&format!("Catalog error: {e}"), None))?;
+    let source = crate::resolve::pick_playback_source(&sources)
+        .ok_or_else(|| unavailable("No media file in the catalog", None))?;
+    let media = PathBuf::from(crate::catalog::ingest::plex::translate_path(
+        &source.playback_path,
+        &remap.from,
+        &remap.to,
+    ));
+    if !media.exists() {
+        // With no remap there is no share to be unmounted, only a path
+        // that names nothing.
+        let unmounted = !remap.to.is_empty() && !Path::new(&remap.to).is_dir();
+        let why = if unmounted {
+            "Media not mounted"
+        } else {
+            "Media file not found"
+        };
+        return Err(unavailable(why, Some(media)));
+    }
+    Ok(media)
+}
+
 /// Distinguishes the scratch files of two renders of one still running at
 /// once, so neither renames the other's half-written file into place.
 static RENDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -107,30 +140,7 @@ impl TuneInStill {
         into: Duration,
     ) -> Result<Self, Unavailable> {
         let Neighbours { prev, airing, next } = at;
-        let unavailable = |why: &str, path: Option<PathBuf>| Unavailable {
-            why: why.to_string(),
-            path,
-        };
-        let sources = sources.map_err(|e| unavailable(&format!("Catalog error: {e}"), None))?;
-        let source = crate::resolve::pick_playback_source(&sources)
-            .ok_or_else(|| unavailable("No media file in the catalog", None))?;
-        let media = PathBuf::from(crate::catalog::ingest::plex::translate_path(
-            &source.playback_path,
-            &remap.from,
-            &remap.to,
-        ));
-        if !media.exists() {
-            // With no remap there is no share to be unmounted, only a path
-            // that names nothing.
-            let unmounted = !remap.to.is_empty() && !Path::new(&remap.to).is_dir();
-            let why = if unmounted {
-                "Media not mounted"
-            } else {
-                "Media file not found"
-            };
-            return Err(unavailable(why, Some(media)));
-        }
-
+        let media = media_path(sources, remap)?;
         let overlay = overlays.for_block(airing.block).cloned();
         let canvas = match (video.width, video.height, &overlay) {
             (Some(w), Some(h), _) => (w, h),

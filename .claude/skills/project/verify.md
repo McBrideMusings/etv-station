@@ -1133,7 +1133,9 @@ the previous build.
 `GET /api/channels/{ch}/pools?draft=ID`. Drive it with `tools/ui-get.sh` (it takes `-X` and `-d`):
 
 ```bash
-tools/ui-get.sh /api/channels/034-syfy/pools | jq '.pools|map_values({member_count, member_runtime_ms})'  # non-scored pools: sources, config and resolved members, no ranking
+tools/ui-get.sh /api/channels/034-syfy/pools | jq '.pools|map_values({member_count, member_runtime_ms, shows: [.member_groups[]?|select(.show)|{show, count}]})'  # non-scored pools: sources, config and resolved members, no ranking
+tools/ui-get.sh '/api/entries/fs:0062a69471a67f0c/file' | jq '{path, size_bytes, streams: .probe.streams|map({kind, codec})}'  # a member Radarr/Sonarr cannot answer: the inspector's file facts
+curl -s -o /tmp/thumb.jpg -w '%{http_code} %{content_type}\n' 'http://127.0.0.1:4747/api/entries/fs:0062a69471a67f0c/thumb'  # its thumbnail: cached Plex artwork, else a frame
 tools/ui-get.sh /api/channels/001-for-you/pools | jq '.pools.movies.ranking[:3]'
 D=$(tools/ui-get.sh -X POST -d '{}' /api/channels/001-for-you/drafts | jq -r .draft)
 tools/ui-get.sh -X POST -d '{"op":"add","pool":"movies","entry":{"keyword":"<kw>","weight":3}}' /api/channels/001-for-you/drafts/$D/edits | jq '.pools.movies.ranking[:3]'

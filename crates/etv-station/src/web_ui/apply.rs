@@ -253,6 +253,7 @@ mod tests {
             plexdb: None,
             keywords: Default::default(),
             coverage: Default::default(),
+            artwork_dir: None,
             options: Options {
                 station,
                 catalog: PathBuf::from("/nonexistent/c.db"),

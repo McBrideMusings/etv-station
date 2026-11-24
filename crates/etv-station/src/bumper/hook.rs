@@ -98,7 +98,6 @@ use std::sync::{Arc, Mutex};
 use rhai::{Array, Dynamic, EvalAltResult, Map, Scope};
 use time::OffsetDateTime;
 
-use crate::ffprobe::PROBE_TIMEOUT;
 use crate::history::{AiringFilter, AiringKind, HistoryDb, LedgerRow, PlayRecord};
 
 use super::timeline::{
@@ -717,7 +716,8 @@ impl Host {
 
     fn probe(&self, path: &str) -> RhaiResult<Dynamic> {
         self.require("probe")?;
-        let mut probed = probe_media(Path::new(path)).map_err(|e| format!("ctx.probe(): {e}"))?;
+        let mut probed = crate::ffprobe::probe_media(Path::new(path))
+            .map_err(|e| format!("ctx.probe(): {e}"))?;
         let audio = match (&probed, &self.catalog_path, &self.explorer) {
             (Some(_), Some(catalog), Some(explorer)) => {
                 crate::audio_facts::facts_for_path(catalog, explorer, path)
@@ -1067,91 +1067,6 @@ fn read_in_dir(dir: &Path, path: &str) -> Result<Option<String>, String> {
     String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| format!("{path:?} is not UTF-8 text"))
-}
-
-/// `ffprobe` output for `path` as the map `ctx.probe` returns. Only the `file`
-/// protocol is allowed, so a path cannot name a URL. `Ok(None)` when
-/// ffprobe runs but rejects the file; `Err` when ffprobe cannot be run.
-fn probe_media(path: &Path) -> Result<Option<serde_json::Value>, String> {
-    use serde_json::{Map as JsonMap, Value, json};
-
-    let args: Vec<std::ffi::OsString> = [
-        "-v",
-        "error",
-        "-print_format",
-        "json",
-        "-show_format",
-        "-show_streams",
-        "-protocol_whitelist",
-        "file",
-        "-i",
-    ]
-    .iter()
-    .map(Into::into)
-    .chain([path.as_os_str().to_owned()])
-    .collect();
-    let stdout = match crate::ffprobe::run_bounded(&args, PROBE_TIMEOUT)
-        .map_err(|e| format!("cannot run ffprobe: {e}"))?
-    {
-        crate::ffprobe::Bounded::Done {
-            success: true,
-            stdout,
-            ..
-        } => stdout,
-        crate::ffprobe::Bounded::Done { .. } => return Ok(None),
-        crate::ffprobe::Bounded::TimedOut => {
-            tracing::warn!(
-                event = "bumper.probe_timeout",
-                path = %path.display(),
-                timeout_secs = PROBE_TIMEOUT.as_secs(),
-                "ffprobe did not finish; ctx.probe returns ()"
-            );
-            return Ok(None);
-        }
-    };
-    let raw: Value = serde_json::from_slice(&stdout)
-        .map_err(|e| format!("ffprobe printed invalid JSON: {e}"))?;
-
-    let tags = |v: &Value| -> Value {
-        let mut out = JsonMap::new();
-        if let Some(obj) = v.get("tags").and_then(Value::as_object) {
-            for (k, val) in obj {
-                if let Some(s) = val.as_str() {
-                    out.insert(k.to_ascii_lowercase(), json!(s));
-                }
-            }
-        }
-        Value::Object(out)
-    };
-    let duration_ms = raw["format"]["duration"]
-        .as_str()
-        .and_then(|s| s.parse::<f64>().ok())
-        .map(|secs| (secs * 1000.0).round() as i64);
-    let streams: Vec<Value> = raw["streams"]
-        .as_array()
-        .map(|a| a.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .map(|s| {
-            let stream_tags = tags(s);
-            json!({
-                "index": s["index"].as_i64(),
-                "kind": s["codec_type"].as_str().unwrap_or("other"),
-                "codec": s["codec_name"].as_str().unwrap_or(""),
-                "lang": stream_tags["language"].as_str().filter(|l| *l != "und"),
-                "width": s["width"].as_i64(),
-                "height": s["height"].as_i64(),
-                "channels": s["channels"].as_i64(),
-                "tags": stream_tags,
-            })
-        })
-        .collect();
-    Ok(Some(json!({
-        "duration_ms": duration_ms,
-        "format": raw["format"]["format_name"].as_str().unwrap_or(""),
-        "tags": tags(&raw["format"]),
-        "streams": streams,
-    })))
 }
 
 /// The station's plugin engine plus the bumper builder, `ctx.rng` and the
@@ -2708,7 +2623,7 @@ fn build(ctx) {
             None,
         )]));
         let built = build(&script, &archival_input(120_000, serde_json::json!({}))).unwrap();
-        let duration = probe_media(Path::new(&fixture("ident-45s.mp4")))
+        let duration = crate::ffprobe::probe_media(Path::new(&fixture("ident-45s.mp4")))
             .unwrap()
             .unwrap()["duration_ms"]
             .as_u64()

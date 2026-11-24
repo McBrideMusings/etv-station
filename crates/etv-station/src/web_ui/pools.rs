@@ -425,10 +425,11 @@ fn ranking_json(
 }
 
 /// An `expr` or `groups` pool's members, from the catalog query generation
-/// runs, with a field `order:` applied: the first [`RANKING_SHOWN`] items,
-/// the total count and runtime, and each show's count and runtime.
-/// `order: random` is left in catalog order (`order_random`), since its
-/// shuffle is reseeded every period.
+/// runs, with a field `order:` applied: every member, grouped by show in the
+/// order each show first appears, plus the total count and runtime. A member
+/// with no show is a group of its own (`show: null`). `order: random` is left
+/// in catalog order (`order_random`), since its shuffle is reseeded every
+/// period.
 fn members(
     catalog: &Catalog,
     pool: &Pool,
@@ -442,52 +443,59 @@ fn members(
             .map_err(|e| e.to_string())?;
     }
     let entries = catalog.entries_for(&ids).map_err(|e| e.to_string())?;
-    let mut total_ms: i64 = 0;
-    // (show, episodes, ms), in the order each show first appears.
-    let mut shows: Vec<(String, usize, i64)> = Vec::new();
-    for e in ids.iter().filter_map(|id| entries.get(id)) {
-        let ms = e.duration_ms.unwrap_or(0);
-        total_ms += ms;
-        if let Some(show) = &e.show {
-            match shows.iter_mut().find(|(s, _, _)| s == show) {
-                Some(row) => {
-                    row.1 += 1;
-                    row.2 += ms;
-                }
-                None => shows.push((show.clone(), 1, ms)),
-            }
-        }
-    }
-    let listed: Vec<Value> = ids
+    let member_groups = group_members(ids.iter().map(|id| (id.as_str(), entries.get(id))));
+    let total_ms: i64 = ids
         .iter()
-        .take(RANKING_SHOWN)
-        .map(|id| {
-            let entry = entries.get(id);
-            let mut v = picked_item_json(catalog, id, None, entry);
-            if let Some(obj) = v.as_object_mut() {
-                obj.insert(
-                    "duration_ms".to_string(),
-                    json!(entry.and_then(|e| e.duration_ms)),
-                );
-            }
-            v
-        })
-        .collect();
+        .filter_map(|id| entries.get(id))
+        .map(|e| e.duration_ms.unwrap_or(0))
+        .sum();
     let mut out = serde_json::Map::new();
-    out.insert("members".to_string(), json!(listed));
+    out.insert("member_groups".to_string(), json!(member_groups));
     out.insert("member_count".to_string(), json!(ids.len()));
     out.insert("member_runtime_ms".to_string(), json!(total_ms));
-    out.insert(
-        "member_shows".to_string(),
-        json!(
-            shows
-                .into_iter()
-                .map(|(show, count, ms)| json!({ "show": show, "count": count, "runtime_ms": ms }))
-                .collect::<Vec<_>>()
-        ),
-    );
     out.insert("order_random".to_string(), json!(random));
     Ok(out)
+}
+
+/// `members` in pool order, grouped: one `{show, count, runtime_ms, items}`
+/// per show, placed where the show first appears and holding every one of its
+/// members in pool order, and one `{show: null, count: 1, …}` per member with
+/// no show. An id with no catalog entry is a showless `<unknown>` item.
+fn group_members<'a>(
+    members: impl Iterator<Item = (&'a str, Option<&'a CatalogEntry>)>,
+) -> Vec<Value> {
+    // (show, runtime_ms, items), in first-appearance order.
+    let mut groups: Vec<(Option<String>, i64, Vec<Value>)> = Vec::new();
+    for (id, entry) in members {
+        let ms = entry.and_then(|e| e.duration_ms).unwrap_or(0);
+        let item = json!({
+            "id": id,
+            "kind": entry.map(|e| e.kind.as_str()),
+            "title": entry.map_or("<unknown>", |e| e.title.as_str()),
+            "year": entry.and_then(|e| e.year),
+            "show": entry.and_then(|e| e.show.as_deref()),
+            "season": entry.and_then(|e| e.season),
+            "episode": entry.and_then(|e| e.episode),
+            "duration_ms": entry.and_then(|e| e.duration_ms),
+        });
+        let show = entry.and_then(|e| e.show.clone());
+        match show
+            .as_ref()
+            .and_then(|s| groups.iter_mut().find(|g| g.0.as_ref() == Some(s)))
+        {
+            Some(group) => {
+                group.1 += ms;
+                group.2.push(item);
+            }
+            None => groups.push((show, ms, vec![item])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(show, ms, items)| {
+            json!({ "show": show, "count": items.len(), "runtime_ms": ms, "items": items })
+        })
+        .collect()
 }
 
 fn mtime(path: &Path) -> SystemTime {
@@ -1436,6 +1444,7 @@ mod tests {
             plexdb: Some(crate::plexdb_ex::Explorer::new(&explorer.url)),
             keywords: Default::default(),
             coverage: Default::default(),
+            artwork_dir: None,
             options: Options {
                 station,
                 catalog: catalog_path,
@@ -1521,15 +1530,62 @@ mod tests {
         );
         let films = &plain["pools"]["films"];
         assert_eq!(films["member_count"], 4, "{films}");
-        let ids: Vec<&str> = films["members"]
-            .as_array()
-            .unwrap()
+        let groups = films["member_groups"].as_array().unwrap();
+        let ids: Vec<&str> = groups
             .iter()
-            .map(|m| m["id"].as_str().unwrap())
+            .map(|g| {
+                assert_eq!(g["show"], Value::Null, "a film is a group of its own: {g}");
+                g["items"][0]["id"].as_str().unwrap()
+            })
             .collect();
         assert_eq!(ids, ["mov-a", "mov-b", "mov-c", "mov-d"]);
-        assert_eq!(films["member_shows"], json!([]));
+        assert_eq!(groups[0]["items"][0]["kind"], "movie");
         assert_eq!(films["order_random"], false);
+    }
+
+    #[test]
+    fn members_group_under_their_show_where_it_first_appears() {
+        let entry = |id: &str, show: Option<&str>, ms: i64| {
+            let mut e = CatalogEntry::new(
+                id,
+                if show.is_some() { "episode" } else { "movie" },
+                id,
+                Source::Plex,
+            );
+            e.show = show.map(str::to_string);
+            e.duration_ms = Some(ms);
+            e
+        };
+        let rows = [
+            entry("f1", Some("Frasier"), 10),
+            entry("n1", Some("New Girl"), 20),
+            entry("film", None, 30),
+            entry("f2", Some("Frasier"), 40),
+            entry("n2", Some("New Girl"), 50),
+        ];
+        let groups = group_members(rows.iter().map(|e| (e.entry_id.as_str(), Some(e))));
+        let shape: Vec<(Value, Vec<&str>, i64)> = groups
+            .iter()
+            .map(|g| {
+                let ids = g["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i["id"].as_str().unwrap())
+                    .collect();
+                (g["show"].clone(), ids, g["runtime_ms"].as_i64().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (json!("Frasier"), vec!["f1", "f2"], 50),
+                (json!("New Girl"), vec!["n1", "n2"], 70),
+                (Value::Null, vec!["film"], 30),
+            ]
+        );
+        assert_eq!(groups[0]["count"], 2);
+        assert_eq!(group_members(std::iter::empty()), Vec::<Value>::new());
     }
 
     #[test]

@@ -42,6 +42,104 @@ pub fn run_bounded(args: &[OsString], timeout: Duration) -> std::io::Result<Boun
     run_program(&program(), args, timeout)
 }
 
+/// The argv that probes one media file as JSON, format and streams. Only the
+/// `file` protocol is allowed, so a path cannot name a URL.
+pub fn media_args(path: &std::path::Path) -> Vec<OsString> {
+    [
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        "-protocol_whitelist",
+        "file",
+        "-i",
+    ]
+    .iter()
+    .map(Into::into)
+    .chain([path.as_os_str().to_owned()])
+    .collect()
+}
+
+/// `ffprobe` output for `path` as the map `ctx.probe` returns. Only the `file`
+/// protocol is allowed, so a path cannot name a URL. `Ok(None)` when
+/// ffprobe runs but rejects the file; `Err` when ffprobe cannot be run.
+pub fn probe_media(path: &std::path::Path) -> Result<Option<serde_json::Value>, String> {
+    use serde_json::{Map as JsonMap, Value, json};
+
+    let args = media_args(path);
+    let stdout =
+        match run_bounded(&args, PROBE_TIMEOUT).map_err(|e| format!("cannot run ffprobe: {e}"))? {
+            Bounded::Done {
+                success: true,
+                stdout,
+                ..
+            } => stdout,
+            Bounded::Done { stderr, .. } => {
+                tracing::info!(
+                    event = "ffprobe.rejected",
+                    path = %path.display(),
+                    stderr = %String::from_utf8_lossy(&stderr).trim(),
+                    "ffprobe could not read the file"
+                );
+                return Ok(None);
+            }
+            Bounded::TimedOut => {
+                tracing::warn!(
+                    event = "ffprobe.timeout",
+                    path = %path.display(),
+                    timeout_secs = PROBE_TIMEOUT.as_secs(),
+                    "ffprobe did not finish; ctx.probe returns ()"
+                );
+                return Ok(None);
+            }
+        };
+    let raw: Value = serde_json::from_slice(&stdout)
+        .map_err(|e| format!("ffprobe printed invalid JSON: {e}"))?;
+
+    let tags = |v: &Value| -> Value {
+        let mut out = JsonMap::new();
+        if let Some(obj) = v.get("tags").and_then(Value::as_object) {
+            for (k, val) in obj {
+                if let Some(s) = val.as_str() {
+                    out.insert(k.to_ascii_lowercase(), json!(s));
+                }
+            }
+        }
+        Value::Object(out)
+    };
+    let duration_ms = raw["format"]["duration"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|secs| (secs * 1000.0).round() as i64);
+    let streams: Vec<Value> = raw["streams"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .map(|s| {
+            let stream_tags = tags(s);
+            json!({
+                "index": s["index"].as_i64(),
+                "kind": s["codec_type"].as_str().unwrap_or("other"),
+                "codec": s["codec_name"].as_str().unwrap_or(""),
+                "lang": stream_tags["language"].as_str().filter(|l| *l != "und"),
+                "width": s["width"].as_i64(),
+                "height": s["height"].as_i64(),
+                "channels": s["channels"].as_i64(),
+                "tags": stream_tags,
+            })
+        })
+        .collect();
+    Ok(Some(json!({
+        "duration_ms": duration_ms,
+        "format": raw["format"]["format_name"].as_str().unwrap_or(""),
+        "tags": tags(&raw["format"]),
+        "streams": streams,
+    })))
+}
+
 /// [`run_bounded`] for async callers: the polling wait runs on the blocking
 /// pool, so it does not hold a runtime worker.
 pub async fn run_bounded_async(args: Vec<OsString>) -> std::io::Result<Bounded> {

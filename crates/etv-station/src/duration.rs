@@ -422,7 +422,7 @@ enum ProbeRun {
 async fn ffprobe_stdout(path: &Path) -> ProbeRun {
     classify_probe(
         path,
-        crate::ffprobe::run_bounded_async(probe_args(path)).await,
+        crate::ffprobe::run_bounded_async(crate::ffprobe::media_args(path)).await,
     )
 }
 
@@ -430,26 +430,11 @@ async fn ffprobe_stdout(path: &Path) -> ProbeRun {
 fn ffprobe_stdout_blocking(path: &Path) -> ProbeRun {
     classify_probe(
         path,
-        crate::ffprobe::run_bounded(&probe_args(path), crate::ffprobe::PROBE_TIMEOUT),
+        crate::ffprobe::run_bounded(
+            &crate::ffprobe::media_args(path),
+            crate::ffprobe::PROBE_TIMEOUT,
+        ),
     )
-}
-
-fn probe_args(path: &Path) -> Vec<std::ffi::OsString> {
-    [
-        "-v",
-        "error",
-        "-print_format",
-        "json",
-        "-show_format",
-        "-show_streams",
-        "-protocol_whitelist",
-        "file",
-        "-i",
-    ]
-    .iter()
-    .map(Into::into)
-    .chain([path.as_os_str().to_owned()])
-    .collect()
 }
 
 fn classify_probe(path: &Path, outcome: std::io::Result<crate::ffprobe::Bounded>) -> ProbeRun {
