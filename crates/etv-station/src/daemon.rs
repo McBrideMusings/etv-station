@@ -5611,4 +5611,48 @@ params = "testsrc=size=1280x720:rate=30 [out0]"
         let r: Vec<&str> = roots.iter().map(String::as_str).collect();
         assert!(cat.fs_rekeys(&r).unwrap().is_empty());
     }
+
+    /// Two mounts of one file give two unrooted ids for the same rooted id: the
+    /// first is renamed onto it, the second merged into it and retired.
+    #[test]
+    fn rekey_merges_a_second_old_id_into_an_existing_new_one() {
+        use crate::catalog::{Entry as CatEntry, EntrySource, Source};
+        let cat = Catalog::open_in_memory().unwrap();
+        let paths = ["/media/concerts/a.mp4", "/mnt/media/concerts/a.mp4"];
+        let olds: Vec<String> = paths
+            .iter()
+            .map(|p| crate::catalog::derive_entry_id(&[], p))
+            .collect();
+        for (old, path) in olds.iter().zip(paths) {
+            cat.upsert_entry(&CatEntry::new(old, "video", old, Source::Plex))
+                .unwrap();
+            cat.add_source(&EntrySource {
+                source: Source::Plex,
+                source_id: format!("rk-{old}"),
+                entry_id: old.clone(),
+                playback_path: path.into(),
+                last_seen: None,
+                missing_since: None,
+                unairable_reason: None,
+            })
+            .unwrap();
+        }
+        let history = HistoryDb::open_in_memory().unwrap();
+        let roots = vec!["/media".to_string(), "/mnt/media".to_string()];
+
+        rekey_fs_entries(&cat, &history, &roots).unwrap();
+
+        let new = crate::catalog::derive_entry_id(&[], "concerts/a.mp4");
+        for old in &olds {
+            assert_eq!(
+                cat.entry_id_for_source(Source::Plex, &format!("rk-{old}"))
+                    .unwrap()
+                    .as_deref(),
+                Some(new.as_str()),
+            );
+        }
+        assert!(cat.entry(&new).unwrap().is_some());
+        let r: Vec<&str> = roots.iter().map(String::as_str).collect();
+        assert!(cat.fs_rekeys(&r).unwrap().is_empty());
+    }
 }
