@@ -744,10 +744,12 @@ mod tests {
         };
         let mut items = vec![local_item(0, Some(pool))];
         assign(&mut items, &cache, &levels, "ch", Path::new("/subs"));
+        let sel = items[0].selected.as_ref().unwrap();
+        let extract = crate::subtitle_cache::path_for(Path::new("/subs"), "/m/film.mkv", 4);
         assert_eq!(
-            picked(&items).1,
-            Some(4),
-            "the pool's text preference went first"
+            (sel.subtitle, sel.subtitle_sidecar.as_deref()),
+            (Some(0), extract.to_str()),
+            "the pool's text preference went first: stream 4, read from its extract"
         );
     }
 
@@ -862,7 +864,8 @@ mod tests {
         );
         assert_eq!(tally.with_subtitle, 1);
 
-        // An embedded text track that matches wins; the sidecar is not used.
+        // An embedded text track that matches wins over the sidecar file, and
+        // airs from its extract.
         let cache = DurationCache::with_streams(
             &path,
             vec![audio(1, "eng", "", 2, true), sub(2, "eng", "subrip")],
@@ -870,9 +873,10 @@ mod tests {
         let mut items = vec![item(None)];
         assign(&mut items, &cache, &levels, "ch", Path::new("/subs"));
         let sel = items[0].selected.as_ref().unwrap();
+        let extract = crate::subtitle_cache::path_for(Path::new("/subs"), &path, 2);
         assert_eq!(
             (sel.subtitle, sel.subtitle_sidecar.as_deref()),
-            (Some(2), None)
+            (Some(0), extract.to_str())
         );
 
         // `prefer` order ranks sidecars: a plain English file beats a forced one
