@@ -329,6 +329,8 @@
   .sugg div:hover { background: var(--panel); }
   .rank-scroll { max-height: 360px; overflow: auto; border: 1px solid var(--line); }
   .rank-scroll thead th { position: sticky; top: 0; background: var(--bg); }
+  /* Narrow: the page scrolls, so the table gives up its own scroll box. */
+  @media (max-width: 900px) { .rank-scroll { max-height: none; overflow: visible; } }
   .mv { font-variant-numeric: tabular-nums; font-weight: 650; white-space: nowrap; }
   .mv.up { color: var(--up); } .mv.down { color: var(--down); } .mv.new, .mv.same { color: var(--muted); }
   #yamlOut pre { margin: 4px 0 8px; padding: 8px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 3px; overflow: auto; font-size: 12px; }
