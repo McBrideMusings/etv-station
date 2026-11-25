@@ -227,7 +227,8 @@
   .insp h4 { font-size: 10.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 10px 0 4px; }
   .insp .stage { border-left: 2px solid var(--fg); padding: 2px 0 4px 8px; margin-bottom: 6px; font-size: 12px; }
   .insp .stage .hd { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
-  .insp .chip { font-family: ui-monospace, monospace; font-size: 10.5px; padding: 0 4px; border: 1px solid var(--line); border-radius: 2px; }
+  /* A static label (a pipeline stage, a pool's scoring); not .chip, which is the channel switcher. */
+  .tag { font-family: ui-monospace, monospace; font-size: 10.5px; padding: 0 4px; border: 1px solid var(--line); border-radius: 2px; }
   .insp dl.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 1px 8px; margin: 3px 0 0; font-size: 11.5px; }
   .insp dl.kv dt { color: var(--muted); }
   .insp dl.kv dd { margin: 0; font-family: ui-monospace, monospace; font-size: 11px; overflow-wrap: anywhere; }
@@ -311,7 +312,6 @@
   select, input[type=text] { font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; padding: 2px 6px; }
   .poolsec { border: 1px solid var(--line); border-radius: 3px; margin-bottom: 10px; }
   .poolsec > summary { cursor: pointer; padding: 6px 10px; background: var(--panel); display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
-  .poolsec .chip { font-family: ui-monospace, monospace; font-size: 10.5px; padding: 0 4px; border: 1px solid var(--line); border-radius: 2px; }
   .pgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px 20px; padding: 8px 10px 10px; }
   .pfield { min-width: 0; }
   .pfield.wide { grid-column: 1 / -1; }
@@ -1866,7 +1866,7 @@ function stageHTML(d, s) {
   }
   const raw = Object.entries(det).filter(([, v]) => v != null && !(Array.isArray(v) && !v.length))
     .map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(typeof v === 'object' ? JSON.stringify(v) : num(v))}</dd>`).join('');
-  return `<div class="stage"><div class="hd"><span class="chip">${esc(s.stage)}</span><span class="chip">${esc(s.by)}</span></div>
+  return `<div class="stage"><div class="hd"><span class="tag">${esc(s.stage)}</span><span class="tag">${esc(s.by)}</span></div>
     ${s.guide ? `<div><b>${esc(s.guide)}</b></div>` : ''}<div class="muted">${esc(s.verdict)}</div>
     <dl class="kv">${facts.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>
     ${raw ? `<details><summary class="muted">all ${Object.keys(det).length} fields</summary><dl class="kv">${raw}</dl></details>` : ''}</div>`;
@@ -2518,7 +2518,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 function poolHtml(name, p, draft, openIt) {
-  const head = `<summary><b>${esc(name)}</b> <span class="chip">${p.scored ? 'scored by plugin' : 'not scored'}</span>
+  const head = `<summary><b>${esc(name)}</b> <span class="tag">${p.scored ? 'scored by plugin' : 'not scored'}</span>
     ${p.scored ? `<span class="muted">${p.ranking_count} ranked${p.edited ? ' · edited in this draft' : ''}</span>`
       : 'member_count' in p ? `<span class="muted num">${p.member_count} items · ${hours(p.member_runtime_ms)}</span>` : ''}</summary>`;
   const sources = `<div class="pfield"><h4>sources${p.scored && !p.sources_authored ? ' <span class="muted">(the plugin\'s own default)</span>' : ''}</h4>${kvHtml(p.sources)}</div>`;
