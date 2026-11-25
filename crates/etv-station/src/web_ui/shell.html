@@ -55,7 +55,9 @@
   /* The channel switcher: a chip beside the view tabs on a phone (the rail does the job on a wide screen), opening a sheet with a search and the lineup. */
   .chip { display: none; align-items: center; gap: 8px; min-height: 44px; padding: 4px 10px; font-weight: 700; white-space: nowrap; flex: none; }
   .chip .chipn { border: 2px solid var(--fg); border-radius: 3px; padding: 0 5px; font-variant-numeric: tabular-nums; }
-  .chip .chipname { max-width: 9em; overflow: hidden; text-overflow: ellipsis; }
+  .chip .chipname { overflow: hidden; text-overflow: ellipsis; }
+  /* The view picker: a native select, so a phone opens its own picker; shown beside the chip on a phone, where the view tabs are hidden. */
+  #viewSelect { display: none; }
   .chback { position: fixed; inset: 0; z-index: 29; background: rgba(0, 0, 0, .45); }
   .chsheet { position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; max-height: 80dvh; display: flex; flex-direction: column; background: var(--panel); border-radius: 12px 12px 0 0; box-shadow: 0 -6px 18px rgba(0, 0, 0, .35); padding: 8px 0 calc(8px + env(safe-area-inset-bottom)); }
   .chsheet .grab { width: 36px; height: 4px; border-radius: 2px; background: var(--line); margin: 0 auto 8px; flex: none; }
@@ -187,6 +189,9 @@
   .blk { cursor: pointer; }
   /* Schedule as an agenda: a heading per day with airings, one row per airing, the frontier as a labelled divider. */
   .layoutctl { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; }
+  .layoutctl .spacer { flex: 1; }
+  #projSelect { width: 72px; min-height: 28px; font-variant-numeric: tabular-nums; }
+  #projSelect.on { border-color: var(--accent); color: var(--accent); font-weight: 700; }
   .ag-now { border: 1px solid var(--line); border-left: 6px solid rgba(0, 0, 0, .35); background: var(--pc, var(--panel)); color: #111; padding: 8px 12px; margin: 0 0 10px; cursor: pointer; }
   .ag-now:focus-visible, .ag-now:hover { outline: 2px solid var(--fg); outline-offset: -2px; }
   .ag-now.sel { outline: 3px solid var(--fg); outline-offset: -3px; }
@@ -266,23 +271,24 @@
     .app { display: block; }
     .lineup { display: none; }
     #lineupSelect { display: block; margin: 10px 20px 0; max-width: calc(100% - 40px); }
-    /* One strip: the switcher chip, then the view tabs scrolling sideways with a fade on the right edge. */
-    .chip { display: inline-flex; }
-    .toolbar { flex-wrap: wrap; row-gap: 4px; }
-    .subtabs { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; scrollbar-width: none; padding-right: 28px; -webkit-mask-image: linear-gradient(to right, #000 88%, transparent); mask-image: linear-gradient(to right, #000 88%, transparent); }
-    .subtabs a { display: inline-flex; align-items: center; min-height: 44px; padding: 3px 12px; }
+    /* One row: the channel chip and the view picker, side by side; the view tabs give way to the picker. 16px text: smaller makes iOS zoom on focus. */
+    .toolbar { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 4px 8px; }
+    .toolbar > :not(.chip):not(#viewSelect) { grid-column: 1 / -1; }
+    .subtabs, .toolbar .spacer { display: none; }
+    .chip, #viewSelect { display: flex; align-items: center; gap: 8px; min-width: 0; min-height: 44px; padding: 0 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); font-size: 16px; font-weight: 700; -webkit-user-select: none; user-select: none; }
+    .chip .chipname { flex: 1; text-align: left; white-space: nowrap; }
+    #viewSelect, #projSelect { appearance: none; -webkit-appearance: none; padding-right: 30px; color: var(--fg);
+      background: var(--panel) no-repeat right 12px center / 9px 6px url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 9 6'%3E%3Cpath d='M0 0h9L4.5 6z' fill='%239298a3'/%3E%3C/svg%3E"); }
+    #projSelect { width: 72px; min-height: 32px; padding: 0 22px 0 10px; border-radius: 6px; background-position: right 9px center; font-size: 16px; }
+    #projSelect.on { color: var(--accent); }
+    #projLabel, #projState:empty { display: none; }
+    .layoutctl { gap: 6px; }
+    .layoutctl .seg button { white-space: nowrap; padding: 3px 8px; }
     /* The top row: 44px targets, no brand, so the five entries fit 390px. The Edit tab opens the channel on screen, so the strip's own Edit link is not repeated. */
     .tabs { padding: 0 12px; gap: 0; overflow-x: auto; scrollbar-width: none; }
     .tabs .brand { display: none; }
     .tabs a, .tabs .soon { display: inline-flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 0; flex: none; }
     #editLink { display: none; }
-    /* Project ahead and Real only as one full-width segmented control. */
-    #projCtl:not([hidden]) { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); width: 100%; gap: 0; margin-top: 4px !important; }
-    #projCtl #projState, #projCtl #projLabel { grid-column: 1 / -1; }
-    #projCtl #projBtns { display: contents; }
-    #projCtl #projClear { grid-column: 1; grid-row: 3; }
-    #projCtl #projBtns button { grid-row: 3; }
-    #projCtl button { min-height: 44px; border-radius: 0; }
     main { padding: 10px 16px; }
     #report { display: block; overflow: visible; }
     .layout { grid-template-columns: minmax(0, 1fr); }
@@ -478,19 +484,13 @@
         <a id="subPools" href="#">Pools</a>
         <a id="subGraphics" href="#">Graphics</a>
       </nav>
+      <select id="viewSelect" aria-label="Channel view">
+        <option value="schedule">Schedule</option><option value="blocks">Blocks</option><option value="bumpers">Bumpers</option>
+        <option value="preview">Preview</option><option value="pools">Pools</option><option value="graphics">Graphics</option>
+      </select>
       <a id="editLink" href="#">Edit this channel</a>
       <span class="spacer"></span>
-      <span id="projCtl" class="toolbar" style="margin:0">
-        <span id="projState" class="muted" aria-live="polite"></span>
-        <span class="muted" id="projLabel">Project ahead</span>
-        <span class="seg" role="group" aria-labelledby="projLabel" id="projBtns">
-          <button type="button" data-project="1d" aria-pressed="false">+1d</button>
-          <button type="button" data-project="3d" aria-pressed="false">+3d</button>
-          <button type="button" data-project="7d" aria-pressed="false">+7d</button>
-          <button type="button" data-project="14d" aria-pressed="false">+14d</button>
-        </span>
-        <button id="projClear" type="button">Real only</button>
-      </span>
+      <span id="projState" class="muted" aria-live="polite"></span>
     </div>
     <div id="state" class="muted"></div>
     <div id="report"></div>
@@ -681,13 +681,17 @@ function show(data, view) {
   draw(view);
 }
 
-// The Project ahead buttons: the pressed one is the length on screen; all stay off while a load is in flight.
+// The Project ahead picker shows the length on screen and stays off while a load is in flight. It is drawn with
+// the schedule, so the state is kept here and applied whenever the picker exists.
+const projCtl = { project: null, busy: false };
 function setControls(project, busy) {
-  for (const b of $('projBtns').querySelectorAll('button')) {
-    b.setAttribute('aria-pressed', String(b.dataset.project === project));
-    b.disabled = busy;
-  }
-  $('projClear').disabled = busy || !project;
+  projCtl.project = project || null;
+  projCtl.busy = busy;
+  const sel = $('projSelect');
+  if (!sel) return;
+  sel.value = projCtl.project || '';
+  sel.classList.toggle('on', !!projCtl.project);
+  sel.disabled = busy;
 }
 
 function draw(view) {
@@ -758,14 +762,6 @@ const chNarrow = window.matchMedia('(max-width: 900px)');
 chNarrow.addEventListener('change', () => { if (!chNarrow.matches) closeSwitcher(false); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('chSheet').hidden) { e.stopPropagation(); closeSwitcher(true); } }, true);
 
-// On a phone the view tabs scroll sideways; center the current one. Sets scrollLeft rather than scrollIntoView, which would also scroll the page.
-function centerSubtab() {
-  const strip = document.querySelector('.subtabs'), tab = strip.querySelector('a[aria-current="page"]');
-  if (!tab) return;
-  const s = strip.getBoundingClientRect(), t = tab.getBoundingClientRect();
-  strip.scrollLeft += (t.left + t.width / 2) - (s.left + s.width / 2);
-}
-
 // Marks where the page is: the tab, the channel in the lineup, the sub-tab, and the links that keep the days.
 function markRoute(r) {
   closeSwitcher(false);
@@ -782,10 +778,9 @@ function markRoute(r) {
   setControls(r.project, false);
   // Project ahead belongs to the schedule; Graphics has no projection to ask for.
   const projecting = r.tab === 'channels' && r.view === 'schedule';
-  for (const id of ['projState', 'projLabel', 'projBtns', 'projClear']) $(id).hidden = !projecting;
+  $('projState').hidden = !projecting;
   if (!railed || !lineup) return;
   const project = r.project;
-  $('projCtl').hidden = r.view !== 'schedule';
   for (const a of $('lineup').querySelectorAll('a')) {
     a.href = r.tab === 'edit' ? editHash(a.dataset.key) : channelHash(a.dataset.key, r.view, project, null, r.layout, r.history);   // a draft belongs to one channel, so the rail drops it
     if (a.dataset.key === r.channel) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
@@ -802,7 +797,7 @@ function markRoute(r) {
     $(id).href = channelHash(r.channel, view, project, r.draft, r.layout, r.history);
     if (r.view === view) $(id).setAttribute('aria-current', 'page'); else $(id).removeAttribute('aria-current');
   }
-  centerSubtab();
+  $('viewSelect').value = r.view;
   const cur = lineup.find((c) => c.channel === r.channel);
   $('chipN').textContent = cur ? (cur.number ?? '—') : '';
   $('chipName').textContent = cur ? (cur.display_name || cur.channel) : '';
@@ -1575,7 +1570,9 @@ function render(d) {
     <button type="button" data-layout="grid" aria-pressed="${grid}">Grid</button></span>
     <span class="seg" role="group" aria-label="Schedule span" id="historyBtns">
     <button type="button" data-history="0" aria-pressed="${!hist}">From now</button>
-    <button type="button" data-history="1" aria-pressed="${hist}">History</button></span></div>`);
+    <button type="button" data-history="1" aria-pressed="${hist}">History</button></span>
+    <span class="spacer"></span><span class="muted" id="projLabel">Project ahead</span>
+    <select id="projSelect" aria-labelledby="projLabel"><option value="">Real</option><option value="1d">+1d</option><option value="3d">+3d</option><option value="7d">+7d</option><option value="14d">+14d</option></select></div>`);
   html.push(`<div class="layout"><div class="schedcol">${nowCard(d, colors, now)}<div class="gwrap${grid ? '' : ' agendawrap'}" id="gwrap">${grid ? '<div class="wk" id="guide"></div>' : '<div class="agenda" id="agenda"></div>'}</div></div><aside class="rail" id="rail"><section class="insp idle" id="insp" data-empty="1">${INSP_EMPTY}</section>`);
 
   html.push('</aside></div>');
@@ -1589,6 +1586,8 @@ function render(d) {
       rerenderSchedule(channelHash(r.channel, 'schedule', r.project, r.draft, b.dataset.layout, r.history));
     });
   }
+  setControls(projCtl.project, projCtl.busy);
+  $('projSelect').addEventListener('change', (e) => chooseProject(e.target.value || null));
   for (const b of $('historyBtns').querySelectorAll('button')) {
     b.addEventListener('click', () => {
       const r = parseRoute();
@@ -2705,15 +2704,15 @@ async function discardDraft() {
 }
 
 $('lineupSelect').addEventListener('change', () => { const r = parseRoute(); if (r.tab === 'edit') { location.hash = editHash($('lineupSelect').value); return; } location.hash = channelHash($('lineupSelect').value, r.view, r.project, null, r.layout); });
-// Choosing a projection length changes the hash; choosing the pressed length again asks for it afresh.
+// Choosing a projection length changes the hash.
 function chooseProject(project) {
   const r = parseRoute();
-  if (!r.channel) return;
-  const target = channelHash(r.channel, r.view, project, r.draft, r.layout);
-  if (location.hash === target) { shown = null; route(); } else location.hash = target;
+  if (r.channel) location.hash = channelHash(r.channel, r.view, project, r.draft, r.layout);
 }
-for (const b of $('projBtns').querySelectorAll('button')) b.addEventListener('click', () => chooseProject(b.dataset.project));
-$('projClear').addEventListener('click', () => chooseProject(null));
+$('viewSelect').addEventListener('change', () => {
+  const r = parseRoute();
+  if (r.channel) location.hash = channelHash(r.channel, $('viewSelect').value, r.project, r.draft, r.layout, r.history);
+});
 window.addEventListener('hashchange', route);
 
 route();
