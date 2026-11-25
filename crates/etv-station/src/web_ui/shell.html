@@ -2522,7 +2522,7 @@ function poolHtml(name, p, draft, openIt) {
     ${p.scored ? `<span class="muted">${p.ranking_count} ranked${p.edited ? ' · edited in this draft' : ''}</span>`
       : 'member_count' in p ? `<span class="muted num">${p.member_count} items · ${hours(p.member_runtime_ms)}</span>` : ''}</summary>`;
   const sources = `<div class="pfield"><h4>sources${p.scored && !p.sources_authored ? ' <span class="muted">(the plugin\'s own default)</span>' : ''}</h4>${kvHtml(p.sources)}</div>`;
-  const config = `<div class="pfield"><h4>config${p.config_authored ? '' : ' <span class="muted">(none written)</span>'}</h4>${kvHtml(p.config)}</div>`;
+  const config = `<div class="pfield"><h4>config${p.config_authored ? '' : ' <span class="muted">(none written)</span>'}</h4>${p.config_authored ? kvHtml(p.config) : ''}</div>`;
   if (!p.scored) return `<details class="poolsec"${openIt ? " open" : ""} data-pool="${esc(name)}">${head}<div class="pgrid">${sources}${config}${membersHtml(name, p)}</div>${p.error ? `<div class="error">${esc(p.error)}</div>` : ''}</details>`;
   if (p.error) return `<details class="poolsec"${openIt ? " open" : ""} data-pool="${esc(name)}">${head}<div class="pgrid">${sources}${config}</div>
     <div class="error">${esc(p.error)}</div></details>`;
